@@ -6,7 +6,7 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-ORDERS = ["myagy", "myagy.agents", "myagy.core", "myagy.core.coordinator", "myagy.agents.subagent", "myagy.terminal", "myagy.core.session", "myagy.terminal.cli", "myagy.agents.brainstorm", "myagy.agents.compactor", "myagy.context", "myagy.tools", "myagy.context.hooks_loader"]
+ORDERS = ["myagy", "myagy.agents", "myagy.core", "myagy.core.coordinator", "myagy.agents.subagent", "myagy.terminal", "myagy.core.session", "myagy.terminal.cli", "myagy.agents.brainstorm", "myagy.agents.compactor", "myagy.context", "myagy.tools", "myagy.context.hooks_loader", "myagy.context.kontexta"]
 
 
 @pytest.mark.parametrize("first", ORDERS)

@@ -58,3 +58,94 @@ def test_context_estimate_does_not_summarize(session, monkeypatch):
     session.history = _history(30)
     metrics = ContextCurator.get_context_metrics(session, "cloud")
     assert metrics["tokens"] > 0
+
+
+def test_completion_parser_handles_reasoning_and_thinking_tags():
+    from myagy.agents.compactor import _parse_completion_response
+
+    # Standard content
+    assert _parse_completion_response({"choices": [{"message": {"content": "Clean summary"}}]}) == "Clean summary"
+
+    # Empty content with reasoning_content fallback
+    assert _parse_completion_response({"choices": [{"message": {"content": "", "reasoning_content": "Reasoning summary"}}]}) == "Reasoning summary"
+
+    # None content with reasoning_content fallback
+    assert _parse_completion_response({"choices": [{"message": {"content": None, "reasoning_content": "Deep reasoning"}}]}) == "Deep reasoning"
+
+    # Content with <think>...</think> and post-think output
+    assert _parse_completion_response({"choices": [{"message": {"content": "<think>pondering</think>Final working memory"}}]}) == "Final working memory"
+
+    # Content where thinking consumed everything (no post-think)
+    assert _parse_completion_response({"choices": [{"message": {"content": "<think>Thinking summary extracted</think>"}}]}) == "Thinking summary extracted"
+
+    # Fully empty response returns None
+    assert _parse_completion_response({"choices": [{"message": {"content": "   ", "reasoning_content": ""}}]}) is None
+    assert _parse_completion_response({}) is None
+
+
+def test_fallback_to_rocm_when_cuda_returns_empty(session, monkeypatch):
+    monkeypatch.setattr(ContextCurator, "synthesize_context_cuda_sync", staticmethod(lambda s, t: None))
+    monkeypatch.setattr(ContextCurator, "synthesize_context_rocm_sync", staticmethod(lambda s, t: "ROCM SUMMARY"))
+    session.endpoints["9000"]["status"] = "online"
+    session.history = _history(10)
+
+    removed = ContextCurator.compact_history(session, keep_recent=4, silent=True)
+    assert removed == 6
+    assert "ROCM SUMMARY" in session.history[0]["content"]
+    assert "AMD ROCm (:9000)" in session.history[0]["content"]
+
+
+def test_fallback_to_cloud_when_local_gpus_return_empty(session, monkeypatch):
+    monkeypatch.setattr(ContextCurator, "synthesize_context_cuda_sync", staticmethod(lambda s, t: None))
+    monkeypatch.setattr(ContextCurator, "synthesize_context_rocm_sync", staticmethod(lambda s, t: None))
+    monkeypatch.setattr(ContextCurator, "synthesize_context_cloud_sync", staticmethod(lambda s, t: "CLOUD SUMMARY"))
+    session.has_oauth = True
+    session.history = _history(10)
+
+    removed = ContextCurator.compact_history(session, keep_recent=4, silent=True)
+    assert removed == 6
+    assert "CLOUD SUMMARY" in session.history[0]["content"]
+    assert "Google Cloud" in session.history[0]["content"]
+
+
+def test_fallback_to_deterministic_extractor_when_all_fail(session, monkeypatch):
+    monkeypatch.setattr(ContextCurator, "synthesize_context_cuda_sync", staticmethod(lambda s, t: None))
+    monkeypatch.setattr(ContextCurator, "synthesize_context_rocm_sync", staticmethod(lambda s, t: None))
+    monkeypatch.setattr(ContextCurator, "synthesize_context_cloud_sync", staticmethod(lambda s, t: None))
+    session.has_oauth = False
+
+    session.history = [
+        {"role": "user", "target": "9000", "content": "Fix bug in terminal/cli.py and run pytest"},
+        {"role": "assistant", "target": "9000", "content": "Ran pytest and modified terminal/cli.py. Error: Traceback occurred."},
+        {"role": "user", "target": "9000", "content": "Now update core/session.py"},
+        {"role": "assistant", "target": "9000", "content": "Updated core/session.py successfully."},
+        {"role": "user", "target": "9000", "content": "recent 1"},
+        {"role": "assistant", "target": "9000", "content": "recent 2"},
+    ]
+
+    removed = ContextCurator.compact_history(session, keep_recent=2, silent=True)
+    assert removed == 4
+    content = session.history[0]["content"]
+    assert "Deterministic Extractive Synthesizer" in content
+    assert "Goals & Requirements" in content
+    assert "Fix bug in terminal/cli.py" in content
+    assert "`terminal/cli.py`" in content or "`core/session.py`" in content
+    assert "Traceback" in content or "pytest" in content
+
+
+def test_compaction_sanitizes_empty_turns(session, monkeypatch):
+    monkeypatch.setattr(ContextCurator, "synthesize_context_cuda_sync", staticmethod(lambda s, t: "OK"))
+    session.history = [
+        {"role": "user", "target": "9000", "content": "old turn 1"},
+        {"role": "assistant", "target": "9000", "content": "old turn 2"},
+        {"role": "user", "target": "9000", "content": "recent turn 1"},
+        {"role": "assistant", "target": "9000", "content": "   "},  # Corrupted empty turn
+        {"role": "user", "target": "9000", "content": "recent turn 2"},
+    ]
+
+    removed = ContextCurator.compact_history(session, keep_recent=3, silent=True)
+    assert removed == 2
+    # Ensure no empty content message remains in history
+    for entry in session.history:
+        assert entry["content"].strip() != ""
+

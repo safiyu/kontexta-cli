@@ -56,6 +56,7 @@ from .llamashift import (
     get_llamashift_models,
 )
 from ..context.mcp_loader import load_mcp_servers, check_oauth_available
+from ..context.kontexta import KontextaManager
 from .laya import LayaDecisionEngine
 from ..agents.compactor import ContextCurator
 from .coordinator import CudaCoordinator
@@ -84,6 +85,7 @@ class MultiGpuHybridSession:
         use_laya_adaptive_permissions: bool = True,
         laya_endpoint: str = DEFAULT_LAYA_ENDPOINT,
         enable_mcp: bool = True,
+        enable_kontexta: bool = True,
         json_output: bool = False,
         multiline_input: bool = True,
         verbose: bool = False,
@@ -94,6 +96,7 @@ class MultiGpuHybridSession:
         self._dangerously_skip_permissions = dangerously_skip_permissions
         self.use_laya_adaptive_permissions = use_laya_adaptive_permissions
         self.enable_mcp = enable_mcp
+        self.enable_kontexta = enable_kontexta
         self.json_output = json_output
         self.multiline_input = multiline_input
         self.verbose = verbose
@@ -102,10 +105,10 @@ class MultiGpuHybridSession:
         self.enable_hooks: bool = True
         self.render_markdown: bool = True
 
-        # Load MCP servers once at startup
+        # Load MCP servers once at startup (including Inbuilt Kontexta)
         self._mcp_servers: List[McpStdioServer | McpStreamableHttpServer] = []
         if enable_mcp:
-            self._mcp_servers = load_mcp_servers()
+            self._mcp_servers = load_mcp_servers(enable_kontexta=self.enable_kontexta)
             if not self.json_output:
                 if self._mcp_servers:
                     names = ", ".join(s.name for s in self._mcp_servers)
@@ -561,6 +564,12 @@ class MultiGpuHybridSession:
                     f"{repomap_text}\n"
                     f"[End of Codebase Symbol Map]\n"
                 )
+
+        # Automatic Inbuilt Kontexta Context & Knowledge Engine injection
+        if self.enable_kontexta:
+            kxta_prompt = KontextaManager.generate_context_prompt(".")
+            if kxta_prompt:
+                base_inst += f"\n\n{kxta_prompt}\n"
 
         if not self.history or not include_history:
             return base_inst
@@ -1113,7 +1122,7 @@ class MultiGpuHybridSession:
             def _prune_empty_history():
                 self.history = [
                     h for h in self.history
-                    if not (h["role"] == "assistant" and not h["content"].strip())
+                    if h.get("content") and h["content"].strip()
                 ]
 
             MAX_ATTEMPTS = 3
@@ -1409,6 +1418,8 @@ class MultiGpuHybridSession:
                 self.active_target = self.resolve_target_alias(val)
             elif key == "dangerously_skip_permissions":
                 self._dangerously_skip_permissions = val
+            elif key == "cloud_model" and isinstance(val, str) and val.strip():
+                self.cloud_model = val.strip()
             else:
                 setattr(self, key, val)
 
@@ -1521,6 +1532,18 @@ class MultiGpuHybridSession:
             hook_entries, hook_files = ExternalHooksManager.load_hook_configs(".")
             hook_tag = f"{UI.GREEN}Active ({len(hook_entries)} hooks loaded from {', '.join(hook_files)}){UI.RST}" if hook_entries else (f"{UI.GREEN}Active (Scanning hooks.json){UI.RST}" if self.enable_hooks else f"{UI.GRAY}Disabled{UI.RST}")
             table.add_row("Lifecycle Hooks", Text.from_ansi(hook_tag))
+
+            if self.enable_kontexta:
+                k_stat = KontextaManager.get_status(".")
+                if k_stat["available"]:
+                    p_info = k_stat["active_project"]["name"] if k_stat["active_project"] else f"{k_stat['projects_count']} projects"
+                    k_str = f"{UI.GREEN}Active{UI.RST} (Inbuilt MCP 'kxta' ➔ {p_info})"
+                else:
+                    k_str = f"{UI.AMBER}Offline (Node script missing){UI.RST}"
+            else:
+                k_str = f"{UI.GRAY}Disabled{UI.RST}"
+            table.add_row("Kontexta Engine", Text.from_ansi(k_str))
+
             table.add_row("Cloud Model", Text.from_ansi(f"{UI.CLOUD}{self.cloud_model}{UI.RST}"))
             table.add_row("Cloud Auth", Text.from_ansi(auth_status))
             table.add_row("Multi-line Input", Text.from_ansi(ml_status))
@@ -1551,6 +1574,16 @@ class MultiGpuHybridSession:
         hook_entries, hook_files = ExternalHooksManager.load_hook_configs(".")
         hook_tag = f"{UI.GREEN}Active ({len(hook_entries)} hooks loaded from {', '.join(hook_files)}){UI.RST}" if hook_entries else (f"{UI.GREEN}Active (Scanning hooks.json){UI.RST}" if self.enable_hooks else f"{UI.GRAY}Disabled{UI.RST}")
         print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Lifecycle Hooks{UI.RST}     : {hook_tag}")
+        if self.enable_kontexta:
+            k_stat = KontextaManager.get_status(".")
+            if k_stat["available"]:
+                p_info = k_stat["active_project"]["name"] if k_stat["active_project"] else f"{k_stat['projects_count']} projects"
+                k_str = f"{UI.GREEN}Active{UI.RST} (Inbuilt MCP 'kxta' ➔ {p_info})"
+            else:
+                k_str = f"{UI.AMBER}Offline (Node script missing){UI.RST}"
+        else:
+            k_str = f"{UI.GRAY}Disabled{UI.RST}"
+        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Kontexta Engine{UI.RST}     : {k_str}")
         shift_tag_text = f"{UI.GREEN}Active (Git ➔ Gemma 4 A4B │ Deep ➔ Qwen 27B){UI.RST}" if self.auto_git_shift else f"{UI.GRAY}Disabled{UI.RST}"
         print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Auto Model Shift{UI.RST}    : {shift_tag_text}")
         print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Cloud Model{UI.RST}         : {UI.CLOUD}{self.cloud_model}{UI.RST}")
@@ -1922,6 +1955,7 @@ class MultiGpuHybridSession:
         print(f"{g}│{r}   {c}/repomap [path]{r}       : Generate AST symbol map of codebase classes & functions")
         print(f"{g}│{r}   {c}/instructions [view]{r}   : Inspect or toggle auto-injected GEMINI.md / antigravity.md")
         print(f"{g}│{r}   {c}/hooks [view|refresh]{r}  : Inspect, reload or toggle lifecycle hooks (hooks.json)")
+        print(f"{g}│{r}   {c}/kontexta [on|off|reg]{r} : Inbuilt Kontexta MCP knowledge engine & project linking")
         print(f"{g}│{r} {UI.BOLD}Autonomous Spec-Driven Workflow:{r}")
         print(f"{g}│{r}   {c}/brainstorm <idea>{r}    : Full Cloud Spec ➔ Approval ➔ ROCm Code ➔ NVIDIA Build Subagent ➔ Dual Review ➔ Commit")
         print(f"{g}│{r}")
@@ -1953,5 +1987,5 @@ class MultiGpuHybridSession:
         print(f"{g}│{r}   {c}/models{r}               : List endpoints and active GGUF models")
         print(f"{g}│{r}   {c}/history{r}              : Show cross-GPU conversation history")
         print(f"{g}│{r}   {c}/clear{r}                : Clear conversation memory")
-        print(f"{g}│{r}   {c}exit{r} or {c}quit{r}          : Exit session")
+        print(f"{g}│{r}   {c}/exit{r}, {c}exit{r}, or {c}quit{r}   : Exit session")
         print(f"{UI.GRAY}╰──────────────────────────────────────────────────────────────────╯{UI.RST}\n")

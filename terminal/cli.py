@@ -33,11 +33,12 @@ from .esc_listener import EscListener, prompt_input
 
 SLASH_COMMANDS = [
     "/auto", "/9000", "/rocm", "/9001", "/cuda", "/cloud", "/gemini", "/models", "/model", "/mode",
-    "/spawn", "/tasks", "/subagent", "/repomap", "/instructions", "/hooks", "/mcp", "/compact",
+    "/spawn", "/tasks", "/subagent", "/repomap", "/instructions", "/hooks", "/kontexta", "/kxta", "/mcp", "/compact",
     "/autocompact", "/compactor", "/curation", "/context", "/ctx", "/save", "/load", "/sessions",
     "/export", "/summarize", "/history", "/clear", "/status", "/metrics", "/verbose", "/steps",
     "/permissions", "/sudo", "/laya", "/json", "/format", "/multiline", "/singleline", "/paste", "/reload",
     "/brainstorm", "/search", "/fetch", "/diff", "/undo", "/stats", "/prefs", "/markdown", "/help",
+    "/exit", "/quit",
 ]
 AT_TARGETS = ["@rocm", "@cuda", "@cloud", "@auto", "@local", "@9000", "@9001"]
 _dynamic_targets: list = []
@@ -114,7 +115,7 @@ def read_input_prompt(first_prompt: str, multiline: bool = True) -> str:
         return stripped
 
     # Slash commands and session exit keywords submit immediately on first Enter
-    if stripped.startswith("/") or stripped.lower() in ("exit", "quit", "q"):
+    if stripped.startswith("/") or stripped.lower() in ("exit", "quit", "q", "/exit", "/quit"):
         return stripped
 
     # Empty first line returns immediately
@@ -229,7 +230,7 @@ async def interactive_loop(session: MultiGpuHybridSession):
             if not user_input:
                 continue
 
-            if user_input.lower() in ("exit", "quit", "q"):
+            if user_input.lower() in ("exit", "quit", "q", "/exit", "/quit"):
                 print(f"{UI.GRAY}Exiting session.{UI.RST}")
                 break
 
@@ -321,8 +322,16 @@ async def interactive_loop(session: MultiGpuHybridSession):
                     fn = session.endpoints['9001']['filename']
                     print(UI.ok(f"Default target set to NVIDIA CUDA Port 9001 ({fn})"))
                 elif cmd in ("/cloud", "/gemini", "/oauth"):
-                    session.active_target = "cloud"
-                    print(UI.ok(f"Default target set to CLOUD via OAuth ({session.cloud_model})"))
+                    if arg:
+                        # /cloud <model-id> — change cloud model mid-session and persist
+                        new_model = arg.strip()
+                        session.cloud_model = new_model
+                        session.active_target = "cloud"
+                        session.save_preferences()
+                        print(UI.ok(f"Cloud model set to {UI.CLOUD}{new_model}{UI.RST} and target switched to CLOUD (saved to prefs)."))
+                    else:
+                        session.active_target = "cloud"
+                        print(UI.ok(f"Default target set to CLOUD via OAuth ({session.cloud_model})"))
                 elif cmd in ("/model", "/switch", "/shift", "/use"):
                     if not arg:
                         session.print_models()
@@ -501,6 +510,50 @@ async def interactive_loop(session: MultiGpuHybridSession):
                             print(f"{UI.DARK_GRAY}│{UI.RST}   {UI.GRAY}(no servers loaded){UI.RST}")
                         print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}")
                         print(f"{UI.GRAY}Commands: /mcp on | /mcp off | /mcp reload{UI.RST}\n")
+                elif cmd in ("/kontexta", "/kxta"):
+                    from ..context.kontexta import KontextaManager
+                    arg_low = (arg or "").strip().lower()
+                    if arg_low in ("off", "disable"):
+                        session.enable_kontexta = False
+                        session._mcp_servers = [s for s in session._mcp_servers if s.name not in ("kontexta", "kxta")]
+                        session._active_local_agent = None
+                        session.save_preferences()
+                        print(UI.ok("Inbuilt Kontexta MCP server DISABLED."))
+                    elif arg_low in ("on", "enable"):
+                        session.enable_kontexta = True
+                        session._mcp_servers = load_mcp_servers(enable_kontexta=True)
+                        session._active_local_agent = None
+                        session.save_preferences()
+                        print(UI.ok("Inbuilt Kontexta MCP server ENABLED."))
+                    elif arg_low in ("sync", "reload", "refresh"):
+                        session._mcp_servers = load_mcp_servers(enable_kontexta=session.enable_kontexta)
+                        session._active_local_agent = None
+                        print(UI.ok("Kontexta MCP integration reloaded."))
+                    elif arg_low.startswith("register") or arg_low.startswith("add"):
+                        parts = arg.split(maxsplit=1)
+                        p_name = parts[1].strip() if len(parts) > 1 else None
+                        ok = KontextaManager.register_project(".", name=p_name)
+                        if ok:
+                            print(UI.ok(f"Project '{os.path.basename(os.path.abspath('.'))}' registered in Kontexta database!"))
+                        else:
+                            print(UI.err("Failed to register project in Kontexta (database locked or unreadable)."))
+                    else:
+                        stat = KontextaManager.get_status(".")
+                        st_col = UI.GREEN_BOLD if stat["available"] else UI.RED_BOLD
+                        st_text = "READY / ACTIVE" if stat["available"] else "NOT FOUND / OFFLINE"
+                        active_proj = stat.get("active_project")
+                        proj_str = f"{active_proj['name']} [{active_proj['slug']}]" if active_proj else f"{UI.GRAY}(unmapped; type /kontexta register){UI.RST}"
+
+                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}INBUILT KONTEXTA MCP INTEGRATION{UI.RST}{UI.DARK_GRAY} ─────────────────────────────╮{UI.RST}")
+                        print(f"{UI.DARK_GRAY}│{UI.RST}  Status       : {st_col}{st_text}{UI.RST} (Enabled: {'YES' if session.enable_kontexta else 'NO'})")
+                        print(f"{UI.DARK_GRAY}│{UI.RST}  Entrypoint   : {UI.CYAN}{stat['mcp_entrypoint']}{UI.RST}")
+                        print(f"{UI.DARK_GRAY}│{UI.RST}  Data Dir     : {UI.GRAY}{stat['data_dir']}{UI.RST}")
+                        print(f"{UI.DARK_GRAY}│{UI.RST}  Database     : {UI.GRAY}{stat['db_path']}{UI.RST} ({stat['db_size_kb']} KB)")
+                        print(f"{UI.DARK_GRAY}│{UI.RST}  Knowledge    : {stat['files_count']} indexed file(s), {stat['tags_count']} tag(s)")
+                        print(f"{UI.DARK_GRAY}│{UI.RST}  Active Repo  : {UI.WHITE}{proj_str}{UI.RST}")
+                        print(f"{UI.DARK_GRAY}│{UI.RST}  Total Projects: {stat['projects_count']} registered")
+                        print(f"{UI.DARK_GRAY}╰──────────────────────────────────────────────────────────────────╯{UI.RST}")
+                        print(f"{UI.GRAY}Commands: /kontexta on | /kontexta off | /kontexta reload | /kontexta register [name]{UI.RST}\n")
                 elif cmd == "/metrics":
                     arg_low = arg.lower()
                     if arg_low in ("off", "disable", "false", "0"):
@@ -925,6 +978,9 @@ async def interactive_loop(session: MultiGpuHybridSession):
                         print(f"{UI.GRAY}Settings save automatically after each command. /prefs reset restores defaults.{UI.RST}\n")
                 elif cmd == "/help":
                     session.print_help()
+                elif cmd in ("/exit", "/quit"):
+                    print(f"{UI.GRAY}Exiting session.{UI.RST}")
+                    break
                 else:
                     print(UI.warn(f"Unknown command '{cmd}'. Type /help for available commands."))
                 session.save_preferences()
@@ -1094,6 +1150,13 @@ async def main():
         help="Disable MCP server integration at startup (re-enable with /mcp on)",
     )
     parser.add_argument(
+        "--no-kontexta",
+        dest="enable_kontexta",
+        action="store_false",
+        default=None,
+        help="Disable Inbuilt Kontexta MCP server integration at startup",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         dest="json_output",
@@ -1137,15 +1200,16 @@ async def main():
     prefs = load_prefs()
     session = MultiGpuHybridSession(
         initial_target=args.target or prefs.get("active_target", "rocm"),
-        cloud_model=args.cloud_model,
+        cloud_model=args.cloud_model if args.cloud_model != DEFAULT_CLOUD_MODEL else prefs.get("cloud_model", DEFAULT_CLOUD_MODEL),
         dangerously_skip_permissions=args.dangerously_skip_permissions if args.dangerously_skip_permissions is not None else prefs.get("dangerously_skip_permissions", True),
         use_laya_adaptive_permissions=prefs.get("use_laya_adaptive_permissions", True),
         enable_mcp=args.enable_mcp,
+        enable_kontexta=args.enable_kontexta if args.enable_kontexta is not None else prefs.get("enable_kontexta", True),
         json_output=args.json_output,
         multiline_input=args.multiline_input if args.multiline_input is not None else prefs.get("multiline_input", True),
         verbose=args.verbose or prefs.get("verbose", False),
     )
-    handled = {"active_target", "dangerously_skip_permissions", "use_laya_adaptive_permissions", "multiline_input", "verbose"}
+    handled = {"active_target", "cloud_model", "dangerously_skip_permissions", "use_laya_adaptive_permissions", "enable_kontexta", "multiline_input", "verbose"}
     session.apply_preferences({k: v for k, v in prefs.items() if k not in handled})
 
     if args.load_session:

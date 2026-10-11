@@ -9,7 +9,7 @@ from ..config import MCP_CONFIG_PATH, KONTEXTA_MCP_PATH, KONTEXTA_DATA_DIR, OAUT
 from ..terminal.ui import UI
 
 
-def load_mcp_servers() -> List[McpStdioServer | McpStreamableHttpServer]:
+def load_mcp_servers(enable_kontexta: bool = True) -> List[McpStdioServer | McpStreamableHttpServer]:
     """
     Loads MCP server definitions from ~/.gemini/config/mcp_config.json.
     Supports both Antigravity native and VS Code compatible formats.
@@ -77,19 +77,18 @@ def load_mcp_servers() -> List[McpStdioServer | McpStreamableHttpServer]:
         except Exception as e:
             print(UI.warn(f"MCP: could not load {MCP_CONFIG_PATH}: {e}"))
 
-    # Auto-detect local Kontexta MCP server if not already defined
-    has_kontexta = any(
-        s.name in ("kontexta", "kxta") or (hasattr(s, "args") and KONTEXTA_MCP_PATH in (s.args or []))
-        for s in servers
-    )
-    if not has_kontexta and os.path.exists(KONTEXTA_MCP_PATH):
-        servers.append(McpStdioServer(
-            name="kontexta",
-            command="node",
-            args=[KONTEXTA_MCP_PATH],
-            env={"KONTEXTA_DATA_DIR": KONTEXTA_DATA_DIR},
-        ))
-        names_seen.add("kontexta")
+    # Auto-detect or build Inbuilt Kontexta MCP server if enabled and not already configured
+    if enable_kontexta:
+        has_kontexta = any(
+            s.name in ("kontexta", "kxta") or (hasattr(s, "args") and KONTEXTA_MCP_PATH in (s.args or []))
+            for s in servers
+        )
+        if not has_kontexta:
+            from .kontexta import KontextaManager
+            srv = KontextaManager.create_mcp_server(server_name="kxta")
+            if srv:
+                servers.append(srv)
+                names_seen.add("kxta")
 
     return servers
 

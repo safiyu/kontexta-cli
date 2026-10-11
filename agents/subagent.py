@@ -269,6 +269,7 @@ class SubagentManager:
             capabilities=CapabilitiesConfig(),
             policies=policy.confirm_run_command(handler=background_permission),
             hooks=[log_tool],
+            mcp_servers=session._mcp_servers,
         )
         agent = Agent(config)
         await agent.__aenter__()

@@ -27,9 +27,19 @@ def test_reset_removes_file(tmp_path):
 
 
 def test_session_apply_and_snapshot(session):
-    session.apply_preferences({"verbose": True, "autocompact_threshold": 5, "dangerously_skip_permissions": False, "active_target": "cloud", "nope": 1})
+    session.apply_preferences({
+        "verbose": True,
+        "autocompact_threshold": 5,
+        "dangerously_skip_permissions": False,
+        "active_target": "cloud",
+        "cloud_model": "gemini-2.5-pro",
+        "nope": 1,
+    })
     prefs = session.preferences()
     assert prefs["verbose"] is True and prefs["autocompact_threshold"] == 5
     assert prefs["dangerously_skip_permissions"] is False
     assert prefs["active_target"] == "cloud"
+    assert prefs["cloud_model"] == "gemini-2.5-pro"
+    assert session.cloud_model == "gemini-2.5-pro"
     assert set(prefs) <= set(PREF_DEFAULTS)
+

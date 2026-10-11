@@ -22,7 +22,7 @@ _LAZY = {
     **{n: ".terminal" for n in ("UI", "RICH_AVAILABLE", "console", "EscListener", "read_input_prompt", "interactive_loop", "main")},
     **{n: ".core" for n in ("MultiGpuHybridSession", "CudaCoordinator", "LayaDecisionEngine", "detect_port_model", "query_endpoint_model", "trigger_llamashift_switch", "get_llamashift_active", "get_llamashift_models")},
     **{n: ".agents" for n in ("SubagentManager", "SubagentTask", "ContextCurator", "BrainstormWorkflow")},
-    **{n: ".context" for n in ("RepoMap", "ProjectInstructions", "ExternalHooksManager", "load_mcp_servers", "check_oauth_available", "McpStdioServer")},
+    **{n: ".context" for n in ("RepoMap", "ProjectInstructions", "ExternalHooksManager", "load_mcp_servers", "check_oauth_available", "McpStdioServer", "KontextaManager")},
     "WebSearchEngine": ".tools",
 }
 
@@ -59,6 +59,7 @@ __all__ = [
     "load_mcp_servers",
     "check_oauth_available",
     "McpStdioServer",
+    "KontextaManager",
     # Tools
     "WebSearchEngine",
     # Terminal & UI

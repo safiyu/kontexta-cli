@@ -32,7 +32,8 @@ An asynchronous, dual-accelerator pairing framework and terminal copilot built o
 * **Markdown Rendering**: responses stream through a live Markdown renderer (toggle with `/markdown`).
 * **Tool-Using Subagents**: `/spawn` runs a real agent on :9001 with the same hooks; unsafe actions are denied (no prompts from the background). Falls back to a plain no-tools completion if the agent can't start.
 * **Universal MCP Server Support**:
-  * Discovers Antigravity native, VS Code-compatible, and local Kontexta MCP tools.
+  * Inbuilt Kontexta MCP integration (`kxta`) with persistent project intelligence, SQLite knowledge store, and entity linking.
+  * Auto-discovers Antigravity native, VS Code-compatible, and local Kontexta MCP tools.
 * **Google Cloud Gemini Fallback**:
   * Native streaming through active Google Antigravity OAuth session.
 
@@ -64,6 +65,7 @@ Projects/myagy/
 │   ├── repomap.py            # AST symbol mapping with fast mtime caching
 │   ├── instructions.py       # GEMINI.md / antigravity.md context injector
 │   ├── hooks_loader.py       # Lifecycle hooks loader (hooks.json)
+│   ├── kontexta.py           # Inbuilt Kontexta MCP manager & project context
 │   └── mcp_loader.py         # Native, VS Code, and Kontexta MCP discovery
 │
 ├── tools/                    # Tool extensions & web scraping
@@ -139,6 +141,7 @@ python3 /home/safiyu/Projects/myagy/antigravity_agent.py --dangerously-skip-perm
 | `/repomap refresh` | Force an immediate cache invalidation and re-index |
 | `/instructions [view]` | Inspect or toggle auto-injected GEMINI.md / antigravity.md context |
 | `/hooks [view\|refresh]` | Inspect, reload, or toggle lifecycle hooks (`hooks.json`) |
+| `/kontexta [on\|off\|reg]` | Inbuilt Kontexta MCP knowledge engine, status, and project linking |
 | `/compact` | Condense older conversation turns into dense Working Memory |
 | `/curation on\|off` | Toggle continuous rolling background hippocampus on RTX 4060 |
 | `/context` or `/ctx` | Display live context window telemetry and headroom progress bar |
@@ -157,6 +160,7 @@ python3 /home/safiyu/Projects/myagy/antigravity_agent.py --dangerously-skip-perm
 | `/prefs [reset]` | Show or reset saved preferences |
 | `/reload` | Hot-reload code in-place preserving context |
 | `/help` | Display full command reference |
+| `/exit`, `exit` | Exit the interactive session (also `/quit`, `quit`) |
 
 ### Keyboard & Execution Controls
 

@@ -4,11 +4,12 @@ import os
 import json
 from typing import Any, Dict
 
-from ..config import PREFS_PATH
+from ..config import PREFS_PATH, DEFAULT_CLOUD_MODEL
 
 # Session attribute -> default value; only these keys are persisted
 PREF_DEFAULTS: Dict[str, Any] = {
     "active_target": "9000",
+    "cloud_model": DEFAULT_CLOUD_MODEL,
     "use_laya_adaptive_permissions": True,
     "dangerously_skip_permissions": True,
     "verbose": False,
@@ -19,6 +20,8 @@ PREF_DEFAULTS: Dict[str, Any] = {
     "auto_repomap": True,
     "auto_instructions": True,
     "enable_hooks": True,
+    "enable_mcp": True,
+    "enable_kontexta": True,
     "max_tool_steps_per_turn": 0,
     "render_markdown": True,
 }

@@ -47,6 +47,7 @@ def test_completer_suggests_commands_and_targets(monkeypatch):
         return [c.text for c in pt.completer.get_completions(Document(text), None)]
 
     assert "/diff" in complete("/di") and "/undo" in complete("/un")
+    assert "/exit" in complete("/ex") and "/quit" in complete("/qu")
     assert "@gemma4" in complete("@ge") and "@cloud" in complete("@cl")
     assert complete("hello") == [] and complete("/model ge") == []
 
@@ -94,3 +95,29 @@ def test_up_arrow_recalls_history(monkeypatch, tmp_path):
     assert _feed_and_prompt(pt, ["remember me", "\r"]) == "remember me"
     assert _feed_and_prompt(pt, ["\x1b[A", "\r"]) == "remember me"
     assert "remember me" in (tmp_path / "hist").read_text()
+
+
+def test_slash_exit_command_returns_immediately(monkeypatch):
+    monkeypatch.setattr(cli, "_read_line", lambda p: "/exit")
+    assert cli.read_input_prompt("> ") == "/exit"
+
+
+@pytest.mark.asyncio
+async def test_interactive_loop_exits_on_slash_exit(monkeypatch):
+    class DummySession:
+        json_output = True
+        multiline_input = True
+        active_target = "auto"
+
+        def get_catalog(self):
+            return []
+
+        def format_context_pill(self, target):
+            return "0 tokens"
+
+        def get_context_metrics(self, target):
+            return {"tokens": 0}
+
+    session = DummySession()
+    monkeypatch.setattr(cli, "read_input_prompt", lambda prompt, multiline: "/exit")
+    await cli.interactive_loop(session)

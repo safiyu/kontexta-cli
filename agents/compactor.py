@@ -1,14 +1,131 @@
 """Context window telemetry, NVIDIA RTX 4060 Working Memory synthesis, and continuous curation."""
 
+import re
+import os
 import json
 import time
 import asyncio
+import subprocess
 import urllib.request
-from typing import Optional, List, Dict, Any
+import urllib.error
+from typing import Optional, List, Dict, Any, Tuple
 
+from ..config import OAUTH_TOKEN_PATH
 from ..terminal.ui import UI, RICH_AVAILABLE, console
 from ..core.llamashift import trigger_llamashift_switch
 from ..core.coordinator import CudaCoordinator
+
+
+def _parse_completion_response(data: dict) -> Optional[str]:
+    """Extracts non-empty text from an OpenAI-compatible completion response."""
+    choices = data.get("choices")
+    if not choices or not isinstance(choices, list):
+        return None
+    choice = choices[0]
+    msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+    content = msg.get("content") or choice.get("text") or ""
+    reasoning = msg.get("reasoning_content") or ""
+
+    text = ""
+    if content and isinstance(content, str) and content.strip():
+        text = content.strip()
+        if "<think>" in text and "</think>" in text:
+            after_think = text.split("</think>", 1)[1].strip()
+            if after_think:
+                text = after_think
+            else:
+                inside_think = text.split("<think>", 1)[1].split("</think>", 1)[0].strip()
+                if inside_think:
+                    text = inside_think
+    elif reasoning and isinstance(reasoning, str) and reasoning.strip():
+        text = reasoning.strip()
+
+    return text.strip() if text.strip() else None
+
+
+def _format_conversation_log(turns: List[Dict[str, str]], max_total_chars: int = 12000) -> str:
+    """Formats turn list into clean log text, bounding length to protect smaller model contexts."""
+    log_parts = []
+    for t in turns:
+        r = t.get("role", "unknown").upper()
+        tgt = t.get("target", "").upper()
+        c = t.get("content", "").strip()
+        if not c:
+            continue
+        if "[Working Memory distilled" in c or "[SYSTEM: Context compacted" in c:
+            log_parts.append(f"[PRIOR WORKING MEMORY BASELINE]:\n{c}")
+        else:
+            if len(c) > 1200:
+                c = c[:1100] + "... [truncated]"
+            log_parts.append(f"[{r} on {tgt}]:\n{c}")
+
+    full_log = "\n---\n".join(log_parts)
+    if len(full_log) > max_total_chars:
+        # Keep the beginning (baseline/goals) and end (recent state)
+        head_len = max_total_chars // 3
+        tail_len = max_total_chars - head_len - 100
+        full_log = full_log[:head_len] + "\n... [intermediate turns condensed] ...\n" + full_log[-tail_len:]
+    return full_log
+
+
+def _query_local_endpoint(
+    url: str,
+    model_name: str,
+    system_instruction: str,
+    conversation_log: str,
+    timeout: float = 15.0,
+) -> Optional[str]:
+    """
+    Queries a local llama-server /v1/chat/completions endpoint.
+    Attempts standard system+user messages first; if HTTP 400 or empty content occurs
+    (frequent in small models / specific chat templates), automatically retries with a
+    single user prompt combining instruction and log.
+    """
+    headers = {"Content-Type": "application/json"}
+
+    # Attempt 1: Standard system + user role messages
+    payload1 = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": f"Synthesize this session history:\n\n{conversation_log}"},
+        ],
+        "max_tokens": 1024,
+        "temperature": 0.2,
+    }
+
+    try:
+        req_data = json.dumps(payload1).encode("utf-8")
+        req = urllib.request.Request(url, data=req_data, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            parsed = _parse_completion_response(data)
+            if parsed:
+                return parsed
+    except urllib.error.HTTPError as he:
+        # If 400 (e.g. system role not supported or template validation error), fall through to retry
+        pass
+    except Exception:
+        pass
+
+    # Attempt 2: Fallback single user message (compatible with all GGUF chat templates)
+    payload2 = {
+        "model": model_name,
+        "messages": [
+            {"role": "user", "content": f"{system_instruction}\n\nSession History To Synthesize:\n{conversation_log}"},
+        ],
+        "max_tokens": 1024,
+        "temperature": 0.2,
+    }
+
+    try:
+        req_data = json.dumps(payload2).encode("utf-8")
+        req = urllib.request.Request(url, data=req_data, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return _parse_completion_response(data)
+    except Exception:
+        return None
 
 
 class ContextCurator:
@@ -133,7 +250,7 @@ class ContextCurator:
     @staticmethod
     def synthesize_context_cuda_sync(session: Any, turns: List[Dict[str, str]]) -> Optional[str]:
         """
-        Sends older turns to Port 9001 (NVIDIA CUDA GPU) to generate high-density Working Memory.
+        Tier 1: Sends older turns to Port 9001 (NVIDIA CUDA GPU) to generate high-density Working Memory.
         Auto-wakes via Llama-Launcher if offline.
         """
         if not turns:
@@ -157,22 +274,10 @@ class ContextCurator:
         if ep9001.get("status") != "online":
             return None
 
-        log_parts = []
-        for t in turns:
-            r = t.get("role", "unknown").upper()
-            tgt = t.get("target", "").upper()
-            c = t.get("content", "").strip()
-            if "[Working Memory distilled" in c or "[SYSTEM: Context compacted" in c:
-                log_parts.append(f"[PRIOR WORKING MEMORY BASELINE]:\n{c}")
-            else:
-                if len(c) > 1500:
-                    c = c[:1400] + "... [truncated]"
-                log_parts.append(f"[{r} on {tgt}]:\n{c}")
-
-        conversation_log = "\n---\n".join(log_parts)
+        conversation_log = _format_conversation_log(turns)
         system_instruction = (
             "You are a Software Engineering Context Synthesizer running on the NVIDIA accelerator.\n"
-            "Distill the prior baseline memory and new conversation turns into an updated, dense Working Memory block.\n"
+            "Distill the prior baseline memory and conversation turns into an updated, dense Working Memory block.\n"
             "Structure strictly with:\n"
             "### Goals & Requirements\n"
             "### Architectural Decisions & Changes\n"
@@ -181,51 +286,282 @@ class ContextCurator:
             "Be factual, concise, and preserve filenames, functions, and error messages."
         )
 
-        payload = {
-            "model": ep9001.get("filename") or "granite-4.2-8b",
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": f"Synthesize this session history:\n\n{conversation_log}"},
-            ],
-            "max_tokens": 500,
-            "temperature": 0.1,
-        }
+        model_name = ep9001.get("filename") or "granite-4.2-8b"
+        return _query_local_endpoint(
+            "http://127.0.0.1:9001/v1/chat/completions",
+            model_name=model_name,
+            system_instruction=system_instruction,
+            conversation_log=conversation_log,
+            timeout=15.0,
+        )
+
+    @staticmethod
+    def synthesize_context_rocm_sync(session: Any, turns: List[Dict[str, str]]) -> Optional[str]:
+        """
+        Tier 2: Primary local executive fallback on AMD ROCm (:9000).
+        Utilizes larger local models (e.g. Gemma 4 26B, Qwen 27B) when compactor fails.
+        """
+        if not turns:
+            return None
+        ep9000 = session.endpoints.get("9000", {})
+        if ep9000.get("status") != "online":
+            return None
+
+        conversation_log = _format_conversation_log(turns)
+        system_instruction = (
+            "You are a Senior Systems Architect and Context Synthesizer.\n"
+            "Distill this conversation history into a dense, structured Working Memory block for ongoing development.\n"
+            "Structure strictly with:\n"
+            "### Goals & Requirements\n"
+            "### Architectural Decisions & Changes\n"
+            "### Files Touched & Current Status\n"
+            "### Next Immediate Steps\n"
+            "Be factual, concise, and preserve filenames, functions, and error messages."
+        )
+
+        model_name = ep9000.get("filename") or "rocm-model"
+        return _query_local_endpoint(
+            "http://127.0.0.1:9000/v1/chat/completions",
+            model_name=model_name,
+            system_instruction=system_instruction,
+            conversation_log=conversation_log,
+            timeout=15.0,
+        )
+
+    @staticmethod
+    def synthesize_context_cloud_sync(session: Any, turns: List[Dict[str, str]]) -> Optional[str]:
+        """
+        Tier 3: Google Cloud Gemini fallback via existing OAuth CLI session.
+        Provides massive context headroom and zero failure on distillation.
+        """
+        if not turns:
+            return None
+        has_token = getattr(session, "has_oauth", False) or os.path.exists(OAUTH_TOKEN_PATH)
+        if not has_token:
+            return None
+
+        conversation_log = _format_conversation_log(turns, max_total_chars=18000)
+        prompt = (
+            "You are a Software Engineering Context Synthesizer.\n"
+            "Distill this development session history into an updated, structured Working Memory block.\n"
+            "Structure strictly with:\n"
+            "### Goals & Requirements\n"
+            "### Architectural Decisions & Changes\n"
+            "### Files Touched & Current Status\n"
+            "### Next Immediate Steps\n"
+            "Be factual, concise, and preserve exact filenames, functions, commands, and errors.\n\n"
+            f"Session History:\n{conversation_log}"
+        )
+
+        cmd = [
+            "agy",
+            "--model", getattr(session, "cloud_model", "gemini-3.8-flash-high"),
+            "--print-timeout", "20",
+            "--print", prompt,
+        ]
+        if getattr(session, "_dangerously_skip_permissions", True):
+            cmd.append("--dangerously-skip-permissions")
 
         try:
-            req_data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                "http://127.0.0.1:9001/v1/chat/completions",
-                data=req_data,
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                choice = data["choices"][0]["message"]
-                res_text = choice.get("content") or choice.get("reasoning_content") or ""
-                return res_text.strip() if res_text.strip() else None
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+            if proc.returncode == 0 and proc.stdout.strip():
+                out = proc.stdout.strip()
+                # If agy printed extraneous headers or warnings, clean them
+                cleaned = []
+                for line in out.splitlines():
+                    if line.startswith("jetski:") or line.startswith("[INFO]") or "auto-denied" in line:
+                        continue
+                    cleaned.append(line)
+                res = "\n".join(cleaned).strip()
+                return res if res else None
         except Exception:
-            return None
+            pass
+        return None
+
+    @classmethod
+    def extract_deterministic_working_memory(cls, turns: List[Dict[str, str]]) -> str:
+        """
+        Tier 4: Guaranteed, deterministic heuristic working memory extraction.
+        Requires zero LLM inference. Parses user requirements, file paths, tool actions,
+        commands run, and errors into a clean, structured Working Memory block.
+        """
+        if not turns:
+            return "No prior turns recorded."
+
+        # 1. Extract Goals & User Directives
+        user_goals = []
+        for t in turns:
+            if t.get("role") == "user":
+                content = t.get("content", "").strip()
+                if not content or content.startswith("[SYSTEM: Context compacted"):
+                    continue
+                # Grab the first 2-3 substantive lines of each user prompt
+                substantive = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith("@")]
+                if substantive:
+                    summary_line = substantive[0][:200]
+                    if summary_line not in user_goals:
+                        user_goals.append(summary_line)
+
+        # 2. Extract Files Referenced / Touched
+        file_patterns = [
+            re.compile(r'(?:/|[a-zA-Z0-9_.-]+/)[a-zA-Z0-9_.-]+\.(?:py|sh|json|md|txt|ts|js|jsx|tsx|html|css|yaml|yml|toml|rs|go|c|cpp|h)\b'),
+            re.compile(r'\b[a-zA-Z0-9_.-]+\.(?:py|sh|json|md|txt|ts|js|jsx|tsx|html|css|yaml|yml|toml|rs|go|c|cpp|h)\b'),
+        ]
+        files_found = set()
+        for t in turns:
+            c = t.get("content", "")
+            for pat in file_patterns:
+                for match in pat.findall(c):
+                    clean_path = match.strip("`'\"(),;:")
+                    if clean_path and not clean_path.startswith("http") and len(clean_path) > 3:
+                        files_found.add(clean_path)
+
+        # 3. Extract Executed Actions & Commands
+        actions = []
+        action_keywords = ("git ", "pytest", "python", "npm ", "cargo ", "curl ", "bash ", "created file", "modified", "replaced", "fixed")
+        for t in turns:
+            lines = t.get("content", "").splitlines()
+            for line in lines:
+                l_strip = line.strip()
+                if any(kw in l_strip.lower() for kw in action_keywords):
+                    preview = l_strip[:160]
+                    if preview not in actions:
+                        actions.append(preview)
+                    if len(actions) >= 8:
+                        break
+
+        # 4. Extract Errors & Issues
+        errors_found = []
+        err_keywords = ("error", "failed", "traceback", "exception", "400", "500", "refused")
+        for t in turns:
+            lines = t.get("content", "").splitlines()
+            for line in lines:
+                l_strip = line.strip()
+                if any(kw in l_strip.lower() for kw in err_keywords):
+                    preview = l_strip[:160]
+                    if preview not in errors_found:
+                        errors_found.append(preview)
+                    if len(errors_found) >= 5:
+                        break
+
+        # 5. Extract Latest Operational State
+        last_turn_text = ""
+        for t in reversed(turns):
+            if t.get("role") == "assistant":
+                lines = [l.strip() for l in t.get("content", "").splitlines() if l.strip()]
+                if lines:
+                    last_turn_text = lines[-1][:220]
+                    break
+
+        # Assemble Structured Markdown
+        sections = []
+
+        # Goals
+        sections.append("### Goals & Requirements")
+        if user_goals:
+            for g in user_goals[:6]:
+                sections.append(f"- {g}")
+        else:
+            sections.append("- Ongoing interactive session tasks and development instructions.")
+
+        # Files
+        sections.append("\n### Files Touched & Codebase References")
+        if files_found:
+            for f in sorted(list(files_found))[:10]:
+                sections.append(f"- `{f}`")
+        else:
+            sections.append("- (General codebase inspection & discussion)")
+
+        # Actions & Commands
+        sections.append("\n### Actions & Tool Executions Recorded")
+        if actions:
+            for a in actions[:6]:
+                sections.append(f"- {a}")
+        else:
+            sections.append(f"- Analyzed and processed {len(turns)} conversation turns.")
+
+        # Errors / Issues if any
+        if errors_found:
+            sections.append("\n### Notable Issues & Errors Encountered")
+            for e in errors_found[:4]:
+                sections.append(f"- {e}")
+
+        # Current Status
+        sections.append("\n### Current Status & Next Steps")
+        if last_turn_text:
+            sections.append(f"- Last milestone: {last_turn_text}")
+        sections.append("- Baseline context established. Ready to proceed with user commands.")
+
+        return "\n".join(sections)
+
+    @classmethod
+    def synthesize_working_memory(cls, session: Any, turns: List[Dict[str, str]], silent: bool = False) -> Tuple[str, str]:
+        """
+        Synthesizes Working Memory through a resilient multi-tier fallback pipeline:
+          Tier 1: NVIDIA RTX 4060 (:9001) dedicated compactor
+          Tier 2: AMD ROCm (:9000) primary executive model
+          Tier 3: Google Cloud Gemini via OAuth
+          Tier 4: Structured Deterministic Extractor (guaranteed non-empty)
+        Returns: (synthesized_text, synthesized_by_label)
+        """
+        # Tier 1: NVIDIA CUDA:9001
+        if CudaCoordinator.state() != "subagent":
+            try:
+                syn = cls.synthesize_context_cuda_sync(session, turns)
+                if syn and syn.strip():
+                    return syn.strip(), "NVIDIA RTX 4060 (:9001)"
+            except Exception:
+                pass
+            if not silent and not session.json_output:
+                print(f"{UI.AMBER}[⚠ CUDA:9001 compactor empty or failed]{UI.RST} {UI.GRAY}Falling back to secondary synthesis tiers...{UI.RST}")
+
+        # Tier 2: AMD ROCm:9000 Primary Executive
+        ep9000 = session.endpoints.get("9000", {})
+        if ep9000.get("status") == "online":
+            try:
+                syn = cls.synthesize_context_rocm_sync(session, turns)
+                if syn and syn.strip():
+                    name_tag = ep9000.get("name_friendly") or ep9000.get("filename") or "Gemma/Qwen"
+                    return syn.strip(), f"AMD ROCm (:9000) [{name_tag}]"
+            except Exception:
+                pass
+
+        # Tier 3: Google Cloud Gemini via OAuth
+        has_token = getattr(session, "has_oauth", False) or os.path.exists(OAUTH_TOKEN_PATH)
+        if has_token:
+            try:
+                syn = cls.synthesize_context_cloud_sync(session, turns)
+                if syn and syn.strip():
+                    c_model = getattr(session, "cloud_model", "gemini-3.8-flash-high")
+                    return syn.strip(), f"Google Cloud ({c_model}) via OAuth"
+            except Exception:
+                pass
+
+        # Tier 4: Structured Deterministic Extractor
+        det_syn = cls.extract_deterministic_working_memory(turns)
+        return det_syn, "Deterministic Extractive Synthesizer (Local Fallback)"
 
     @classmethod
     async def async_synthesize_cuda(cls, session: Any):
-        """Background coroutine that pre-computes Working Memory synthesis on CUDA:9001 only when idle."""
+        """Background coroutine that pre-computes Working Memory synthesis only when idle."""
         if not CudaCoordinator.start_compaction(asyncio.current_task()):
             return
         try:
             if len(session.history) <= session.max_recent_turns:
                 return
             older = session.history[:-session.max_recent_turns]
-            syn = await asyncio.to_thread(cls.synthesize_context_cuda_sync, session, older)
+            syn, syn_by = await asyncio.to_thread(cls.synthesize_working_memory, session, older, True)
             if syn:
                 session._cached_curated_memory = {
                     "summary": syn,
+                    "synthesized_by": syn_by,
                     "covered_turns": len(older),
                     "timestamp": time.time(),
                 }
                 if session.continuous_curation and len(session.history) >= (session.max_recent_turns + 2):
                     removed = cls.compact_history(session, keep_recent=session.max_recent_turns, silent=True)
                     if removed > 0 and not session.json_output:
-                        print(f"\n{UI.DARK_GRAY}⚡ [Hippocampus: {removed} older turns distilled into Working Memory via RTX 4060]{UI.RST}\n", flush=True)
+                        print(f"\n{UI.DARK_GRAY}⚡ [Hippocampus: {removed} older turns distilled into Working Memory via {syn_by}]{UI.RST}\n", flush=True)
         except asyncio.CancelledError:
             # Preempted by on-demand subagent task
             pass
@@ -236,7 +572,7 @@ class ContextCurator:
 
     @classmethod
     def trigger_background_synthesis(cls, session: Any):
-        """Fires non-blocking background synthesis task on CUDA:9001 only when idle and not busy with subagents."""
+        """Fires non-blocking background synthesis task only when idle and not busy with subagents."""
         if not session.continuous_curation:
             return
         if not CudaCoordinator.can_compact():
@@ -244,34 +580,23 @@ class ContextCurator:
         if session._synthesis_task and not session._synthesis_task.done():
             return
         if len(session.history) > session.max_recent_turns:
-            # The coroutine takes the coordinator slot itself once it starts
             session._synthesis_task = asyncio.create_task(cls.async_synthesize_cuda(session))
 
     @classmethod
     def summarize_history_sync(cls, session: Any, turns: List[Dict[str, str]]) -> str:
-        """Extracts salient points from older turns. Tries CUDA synthesis first, then falls back."""
+        """Extracts salient points from older turns using the multi-tier synthesis pipeline."""
         if not turns:
             return ""
-        syn = cls.synthesize_context_cuda_sync(session, turns)
-        if syn:
-            return syn
-
-        summary_points = []
-        for t in turns:
-            role = t.get("role", "unknown").upper()
-            target = t.get("target", "").upper()
-            content = t.get("content", "").strip()
-            lines = [line.strip() for line in content.splitlines() if line.strip()]
-            if lines:
-                preview = lines[0][:140]
-                summary_points.append(f"• [{role} on {target}]: {preview}")
-        return "\n".join(summary_points)
+        if session._cached_curated_memory and session._cached_curated_memory.get("covered_turns") == len(turns):
+            return session._cached_curated_memory["summary"]
+        syn, _ = cls.synthesize_working_memory(session, turns, silent=True)
+        return syn
 
     @classmethod
     def compact_history(cls, session: Any, keep_recent: Optional[int] = None, silent: bool = False) -> int:
         """
-        Compact conversation history into structured Working Memory using NVIDIA RTX 4060 (:9001).
-        Preserves keep_recent turns verbatim.
+        Compact conversation history into structured Working Memory using the multi-tier pipeline.
+        Preserves keep_recent turns verbatim and eliminates empty/corrupted turns.
         """
         keep = keep_recent if keep_recent is not None else session.max_recent_turns
         if len(session.history) <= keep:
@@ -287,26 +612,13 @@ class ContextCurator:
         synthesized_by = None
         if session._cached_curated_memory and session._cached_curated_memory.get("covered_turns") == removed:
             synthesized_text = session._cached_curated_memory["summary"]
-            synthesized_by = "NVIDIA RTX 4060 (pre-computed cache)"
-        elif session.endpoints.get("9001", {}).get("status") == "online":
-            if not silent and not session.json_output:
-                print(f"{UI.CUDA_BOLD}[⚡ CUDA:9001]{UI.RST} {UI.GRAY}Synthesizing working memory on NVIDIA RTX 4060...{UI.RST}")
-            synthesized_text = cls.synthesize_context_cuda_sync(session, older)
-            if synthesized_text:
-                synthesized_by = "NVIDIA RTX 4060 (:9001)"
-
-        if synthesized_text:
-            summary_content = f"[Working Memory distilled by {synthesized_by}]\n{synthesized_text}"
+            synthesized_by = session._cached_curated_memory.get("synthesized_by") or "pre-computed cache"
         else:
-            summary_lines = ["[Compact Context Summary — earlier turns condensed]"]
-            for t in older:
-                role = t.get("role", "?").upper()
-                tgt = t.get("target", "?").upper()
-                content = t.get("content", "").strip()
-                lines = [l.strip() for l in content.splitlines() if l.strip()]
-                preview = lines[0][:180] if lines else "(empty)"
-                summary_lines.append(f"• [{role} on {tgt}]: {preview}")
-            summary_content = "\n".join(summary_lines)
+            if not silent and not session.json_output:
+                print(f"{UI.CUDA_BOLD}[⚡ Working Memory]{UI.RST} {UI.GRAY}Synthesizing context across multi-tier pipeline...{UI.RST}")
+            synthesized_text, synthesized_by = cls.synthesize_working_memory(session, older, silent=silent)
+
+        summary_content = f"[Working Memory distilled by {synthesized_by}]\n{synthesized_text}"
 
         summary_entry = {
             "role": "user",
@@ -319,15 +631,19 @@ class ContextCurator:
             "content": "[SYSTEM: Acknowledged. I have the distilled prior context and will continue from here.]",
         }
 
-        session.history = [summary_entry, companion_entry] + recent
+        # Filter out any corrupted or empty turns to prevent HTTP 400 "no content" errors on subsequent queries
+        sanitized_recent = [t for t in recent if t.get("content") and t["content"].strip()]
+
+        session.history = [summary_entry, companion_entry] + sanitized_recent
         session._active_local_agent = None
         session._cached_curated_memory = None
 
         if not silent:
             label_by = f" via {synthesized_by}" if synthesized_by else ""
             if RICH_AVAILABLE and not session.json_output:
-                console.print(f"\n[bold cyan]✓ History compacted{label_by}:[/bold cyan] [dim]{removed} old turn(s) → working memory. Kept {len(recent)} recent verbatim.[/dim]\n")
+                console.print(f"\n[bold cyan]✓ History compacted{label_by}:[/bold cyan] [dim]{removed} old turn(s) → working memory. Kept {len(sanitized_recent)} recent verbatim.[/dim]\n")
             else:
-                print(UI.ok(f"History compacted{label_by}: {removed} old turns → working memory. {len(recent)} recent turns kept verbatim."))
+                print(UI.ok(f"History compacted{label_by}: {removed} old turns → working memory. {len(sanitized_recent)} recent turns kept verbatim."))
 
         return removed
+
