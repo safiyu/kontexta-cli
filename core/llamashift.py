@@ -11,19 +11,30 @@ from typing import Optional, List, Dict, Any, Callable, Tuple
 
 from ..config import DEFAULT_MODEL_DIR, DEFAULT_LLAMASHIFT_URL
 
-_HEADERS = {"User-Agent": "Antigravity/1.0"}
+_BASE_HEADERS = {"User-Agent": "Antigravity/1.0"}
 STATUS_TTL = 2.0
 CONFIG_TTL = 30.0
 DOWN_TTL = 3.0
-START_TIMEOUT = 30.0
+START_TIMEOUT = 130.0  # a swap can wait out the 60s drain plus ~20s for the port to free
 
 _lock = threading.Lock()
 _cache: Dict[str, Any] = {"at": 0.0, "data": None, "down_until": 0.0, "state": "down"}
 _cfg_cache: Dict[str, Any] = {"at": 0.0, "master_port": None}
 
 
+def _headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Request headers; adds the management key when LLAMASHIFT_API_KEY is set (read per call)."""
+    headers = dict(_BASE_HEADERS)
+    key = os.environ.get("LLAMASHIFT_API_KEY", "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 def _get_json(url: str, timeout: float) -> Any:
-    req = urllib.request.Request(url, headers=_HEADERS)
+    req = urllib.request.Request(url, headers=_headers())
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -37,7 +48,7 @@ def invalidate_cache():
 def _probe_failure_state() -> str:
     """Tells 'starting' (health 503) apart from 'down' once per failure window."""
     try:
-        req = urllib.request.Request(f"{DEFAULT_LLAMASHIFT_URL}/api/health", headers=_HEADERS)
+        req = urllib.request.Request(f"{DEFAULT_LLAMASHIFT_URL}/api/health", headers=_headers())
         with urllib.request.urlopen(req, timeout=0.5):
             return "down"
     except urllib.error.HTTPError as e:
@@ -58,8 +69,9 @@ def get_status(max_age: float = STATUS_TTL) -> Optional[Dict[str, Any]]:
         data = _get_json(f"{DEFAULT_LLAMASHIFT_URL}/api/status", 1.0)
         if not isinstance(data, dict):
             raise ValueError("unexpected status payload")
-    except Exception:
-        state = _probe_failure_state()
+    except Exception as exc:
+        unauthorized = isinstance(exc, urllib.error.HTTPError) and exc.code == 401
+        state = "unauthorized" if unauthorized else _probe_failure_state()
         with _lock:
             _cache.update(data=None, down_until=time.monotonic() + DOWN_TTL, state=state)
         return None
@@ -69,7 +81,7 @@ def get_status(max_age: float = STATUS_TTL) -> Optional[Dict[str, Any]]:
 
 
 def shift_state() -> str:
-    """'up', 'starting' or 'down'."""
+    """'up', 'starting', 'unauthorized' (API key missing or wrong) or 'down'."""
     return "up" if get_status() is not None else _cache["state"]
 
 
@@ -97,14 +109,15 @@ def get_master_port(status: Optional[Dict[str, Any]] = None) -> str:
 
 def _normalize_models(status: Dict[str, Any]) -> List[Dict[str, Any]]:
     mode = status.get("mode", "single_port")
-    master_port = get_master_port(status)
+    master_port = None
     out = []
     for m in status.get("models", []):
         is_dedicated = bool(m.get("dedicated", False))
-        if mode == "single_port" and not is_dedicated:
-            effective_port = master_port
+        if m.get("effectivePort") is not None:
+            effective_port = str(m["effectivePort"])
         else:
-            effective_port = str(m.get("port", master_port))
+            master_port = master_port or get_master_port(status)
+            effective_port = master_port if mode == "single_port" and not is_dedicated else str(m.get("port", master_port))
         try:
             ctx_size = int(m.get("ctxSize") or 0)
         except (TypeError, ValueError):
@@ -195,7 +208,7 @@ def detect_port_model(port: int | str, fallback_url: Optional[str] = None) -> Di
 def query_endpoint_model(url: str, timeout: float = 1.0) -> Optional[str]:
     """Compatibility wrapper that queries a model URL."""
     try:
-        req = urllib.request.Request(f"{url.rstrip('/')}/models", headers={"User-Agent": "Antigravity/1.0"})
+        req = urllib.request.Request(f"{url.rstrip('/')}/models", headers=_BASE_HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
@@ -207,25 +220,36 @@ def query_endpoint_model(url: str, timeout: float = 1.0) -> Optional[str]:
     return None
 
 
+def _is_timeout(exc: BaseException) -> bool:
+    return isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
+
+
 def trigger_llamashift_switch(model_id: str) -> Dict[str, Any]:
-    """Starts or switches a model via LlamaShift; single_port swaps can take ~20s before it answers."""
+    """Starts or switches a model via LlamaShift; the result may carry `warnings`, or `timeout` when it kept working past our wait."""
     try:
         payload = json.dumps({"model": model_id}).encode("utf-8")
         req = urllib.request.Request(
             f"{DEFAULT_LLAMASHIFT_URL}/api/start",
             data=payload,
-            headers={"Content-Type": "application/json", **_HEADERS},
+            headers=_headers({"Content-Type": "application/json"}),
         )
         with urllib.request.urlopen(req, timeout=START_TIMEOUT) as resp:
             result = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
-            detail = json.loads(e.read().decode("utf-8")).get("error") or e.reason
+            body = json.loads(e.read().decode("utf-8"))
         except Exception:
-            detail = e.reason
-        result = {"error": str(detail)}
+            body = {}
+        detail = str(body.get("error") or e.reason)
+        if e.code == 401:
+            detail += " (set LLAMASHIFT_API_KEY)"
+        result = {"error": detail}
+        if isinstance(body.get("warnings"), list):
+            result["warnings"] = body["warnings"]
     except Exception as e:
         result = {"error": str(e)}
+        if _is_timeout(e):
+            result["timeout"] = True
     invalidate_cache()
     return result
 
@@ -273,6 +297,13 @@ def get_logs_tail(model_id: str, lines: int = 12) -> str:
         return ""
 
 
+def model_is_running(model_id: str) -> Optional[bool]:
+    """Fresh LlamaShift view of whether a profile is running; None when it cannot be told."""
+    status = get_status(max_age=0.0)
+    profile = next((m for m in _normalize_models(status) if m["id"] == model_id), None) if status else None
+    return None if profile is None else profile["status"] == "running"
+
+
 def _port_ready(port: int | str) -> bool:
     try:
         with urllib.request.urlopen(f"http://localhost:{int(port)}/health", timeout=1.0) as resp:
@@ -283,34 +314,43 @@ def _port_ready(port: int | str) -> bool:
 
 def ensure_ready(model_id: str, port: int | str, timeout: float = 45.0,
                  on_progress: Optional[Callable[[float], None]] = None) -> Dict[str, Any]:
-    """Starts a model and waits until its llama-server answers /health; returns {ok, reason, log_tail, elapsed}."""
+    """Starts a model and waits until its llama-server answers /health; returns {ok, reason, log_tail, elapsed, warnings}."""
     t0 = time.monotonic()
+    warnings: List[str] = []
 
     def fail(reason: str) -> Dict[str, Any]:
-        return {"ok": False, "reason": reason, "log_tail": get_logs_tail(model_id), "elapsed": time.monotonic() - t0}
+        return {"ok": False, "reason": reason, "log_tail": get_logs_tail(model_id),
+                "elapsed": time.monotonic() - t0, "warnings": warnings}
 
     res = trigger_llamashift_switch(model_id)
-    if "error" in res:
+    warnings = [str(w) for w in res.get("warnings", [])]
+    if "error" in res and not res.get("timeout"):
         return fail(f"start request failed: {res['error']}")
     if res.get("success") is False:
         return fail(str(res.get("message") or "start refused"))
 
+    # A timed-out start call means LlamaShift is still draining or spawning, so "not running yet" is not a crash.
+    start_pending = bool(res.get("timeout"))
+    seen_running = False
+    t_wait = time.monotonic()
     last_check = 0.0
     while True:
-        elapsed = time.monotonic() - t0
-        if _port_ready(port):
+        waited = time.monotonic() - t_wait
+        # On a shared port the old model still answers /health, so health alone is not proof the new one is up.
+        if _port_ready(port) and model_is_running(model_id) is not False:
             invalidate_cache()
-            return {"ok": True, "reason": "", "log_tail": "", "elapsed": elapsed}
-        if elapsed >= timeout:
+            return {"ok": True, "reason": "", "log_tail": "", "elapsed": time.monotonic() - t0, "warnings": warnings}
+        if waited >= timeout:
             return fail(f"not ready after {timeout:.0f}s")
-        if elapsed > 3.0 and elapsed - last_check >= 2.0:
-            last_check = elapsed
-            status = get_status(max_age=0.0)
-            profile = next((m for m in _normalize_models(status) if m["id"] == model_id), None) if status else None
-            if profile is not None and profile["status"] != "running":
+        if waited > 3.0 and waited - last_check >= 2.0:
+            last_check = waited
+            running = model_is_running(model_id)
+            if running:
+                seen_running = True
+            elif running is False and (seen_running or not start_pending):
                 return fail("the model process exited while loading")
         if on_progress:
-            on_progress(elapsed)
+            on_progress(time.monotonic() - t0)
         time.sleep(0.5)
 
 
@@ -320,10 +360,10 @@ def wake_compactor(port: int | str = 9001, timeout: float = 45.0,
     from ..config import COMPACTOR_MODEL_ID
     model_id = resolve_model_id(COMPACTOR_MODEL_ID)
     if model_id is None:
-        return {"ok": False, "reason": f"no LlamaShift profile matches '{COMPACTOR_MODEL_ID}' (set MYAGY_COMPACTOR_MODEL)", "log_tail": "", "elapsed": 0.0}
+        return {"ok": False, "reason": f"no LlamaShift profile matches '{COMPACTOR_MODEL_ID}' (set MYAGY_COMPACTOR_MODEL)", "log_tail": "", "elapsed": 0.0, "warnings": []}
     allowed, why = can_wake_secondary(model_id, port)
     if not allowed:
-        return {"ok": False, "reason": why, "log_tail": "", "elapsed": 0.0}
+        return {"ok": False, "reason": why, "log_tail": "", "elapsed": 0.0, "warnings": []}
     return ensure_ready(model_id, port, timeout, on_progress)
 
 

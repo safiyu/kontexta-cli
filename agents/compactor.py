@@ -137,6 +137,14 @@ def _query_local_endpoint(
 _noted_wake_reasons: set = set()
 
 
+def _note_wake_warnings(warnings: list):
+    """Shows LlamaShift VRAM warnings once per distinct text."""
+    for text in warnings:
+        if text not in _noted_wake_reasons:
+            _noted_wake_reasons.add(text)
+            say.warn(text)
+
+
 def _note_wake_skipped(reason: str):
     """Tells the user once per distinct reason why the compactor model was not started."""
     if reason not in _noted_wake_reasons:
@@ -281,6 +289,7 @@ class ContextCurator:
         ep9001 = session.endpoints.get("9001", {})
         if ep9001.get("status") != "online" and not _SKIP_CUDA_WAKE.get():
             woke = wake_compactor(9001)
+            _note_wake_warnings(woke["warnings"])
             if woke["ok"]:
                 session.refresh_endpoints()
                 ep9001 = session.endpoints.get("9001", {})
@@ -562,6 +571,7 @@ class ContextCurator:
         if session.endpoints.get("9001", {}).get("status") == "online":
             return
         woke = await asyncio.to_thread(wake_compactor, 9001)
+        _note_wake_warnings(woke["warnings"])
         if woke["ok"]:
             await asyncio.to_thread(session.refresh_endpoints)
         else:

@@ -48,6 +48,7 @@ from .llamashift import (
     get_llamashift_active,
     get_llamashift_models,
     get_logs_tail,
+    model_is_running,
     shift_state,
 )
 from ..context.mcp_loader import load_mcp_servers, check_oauth_available
@@ -283,6 +284,7 @@ class MultiGpuHybridSession:
         if state != self._shift_noted:
             note = {"down": "LlamaShift is not reachable, probing the model ports directly",
                     "starting": "LlamaShift is still starting",
+                    "unauthorized": "LlamaShift rejected the request, set LLAMASHIFT_API_KEY to its management key",
                     "up": "LlamaShift is reachable again"}[state]
             say.step(note)
             self._shift_noted = state
@@ -1749,6 +1751,12 @@ class MultiGpuHybridSession:
         say.table("", ["#", "ID", "Status", "Device and port", "Model", "Specialty"], rows)
         say.dim("Select with /model <# or id>, or send a one-shot with @<id> <prompt>. Inactive models hot-swap automatically.")
 
+    async def _swap_ready(self, port: int, model_id: str) -> bool:
+        """Port answers /health and LlamaShift agrees the new model is the one running (the old one may still answer)."""
+        if not await asyncio.to_thread(self._port_healthy, port):
+            return False
+        return await asyncio.to_thread(model_is_running, model_id) is not False
+
     @staticmethod
     def _port_healthy(port: int) -> bool:
         try:
@@ -1869,12 +1877,14 @@ class MultiGpuHybridSession:
         # Inactive model: trigger hot-swap
         say.step(f"hot-swapping {model_name} ({model_size}) onto {gpu_name} [{dev_str}] (port {port})")
         res = await asyncio.to_thread(trigger_llamashift_switch, mid)
-        if "error" in res:
+        for warning in res.get("warnings", []):
+            say.warn(str(warning))
+        if "error" in res and not res.get("timeout"):
             say.err(f"Llama-Shift switch request failed: {res['error']}")
             return False
 
         start_time = time.time()
-        timeout = 45.0
+        timeout = 45.0 + (60.0 if res.get("timeout") else 0.0)
         success = False
         target_port_int = int(port) if str(port).isdigit() else 9000
 
@@ -1884,14 +1894,14 @@ class MultiGpuHybridSession:
                     elapsed = time.time() - start_time
                     spin.update(f"[bold cyan]Loading {model_name} into {gpu_name} [{dev_str}] VRAM... [bold yellow]{elapsed:.1f}s[/bold yellow]")
                     await asyncio.sleep(0.5)
-                    if await asyncio.to_thread(self._port_healthy, target_port_int):
+                    if await self._swap_ready(target_port_int, mid):
                         success = True
                         break
         else:
             say.step("loading weights into VRAM")
             while time.time() - start_time < timeout:
                 await asyncio.sleep(1.0)
-                if await asyncio.to_thread(self._port_healthy, target_port_int):
+                if await self._swap_ready(target_port_int, mid):
                     success = True
                     break
 

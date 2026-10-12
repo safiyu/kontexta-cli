@@ -373,6 +373,8 @@ class SubagentManager:
             wake_note = ""
             if ep9001.get("status") != "online":
                 woke = await asyncio.to_thread(wake_compactor, 9001)
+                for warning in woke["warnings"]:
+                    say.warn(warning)
                 if woke["ok"]:
                     await asyncio.to_thread(session.refresh_endpoints)
                     ep9001 = session.endpoints.get("9001", {})

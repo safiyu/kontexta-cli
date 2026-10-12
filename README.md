@@ -103,6 +103,8 @@ python3 -m pytest
 | `MYAGY_MODEL_DIR` | `/home/safiyu/models` | GGUF model directory (also used by `launch_cuda_compactor.sh`) |
 | `MYAGY_KONTEXTA_MCP` | `~/Projects/kontexta/apps/mcp/dist/index.js` | Kontexta MCP entrypoint |
 | `MYAGY_KONTEXTA_DATA` | `~/.local/share/kontexta` | Kontexta data directory |
+| `MYAGY_COMPACTOR_MODEL` | `granite42_8b` | LlamaShift profile id for the compactor and subagents (matched by name if the id is absent) |
+| `LLAMASHIFT_API_KEY` | unset | LlamaShift `managementApiKey`, sent as a Bearer token on `/api/*` calls |
 | `LLAMA_SERVER_BIN` | `/home/safiyu/llama.cpp-cuda/build/bin/llama-server` | llama-server binary for the compactor script |
 
 ### 3. Configure Bash Alias

@@ -954,6 +954,8 @@ async def _cmd_compactor(session, arg, ctx):
     if arg_low in ("start", "on", "launch", "wake"):
         say.step("starting the compactor model on port 9001 via LlamaShift")
         res = await asyncio.to_thread(wake_compactor, 9001)
+        for warning in res["warnings"]:
+            say.warn(warning)
         if res["ok"]:
             say.ok(f"NVIDIA Compactor ready in {res['elapsed']:.1f}s.")
             await asyncio.to_thread(session.refresh_endpoints)

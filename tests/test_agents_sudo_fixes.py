@@ -271,7 +271,7 @@ def test_async_compaction_does_not_block_when_history_grew(session, monkeypatch)
 
     monkeypatch.setattr(ContextCurator, "synthesize_context_cuda_sync", staticmethod(synth))
     monkeypatch.setattr(ContextCurator, "compact_history", classmethod(boom))
-    monkeypatch.setattr(compactor, "wake_compactor", lambda port=9001, **k: {"ok": False, "reason": "off", "log_tail": "", "elapsed": 0.0})
+    monkeypatch.setattr(compactor, "wake_compactor", lambda port=9001, **k: {"ok": False, "reason": "off", "log_tail": "", "elapsed": 0.0, "warnings": []})
 
     asyncio.run(ContextCurator.async_synthesize_cuda(session))
     assert len(session.history) == 25
@@ -280,7 +280,7 @@ def test_async_compaction_does_not_block_when_history_grew(session, monkeypatch)
 
 def test_cuda_wake_happens_once_on_the_event_loop(session, monkeypatch):
     woke = []
-    monkeypatch.setattr(compactor, "wake_compactor", lambda port=9001, **k: woke.append(port) or {"ok": False, "reason": "x", "log_tail": "", "elapsed": 0.0})
+    monkeypatch.setattr(compactor, "wake_compactor", lambda port=9001, **k: woke.append(port) or {"ok": False, "reason": "x", "log_tail": "", "elapsed": 0.0, "warnings": []})
     session.history = [{"role": "user", "target": "9000", "content": f"t{i}"} for i in range(24)]
     asyncio.run(ContextCurator.async_synthesize_cuda(session))
     assert woke == [9001]

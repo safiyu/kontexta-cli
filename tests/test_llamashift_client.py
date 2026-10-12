@@ -1,5 +1,7 @@
+import asyncio
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -9,21 +11,29 @@ from myagy.agents import compactor
 from myagy.agents.compactor import ContextCurator
 
 
-def _status(mode="multi_port", granite_port=9001, running=("qwen27",), granite_dedicated=False):
+def _status(mode="multi_port", granite_port=9001, running=("qwen27",), granite_dedicated=False, effective=False):
     def model(mid, port, ctx, fname, dedicated=False):
         return {"id": mid, "name": mid.upper(), "filename": fname, "port": port, "ctxSize": ctx, "dedicated": dedicated,
                 "status": "running" if mid in running else "stopped", "gpu": "GPU", "size": "8B"}
-    return {"mode": mode, "models": [
+    models = [
         model("qwen27", 9000, 65152, "qwen27.gguf"),
         model("granite_8b_q4", granite_port, 26384, "granite-4.2-8b.gguf", granite_dedicated),
-    ]}
+    ]
+    if effective:
+        for m in models:
+            m["effectivePort"] = 19000 if mode == "single_port" and not m["dedicated"] else m["port"]
+    return {"mode": mode, "models": models}
 
 
 class FakeShift:
     """Serves LlamaShift's /api/* plus a llama-server style /health on the same port."""
 
-    def __init__(self, status, health_503_first=0, health_ok=True, master_port=9000, logs=None):
+    def __init__(self, status, health_503_first=0, health_ok=True, master_port=9000, logs=None,
+                 api_key=None, start_delay=0.0, start_warnings=None, start_code=200, running_after=0.0):
         self.status, self.paths = status, []
+        self.api_key, self.start_delay = api_key, start_delay
+        self.running_after, self.started = running_after, {}
+        self.start_warnings, self.start_code = start_warnings or [], start_code
         self.config = {"mode": status.get("mode", "single_port"), "masterPort": master_port}
         self.logs = ["line one", "line two"] if logs is None else logs
         self.health_left, self.health_ok = health_503_first, health_ok
@@ -41,9 +51,24 @@ class FakeShift:
                 self.end_headers()
                 self.wfile.write(raw)
 
+            def _authorized(self):
+                if not outer.api_key or not self.path.startswith("/api/") or self.path.startswith("/api/health"):
+                    return True
+                if self.headers.get("Authorization") == f"Bearer {outer.api_key}":
+                    return True
+                self._send(401, {"error": "Unauthorized: a valid management API key or PIN session is required"})
+                return False
+
             def do_GET(self):
                 outer.paths.append(self.path)
+                if not self._authorized():
+                    return
                 if self.path.startswith("/api/status"):
+                    now = time.monotonic()
+                    for m in outer.status["models"]:
+                        t = outer.started.get(m["id"])
+                        if t is not None and now - t >= outer.running_after:
+                            m["status"] = "running"
                     self._send(200, outer.status)
                 elif self.path.startswith("/api/config"):
                     self._send(200, outer.config)
@@ -60,11 +85,18 @@ class FakeShift:
 
             def do_POST(self):
                 outer.paths.append(self.path)
+                if not self._authorized():
+                    return
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                if outer.start_delay:
+                    time.sleep(outer.start_delay)
                 if body.get("model") == "missing":
                     self._send(400, {"error": "Invalid or missing 'model' parameter"})
+                elif outer.start_code == 409:
+                    self._send(409, {"error": "Not enough free VRAM. Send force to start anyway.", "warnings": outer.start_warnings})
                 else:
-                    self._send(200, {"success": True})
+                    outer.started[body.get("model")] = time.monotonic()
+                    self._send(200, {"success": True, "warnings": outer.start_warnings})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.port = self.server.server_address[1]
@@ -241,3 +273,118 @@ def test_refresh_endpoints_announces_transitions_once(monkeypatch, capsys):
     text = out.out + out.err
     assert text.count("not reachable") == 1
     assert text.count("reachable again") == 1
+
+
+def test_api_key_is_sent_when_configured(shift, monkeypatch):
+    shift(api_key="s3cret")
+    monkeypatch.setenv("LLAMASHIFT_API_KEY", "s3cret")
+    assert ls.shift_state() == "up"
+    assert [m["id"] for m in ls.get_llamashift_active()] == ["qwen27"]
+
+
+def test_missing_key_is_reported_as_unauthorized_not_down(shift, monkeypatch):
+    shift(api_key="s3cret")
+    monkeypatch.delenv("LLAMASHIFT_API_KEY", raising=False)
+    assert ls.get_status() is None
+    assert ls.shift_state() == "unauthorized"
+    res = ls.trigger_llamashift_switch("granite_8b_q4")
+    assert "LLAMASHIFT_API_KEY" in res["error"]
+
+
+def test_wrong_key_is_unauthorized(shift, monkeypatch):
+    shift(api_key="s3cret")
+    monkeypatch.setenv("LLAMASHIFT_API_KEY", "nope")
+    assert ls.shift_state() == "unauthorized"
+
+
+def test_slow_start_timeout_keeps_polling_instead_of_failing(shift, monkeypatch):
+    fake = shift(start_delay=1.5)
+    monkeypatch.setattr(ls, "START_TIMEOUT", 0.4)
+    res = ls.trigger_llamashift_switch("granite_8b_q4")
+    assert res.get("timeout") is True
+    res = ls.ensure_ready("granite_8b_q4", fake.port, timeout=10)
+    assert res["ok"], res
+
+
+def test_readiness_window_starts_after_the_start_call_returns(shift, monkeypatch):
+    fake = shift(start_delay=1.0, health_503_first=2)
+    res = ls.ensure_ready("granite_8b_q4", fake.port, timeout=5)
+    assert res["ok"] and res["elapsed"] >= 1.0
+
+
+def test_start_warnings_are_returned(shift):
+    fake = shift(start_warnings=["Model may not fit: 9.1 GB needed, 6.0 GB free"])
+    res = ls.ensure_ready("granite_8b_q4", fake.port, timeout=5)
+    assert res["ok"] and res["warnings"] == ["Model may not fit: 9.1 GB needed, 6.0 GB free"]
+
+
+def test_strict_vram_409_surfaces_message_and_warnings(shift):
+    fake = shift(start_code=409, start_warnings=["Model may not fit"])
+    res = ls.ensure_ready("granite_8b_q4", fake.port, timeout=2)
+    assert not res["ok"] and "Not enough free VRAM" in res["reason"]
+    assert res["warnings"] == ["Model may not fit"]
+
+
+def test_effective_port_from_status_needs_no_config_call(shift):
+    fake = shift(_status(mode="single_port", effective=True), master_port=1234)
+    ports = {m["id"]: m["port"] for m in ls.get_llamashift_models()}
+    assert ports == {"qwen27": "19000", "granite_8b_q4": "19000"}
+    assert "/api/config" not in fake.paths
+    assert ls.ctx_size_for_port(19000) == 65152
+
+
+def test_wake_result_always_carries_warnings(shift, monkeypatch):
+    shift(_status(mode="single_port"))
+    monkeypatch.setattr("myagy.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
+    assert ls.wake_compactor(9001, timeout=1)["warnings"] == []
+
+
+def test_refresh_endpoints_explains_unauthorized(monkeypatch, capsys):
+    from myagy.core import session as sess_mod
+    monkeypatch.setattr(sess_mod, "shift_state", lambda: "unauthorized")
+    monkeypatch.setattr(sess_mod, "get_llamashift_active", lambda: [])
+    offline = {"model_path": "", "filename": "x", "name": "x", "status": "offline", "source": "none", "port": 0, "gpu": ""}
+    monkeypatch.setattr(sess_mod, "detect_port_model", lambda *a, **k: offline)
+    s = sess_mod.MultiGpuHybridSession(enable_mcp=False, json_output=False)
+    s.refresh_endpoints()
+    out = capsys.readouterr()
+    assert "LLAMASHIFT_API_KEY" in out.out + out.err
+
+
+def test_compactor_start_command_shows_vram_warnings(monkeypatch, capsys):
+    from myagy.terminal import cli
+
+    monkeypatch.setattr(cli, "wake_compactor", lambda port=9001, **k: {
+        "ok": True, "reason": "", "log_tail": "", "elapsed": 2.0, "warnings": ["Model may not fit: 9 GB needed"]})
+
+    class Fake:
+        json_output = False
+        endpoints = {}
+
+        def refresh_endpoints(self):
+            return {}
+
+    asyncio.run(cli.COMMANDS["/compactor"](Fake(), "start", None))
+    out = capsys.readouterr()
+    assert "Model may not fit" in out.out + out.err
+
+
+def test_ensure_ready_waits_for_status_when_old_model_still_answers_health(shift):
+    fake = shift(_status(running=("qwen27",)), running_after=1.5)
+    t0 = time.monotonic()
+    res = ls.ensure_ready("granite_8b_q4", fake.port, timeout=10)
+    assert res["ok"]
+    assert time.monotonic() - t0 >= 1.4
+
+
+def test_draining_swap_is_not_mistaken_for_a_crash(shift, monkeypatch):
+    fake = shift(_status(running=("qwen27",)), start_delay=0.8, running_after=4.5)
+    monkeypatch.setattr(ls, "START_TIMEOUT", 0.3)
+    res = ls.ensure_ready("granite_8b_q4", fake.port, timeout=15)
+    assert res["ok"], res
+
+
+def test_real_crash_is_still_detected(shift):
+    fake = shift(_status(running=("qwen27",)), health_ok=False, running_after=999)
+    res = ls.ensure_ready("granite_8b_q4", fake.port, timeout=8)
+    assert not res["ok"] and "exited" in res["reason"]
