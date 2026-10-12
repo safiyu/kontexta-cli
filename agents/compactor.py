@@ -14,7 +14,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from ..config import OAUTH_TOKEN_PATH
 from ..terminal.ui import UI
 from ..terminal import say
-from ..core.llamashift import trigger_llamashift_switch
+from ..core.llamashift import wake_compactor, ctx_size_for_port
 from ..core.coordinator import CudaCoordinator
 
 
@@ -134,6 +134,16 @@ def _query_local_endpoint(
         return None
 
 
+_noted_wake_reasons: set = set()
+
+
+def _note_wake_skipped(reason: str):
+    """Tells the user once per distinct reason why the compactor model was not started."""
+    if reason not in _noted_wake_reasons:
+        _noted_wake_reasons.add(reason)
+        say.step(f"compactor model not started: {reason}")
+
+
 class ContextCurator:
     """Manages context telemetry, slot tracking, and continuous working memory synthesis on NVIDIA CUDA."""
 
@@ -162,7 +172,7 @@ class ContextCurator:
                         max_ctx = slot0.get("n_ctx")
                         is_exact = bool(n_tokens and max_ctx)
                         if n_tokens and not max_ctx:
-                            max_ctx = 131072
+                            max_ctx = ctx_size_for_port(port) or 131072
             except Exception:
                 pass
 
@@ -172,7 +182,7 @@ class ContextCurator:
             hist_len = sum(len(h.get("content", "")) for h in session.history)
             n_tokens = int((sys_len + hist_len) / 3.6)
             if tgt in ("9000", "9001"):
-                max_ctx = 131072
+                max_ctx = ctx_size_for_port(session.endpoints[tgt]["port"]) or 131072
             else:
                 max_ctx = 1048576  # Gemini 1M context
 
@@ -270,17 +280,12 @@ class ContextCurator:
             return None
         ep9001 = session.endpoints.get("9001", {})
         if ep9001.get("status") != "online" and not _SKIP_CUDA_WAKE.get():
-            try:
-                start_res = trigger_llamashift_switch("granite42_8b")
-                if start_res.get("success"):
-                    for _ in range(8):
-                        time.sleep(0.5)
-                        session.refresh_endpoints()
-                        if session.endpoints.get("9001", {}).get("status") == "online":
-                            ep9001 = session.endpoints["9001"]
-                            break
-            except Exception:
-                pass
+            woke = wake_compactor(9001)
+            if woke["ok"]:
+                session.refresh_endpoints()
+                ep9001 = session.endpoints.get("9001", {})
+            else:
+                _note_wake_skipped(woke["reason"])
         if ep9001.get("status") != "online":
             return None
 
@@ -556,16 +561,11 @@ class ContextCurator:
         """Starts :9001 and refreshes endpoints on the event loop, so the synthesis thread never mutates session state."""
         if session.endpoints.get("9001", {}).get("status") == "online":
             return
-        try:
-            start_res = await asyncio.to_thread(trigger_llamashift_switch, "granite42_8b")
-            if start_res.get("success"):
-                for _ in range(8):
-                    await asyncio.sleep(0.5)
-                    session.refresh_endpoints()
-                    if session.endpoints.get("9001", {}).get("status") == "online":
-                        break
-        except Exception:
-            pass
+        woke = await asyncio.to_thread(wake_compactor, 9001)
+        if woke["ok"]:
+            await asyncio.to_thread(session.refresh_endpoints)
+        else:
+            _note_wake_skipped(woke["reason"])
 
     @classmethod
     async def async_synthesize_cuda(cls, session: Any):

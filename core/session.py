@@ -47,6 +47,8 @@ from .llamashift import (
     trigger_llamashift_switch,
     get_llamashift_active,
     get_llamashift_models,
+    get_logs_tail,
+    shift_state,
 )
 from ..context.mcp_loader import load_mcp_servers, check_oauth_available
 from ..context.kontexta import KontextaManager
@@ -123,6 +125,7 @@ class MultiGpuHybridSession:
         multiline_input: bool = True,
         verbose: bool = False,
     ):
+        self._shift_noted: str = "up"
         self.cloud_model = cloud_model
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.has_oauth = check_oauth_available()
@@ -256,15 +259,10 @@ class MultiGpuHybridSession:
                 pass
 
     def refresh_endpoints(self) -> Dict[str, Any]:
-        """
-        Dynamically refreshes Port 9000 and Port 9001 model state. Zero hardcoding.
-        Strategy:
-          1. Single GET /api/active call — resolves all running models in one shot.
-          2. Per-port fallback via detect_port_model() for any port not covered by /api/active.
-        """
+        """Refreshes port 9000/9001 model state from one cached LlamaShift /api/status, then probes ports directly."""
         model_dir = DEFAULT_MODEL_DIR
 
-        # Try to resolve all ports in one shot via /api/active
+        # Resolve running models from the cached LlamaShift status in one shot
         active_by_port: Dict[int, Dict] = {}
         try:
             active_list = get_llamashift_active()
@@ -280,6 +278,14 @@ class MultiGpuHybridSession:
                     active_by_port[int(m_port)] = m
         except Exception:
             pass
+
+        state = shift_state()
+        if state != self._shift_noted:
+            note = {"down": "LlamaShift is not reachable, probing the model ports directly",
+                    "starting": "LlamaShift is still starting",
+                    "up": "LlamaShift is reachable again"}[state]
+            say.step(note)
+            self._shift_noted = state
 
         for port_str, ep in self.endpoints.items():
             port_int = ep["port"]
@@ -1891,6 +1897,9 @@ class MultiGpuHybridSession:
 
         if not success:
             say.err(f"Timed out after {timeout:.0f}s waiting for {model_name} on port {target_port_int}.")
+            tail = await asyncio.to_thread(get_logs_tail, mid)
+            if tail:
+                say.detail(tail)
             return False
 
         elapsed = time.time() - start_time

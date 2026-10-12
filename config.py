@@ -13,6 +13,9 @@ PLANS_DIR = os.path.expanduser("~/.myagy/plans")
 PREFS_PATH = os.path.expanduser("~/.myagy/config.json")
 HISTORY_PATH = os.path.expanduser("~/.myagy/prompt_history")
 
+# LlamaShift profile id for the CUDA compactor and subagents
+COMPACTOR_MODEL_ID = os.environ.get("MYAGY_COMPACTOR_MODEL", "granite42_8b")
+
 # Default Service Endpoints & Ports
 PORT_ROCM = 9000
 PORT_CUDA = 9001

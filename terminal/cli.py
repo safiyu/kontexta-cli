@@ -18,7 +18,7 @@ from ..config import (
 from . import say
 from .ui import UI, StreamRenderer
 from ..core.prefs import PREF_DEFAULTS, load_prefs, reset_prefs
-from ..core.llamashift import trigger_llamashift_switch
+from ..core.llamashift import wake_compactor
 from ..context.mcp_loader import load_mcp_servers, McpStdioServer
 from ..core.session import MultiGpuHybridSession
 from ..core.sudo_manager import SudoManager
@@ -952,13 +952,15 @@ async def _cmd_exit(session, arg, ctx):
 async def _cmd_compactor(session, arg, ctx):
     arg_low = arg.lower()
     if arg_low in ("start", "on", "launch", "wake"):
-        say.step("Llama-Launcher: starting IBM Granite 4.2 8B on NVIDIA RTX 4060 (port 9001)...")
-        res = await asyncio.to_thread(trigger_llamashift_switch, "granite42_8b")
-        if res.get("success"):
-            say.ok("NVIDIA Compactor started successfully via Llama-Launcher.")
+        say.step("starting the compactor model on port 9001 via LlamaShift")
+        res = await asyncio.to_thread(wake_compactor, 9001)
+        if res["ok"]:
+            say.ok(f"NVIDIA Compactor ready in {res['elapsed']:.1f}s.")
             await asyncio.to_thread(session.refresh_endpoints)
         else:
-            say.err(f"Failed to start compactor: {res.get('error', res)}")
+            say.err(f"Compactor not started: {res['reason']}")
+            if res["log_tail"]:
+                say.detail(res["log_tail"])
     elif arg_low in ("status", ""):
         await asyncio.to_thread(session.refresh_endpoints)
         ep = session.endpoints.get("9001", {})

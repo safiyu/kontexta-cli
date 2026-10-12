@@ -79,7 +79,7 @@ def test_falls_back_to_plain_when_agent_fails(online_session, monkeypatch):
 
 
 def test_offline_port_fails_cleanly(session, monkeypatch):
-    monkeypatch.setattr(sa, "trigger_llamashift_switch", lambda m: {"error": "down"})
+    monkeypatch.setattr(sa, "wake_compactor", lambda port=9001, **k: {"ok": False, "reason": "down", "log_tail": "", "elapsed": 0.0})
     task = SubagentTask(3, "x")
     _run(task, session)
     assert task.status == "failed" and "offline" in task.error

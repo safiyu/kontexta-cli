@@ -19,7 +19,7 @@ from google.antigravity.hooks import policy
 from ..terminal.ui import UI
 from ..terminal import say
 from ..core.coordinator import CudaCoordinator
-from ..core.llamashift import trigger_llamashift_switch
+from ..core.llamashift import wake_compactor
 from ..core import shellparse
 
 
@@ -370,21 +370,17 @@ class SubagentManager:
         try:
             # 1. Ensure Port 9001 is online (auto-wake via llama-launcher if needed)
             ep9001 = session.endpoints.get("9001", {})
+            wake_note = ""
             if ep9001.get("status") != "online":
-                try:
-                    start_res = trigger_llamashift_switch("granite42_8b")
-                    if start_res.get("success"):
-                        for _ in range(8):
-                            await asyncio.sleep(0.5)
-                            session.refresh_endpoints()
-                            if session.endpoints.get("9001", {}).get("status") == "online":
-                                ep9001 = session.endpoints["9001"]
-                                break
-                except Exception:
-                    pass
+                woke = await asyncio.to_thread(wake_compactor, 9001)
+                if woke["ok"]:
+                    await asyncio.to_thread(session.refresh_endpoints)
+                    ep9001 = session.endpoints.get("9001", {})
+                else:
+                    wake_note = f" ({woke['reason']})"
 
             if ep9001.get("status") != "online":
-                raise RuntimeError("NVIDIA RTX 4060 (Port 9001) is offline. Start it via llama-launcher or /compactor start.")
+                raise RuntimeError(f"NVIDIA RTX 4060 (Port 9001) is offline{wake_note}. Start it via LlamaShift or /compactor start.")
 
             res_text = None
             # Check if this task involves running a build or shell command
