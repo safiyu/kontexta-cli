@@ -1,4 +1,5 @@
 import os
+import shutil
 import pytest
 
 from myagy.context.kontexta import KontextaManager
@@ -20,7 +21,7 @@ def test_kontexta_create_mcp_server():
     if KontextaManager.is_available():
         assert server is not None
         assert server.name == "kxta"
-        assert server.command in ("node", "/usr/bin/node")
+        assert server.command == (shutil.which("node") or "node")
         assert "KONTEXTA_DATA_DIR" in server.env
         assert server.env["NODE_ENV"] == "production"
 

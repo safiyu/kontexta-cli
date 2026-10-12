@@ -10,24 +10,29 @@ Thin entry point delegating to the `myagy` package:
   - terminal/: REPL (cli.py), UI styling, ESC listener
 """
 
-import sys
-import os
 import asyncio
+import importlib
+import os
+import sys
 
-# Ensure the package parent directory is in sys.path
-_PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_NAME = __package__ or os.path.basename(_PKG_DIR)
 
-# Only the parent dir goes on the path so subpackages stay namespaced under myagy
-if _PARENT_DIR not in sys.path:
-    sys.path.insert(0, _PARENT_DIR)
+# Only the parent dir goes on the path so subpackages stay namespaced under the package name
+if not __package__:
+    _PARENT_DIR = os.path.dirname(_PKG_DIR)
+    if _PARENT_DIR not in sys.path:
+        sys.path.insert(0, _PARENT_DIR)
 
-# Support running directly as a script or importing as a module
-if __package__ is None or __package__ == "":
-    from myagy import *
-    from myagy.terminal.cli import main
-else:
-    from . import *
-    from .terminal.cli import main
+
+def __getattr__(name):
+    # Backward-compat re-exports resolve lazily so importing this wrapper stays cheap
+    return getattr(importlib.import_module(_PKG_NAME), name)
+
+
+def main():
+    return importlib.import_module(f"{_PKG_NAME}.terminal.cli").main()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

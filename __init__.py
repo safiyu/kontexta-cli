@@ -37,6 +37,10 @@ def __getattr__(name):
     return value
 
 
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY))
+
+
 __all__ = [
     # Core
     "MultiGpuHybridSession",

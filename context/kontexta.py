@@ -3,16 +3,14 @@
 import os
 import shutil
 import sqlite3
+from contextlib import closing
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 from ..config import KONTEXTA_MCP_PATH, KONTEXTA_DATA_DIR
 from ..terminal.ui import UI
 
-try:
-    from google.antigravity.types import McpStdioServer
-except ImportError:
-    from .mcp_loader import McpStdioServer
+from google.antigravity.types import McpStdioServer
 
 
 class KontextaManager:
@@ -24,7 +22,6 @@ class KontextaManager:
         candidates = [
             os.environ.get("KONTEXTA_MCP_PATH"),
             KONTEXTA_MCP_PATH,
-            os.path.expanduser("~/Projects/kontexta/apps/mcp/dist/index.js"),
             os.path.expanduser("~/kontexta/apps/mcp/dist/index.js"),
             os.path.expanduser("~/.local/share/kontexta/mcp/dist/index.js"),
         ]
@@ -83,7 +80,7 @@ class KontextaManager:
         try:
             # Open with read-only URI
             uri = f"file:{db_path}?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=1.0) as conn:
+            with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
                 cur = conn.cursor()
                 cur.execute(sql, params)
                 return cur.fetchall()
@@ -144,9 +141,8 @@ class KontextaManager:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
-            with sqlite3.connect(db_path, timeout=3.0) as conn:
-                cur = conn.cursor()
-                cur.execute(
+            with closing(sqlite3.connect(db_path, timeout=3.0)) as conn:
+                conn.execute(
                     "INSERT INTO projects (name, slug, description, path, created_at) VALUES (?, ?, ?, ?, ?)",
                     (base_name, base_slug, base_desc, abs_root, now_str)
                 )

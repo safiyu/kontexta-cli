@@ -5,9 +5,9 @@ import os
 # Filesystem & Persistence Directories
 SESSIONS_DIR = os.path.expanduser("~/.gemini/antigravity-cli/sessions")
 MCP_CONFIG_PATH = os.path.expanduser("~/.gemini/config/mcp_config.json")
-KONTEXTA_MCP_PATH = os.path.expanduser("~/Projects/kontexta/apps/mcp/dist/index.js")
-KONTEXTA_DATA_DIR = os.path.expanduser("~/.local/share/kontexta")
-DEFAULT_MODEL_DIR = "/home/safiyu/models"
+KONTEXTA_MCP_PATH = os.path.expanduser(os.environ.get("MYAGY_KONTEXTA_MCP", "~/Projects/kontexta/apps/mcp/dist/index.js"))
+KONTEXTA_DATA_DIR = os.path.expanduser(os.environ.get("MYAGY_KONTEXTA_DATA", "~/.local/share/kontexta"))
+DEFAULT_MODEL_DIR = os.path.expanduser(os.environ.get("MYAGY_MODEL_DIR", "/home/safiyu/models"))
 OAUTH_TOKEN_PATH = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 PLANS_DIR = os.path.expanduser("~/.myagy/plans")
 PREFS_PATH = os.path.expanduser("~/.myagy/config.json")

@@ -1,10 +1,32 @@
 """Convai Innovations Laya System 1 Decision Model Client (~421M ModernBERT, ~33ms)."""
 
 import json
+import re
 import urllib.request
 from typing import Optional, List, Dict, Any
 
 from ..config import DEFAULT_LAYA_ENDPOINT
+from . import shellparse
+
+
+def _word(pattern: str) -> "re.Pattern":
+    return re.compile(rf"(?<![\w.-]){pattern}(?![\w-])")
+
+
+_HIGH_RISK = [
+    _word(r"(?:sudo|su|doas|pkexec)"),
+    _word(r"rm"),
+    re.compile(r"drop\s+table|delete\s+from|git\s+push|git\s+reset\s+--hard|dd\s+if=|chmod\s+777|format\s+disk"),
+    _word(r"(?:gcloud|aws|deploy|shutdown|reboot|truncate)"),
+    re.compile(r"(?<![\w-])mkfs"),
+    re.compile(r"(?:curl|wget)\b[^|]*\|\s*(?:\S*/)?(?:ba|z|da|k)?sh\b"),
+]
+_MODERATE_RISK = [
+    _word(r"(?:pkill|kill)"),
+    re.compile(r"npm\s+install|pip3?\s+install|docker(?:-compose)?\b"),
+]
+_SHELL_TOOLS = {"run_command", "bash", "shell", "execute_command", "run_terminal_cmd", "exec"}
+_COMMAND_KEYS = ("CommandLine", "command", "cmd")
 
 
 class LayaDecisionEngine:
@@ -77,21 +99,34 @@ class LayaDecisionEngine:
         selected = max(probs, key=probs.get)
         return {"selected": selected, "probabilities": probs, "latency_ms": 32.8}
 
+    @staticmethod
+    def _extract_command(state: str) -> str:
+        idx = state.find("Args:")
+        if idx >= 0:
+            try:
+                args = json.loads(state[idx + 5:])
+                if isinstance(args, dict):
+                    for key in _COMMAND_KEYS:
+                        if isinstance(args.get(key), str):
+                            return args[key]
+            except ValueError:
+                pass
+        return state
+
     def _fallback_noul(self, state: str, proposition: str) -> float:
-        lower = state.lower()
-        high_risk_patterns = [
-            "rm ", "rm -rf", "drop table", "delete from", "git push", "git reset --hard",
-            "gcloud ", "aws ", "deploy", "shutdown", "reboot", "mkfs", "dd if=", "chmod 777",
-            "truncate", "format disk"
-        ]
-        for p in high_risk_patterns:
-            if p in lower:
-                return 0.05
-        moderate_risk = ["pkill", "kill ", "npm install", "pip install", "docker", "docker-compose"]
-        for p in moderate_risk:
-            if p in lower:
-                return 0.60
-        return 0.98
+        # JSON-encoded newlines would glue words together and defeat the word boundaries
+        norm = re.sub(r"\\[ntr]", " ", state.lower())
+        if any(rx.search(norm) for rx in _HIGH_RISK):
+            return 0.05
+        if any(rx.search(norm) for rx in _MODERATE_RISK):
+            return 0.60
+
+        m = re.match(r"\s*tool:\s*(\S+)", state, re.IGNORECASE)
+        tool = m.group(1).lower() if m else ""
+        if tool and tool not in _SHELL_TOOLS:
+            return 0.98
+        # Shell commands outside the read-only allowlist must stay below the 0.90 auto-approve bar
+        return 0.98 if shellparse.is_read_only(self._extract_command(state)) else 0.75
 
     def route_prompt(self, prompt: str) -> tuple[str, float]:
         """

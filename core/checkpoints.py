@@ -10,6 +10,7 @@ class Checkpoints:
     """Snapshots the working tree as git tree objects without touching the real index."""
 
     MAX_TURNS = 20
+    MAX_UNTRACKED_BYTES = 5 * 1024 * 1024
 
     @staticmethod
     def _git(args: List[str], cwd: str, env: Optional[dict] = None, check: bool = True) -> str:
@@ -28,12 +29,28 @@ class Checkpoints:
             return None
 
     @classmethod
+    def _oversized_untracked(cls, root: str) -> List[str]:
+        """Untracked, non-ignored files above the size cap; snapshotting them would bloat .git/objects."""
+        out = cls._git(["ls-files", "--others", "--exclude-standard", "-z"], root)
+        big = []
+        for rel in out.split("\0"):
+            if not rel:
+                continue
+            try:
+                if os.path.getsize(os.path.join(root, rel)) > cls.MAX_UNTRACKED_BYTES:
+                    big.append(rel)
+            except OSError:
+                pass
+        return big
+
+    @classmethod
     def snapshot(cls, root: str) -> Optional[str]:
         """Returns a tree hash of the current working tree (tracked + untracked, not ignored)."""
         tmpdir = tempfile.mkdtemp(prefix="myagy-idx-")
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmpdir, "index"))
         try:
-            cls._git(["add", "-A", "--", "."], root, env)
+            excludes = [f":(exclude,literal){p}" for p in cls._oversized_untracked(root)]
+            cls._git(["add", "-A", "--", ".", *excludes], root, env)
             return cls._git(["write-tree"], root, env).strip() or None
         except Exception:
             return None
@@ -57,10 +74,12 @@ class Checkpoints:
         return result
 
     @classmethod
-    def diff(cls, root: str, before: str, after: str, stat: bool = False) -> str:
+    def diff(cls, root: str, before: str, after: str, stat: bool = False, numstat: bool = False) -> str:
         args = ["diff", "--no-renames", "--no-color"]
         if stat:
             args.append("--stat")
+        if numstat:
+            args.append("--numstat")
         return cls._git([*args, before, after], root)
 
     @classmethod
