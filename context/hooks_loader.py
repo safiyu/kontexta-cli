@@ -12,6 +12,7 @@ Conforms to Antigravity Customization Specification (.agents/hooks.json, ~/.gemi
 import json
 import os
 import re
+import signal
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 from google.antigravity import hooks, types
@@ -26,6 +27,55 @@ HOOKS_CANDIDATE_PATHS = [
     # Global machine config
     os.path.expanduser("~/.gemini/config/hooks.json"),
 ]
+
+
+EVENT_KEYS = ("PreToolUse", "PostToolUse", "PreTurn", "PostTurn", "PreInvocation", "PostInvocation", "Stop")
+
+
+def _normalize_hook(h: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(h, str):
+        h = {"command": h}
+    if not isinstance(h, dict) or not isinstance(h.get("command"), str) or not h["command"].strip():
+        return None
+    timeout = h.get("timeout", 30)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        timeout = 30
+    return {"command": h["command"], "timeout": timeout}
+
+
+def _normalize_event(value: Any) -> List[Dict[str, Any]]:
+    """Coerces one event entry into [{"matcher": str, "hooks": [{"command", "timeout"}]}]."""
+    if value is None:
+        return []
+    if isinstance(value, (dict, str)):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    groups = []
+    for group in value:
+        if isinstance(group, str):
+            group = {"hooks": [group]}
+        if not isinstance(group, dict):
+            continue
+        raw_hooks = group.get("hooks", [])
+        if isinstance(raw_hooks, (dict, str)):
+            raw_hooks = [raw_hooks]
+        if not isinstance(raw_hooks, list):
+            continue
+        hooks_list = [n for n in (_normalize_hook(h) for h in raw_hooks) if n]
+        if not hooks_list:
+            continue
+        matcher = group.get("matcher", "*")
+        groups.append({"matcher": matcher if isinstance(matcher, str) else "*", "hooks": hooks_list})
+    return groups
+
+
+def normalize_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(spec)
+    for key in EVENT_KEYS:
+        if key in out:
+            out[key] = _normalize_event(out[key])
+    return out
 
 
 class ExternalHooksManager:
@@ -88,7 +138,7 @@ class ExternalHooksManager:
                             "name": hook_name,
                             "source_file": fp,
                             "base_dir": base_dir,
-                            "spec": hook_spec,
+                            "spec": normalize_spec(hook_spec),
                         })
             except Exception as e:
                 print(f"{UI.RED_BOLD}[✗ Hook Error]{UI.RST} Failed to parse {fp}: {e}")
@@ -111,28 +161,39 @@ class ExternalHooksManager:
         """
         try:
             expanded_cmd = os.path.expanduser(cmd)
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 expanded_cmd,
                 shell=True,
                 cwd=base_dir,
-                input=json.dumps(payload),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                capture_output=True,
-                timeout=timeout,
+                start_new_session=True,
             )
-            stdout = proc.stdout.strip()
+            try:
+                out, _ = proc.communicate(json.dumps(payload), timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Kill the whole group so grandchildren of the shell don't linger
+                if hasattr(os, "killpg"):
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    proc.kill()
+                proc.communicate()
+                return {"error": f"Hook timed out after {timeout}s"}
+            stdout = (out or "").strip()
             if stdout:
                 try:
                     parsed = json.loads(stdout)
                     if isinstance(parsed, dict):
                         return parsed
-                    return {"raw_output": stdout, "exit_code": proc.returncode}
                 except Exception:
-                    # Output wasn't valid JSON, return stdout string representation
-                    return {"raw_output": stdout, "exit_code": proc.returncode}
+                    pass
+                return {"raw_output": stdout, "exit_code": proc.returncode}
             return {"exit_code": proc.returncode}
-        except subprocess.TimeoutExpired:
-            return {"error": f"Hook timed out after {timeout}s"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -156,23 +217,16 @@ class ExternalHooksManager:
 
         for entry in entries:
             for spec_key in cls.TURN_EVENT_ALIASES.get(event, (event,)):
-                groups = entry["spec"].get(spec_key) or []
-                if not isinstance(groups, list):
-                    continue
-                for group in groups:
-                    if not isinstance(group, dict):
-                        continue
-                    for h in group.get("hooks", []):
-                        cmd = h.get("command") if isinstance(h, dict) else None
-                        if not cmd:
-                            continue
+                for group in entry["spec"].get(spec_key, []):
+                    for h in group["hooks"]:
+                        cmd = h["command"]
                         body = dict(payload)
                         body.update({
                             "event": event,
                             "conversationId": getattr(session_obj, "conversation_id", "myagy-session"),
                             "modelName": session_obj.active_target,
                         })
-                        result = cls.execute_command_hook(cmd, entry["base_dir"], body, timeout=h.get("timeout", 30))
+                        result = cls.execute_command_hook(cmd, entry["base_dir"], body, timeout=h["timeout"])
                         decision = str(result.get("decision", "")).lower()
                         reason = str(result.get("reason", ""))
 
@@ -206,23 +260,22 @@ class ExternalHooksManager:
 
         active_hooks = []
 
-        # ── PreToolUse Handlers ───────────────────────────────────────
-        pre_tool_handlers = []
-        for entry in hook_entries:
-            pre_list = entry["spec"].get("PreToolUse", [])
-            for group in pre_list:
-                matcher_pattern = group.get("matcher", "*")
-                sub_hooks = group.get("hooks", [])
-                for h in sub_hooks:
-                    cmd = h.get("command")
-                    if cmd:
-                        pre_tool_handlers.append({
+        def collect(event: str) -> List[Dict[str, Any]]:
+            handlers = []
+            for entry in hook_entries:
+                for group in entry["spec"].get(event, []):
+                    for h in group["hooks"]:
+                        handlers.append({
                             "name": entry["name"],
-                            "matcher": matcher_pattern,
-                            "command": cmd,
+                            "matcher": group["matcher"],
+                            "command": h["command"],
                             "base_dir": entry["base_dir"],
-                            "timeout": h.get("timeout", 30),
+                            "timeout": h["timeout"],
                         })
+            return handlers
+
+        # ── PreToolUse Handlers ───────────────────────────────────────
+        pre_tool_handlers = collect("PreToolUse")
 
         if pre_tool_handlers:
             @hooks.pre_tool_call_decide
@@ -262,8 +315,8 @@ class ExternalHooksManager:
                         timeout=handler["timeout"],
                     )
 
-                    decision = result.get("decision", "").lower()
-                    reason = result.get("reason", "")
+                    decision = str(result.get("decision", "")).lower()
+                    reason = str(result.get("reason", ""))
                     overwrite = result.get("overwrite")
 
                     if decision == "deny":
@@ -283,22 +336,7 @@ class ExternalHooksManager:
             active_hooks.append(external_pre_tool_decide)
 
         # ── PostToolUse Handlers ──────────────────────────────────────
-        post_tool_handlers = []
-        for entry in hook_entries:
-            post_list = entry["spec"].get("PostToolUse", [])
-            for group in post_list:
-                matcher_pattern = group.get("matcher", "*")
-                sub_hooks = group.get("hooks", [])
-                for h in sub_hooks:
-                    cmd = h.get("command")
-                    if cmd:
-                        post_tool_handlers.append({
-                            "name": entry["name"],
-                            "matcher": matcher_pattern,
-                            "command": cmd,
-                            "base_dir": entry["base_dir"],
-                            "timeout": h.get("timeout", 30),
-                        })
+        post_tool_handlers = collect("PostToolUse")
 
         if post_tool_handlers:
             @hooks.post_tool_call

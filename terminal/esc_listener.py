@@ -184,9 +184,10 @@ class EscListener:
         if EscListener._current is self:
             EscListener._current = None
         self._paused = False
+        # Join before restoring cooked mode so a late read can't swallow the next keystroke
+        if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=0.5)
         self._cleanup_terminal()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=0.1)
 
 
 def prompt_input(prompt: str = "") -> str:

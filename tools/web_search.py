@@ -31,6 +31,9 @@ class WebSearchEngine:
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
+    MAX_READ_BYTES = 2_000_000
+    TEXT_TYPES = ("text/", "application/xhtml", "application/xml", "application/json")
+
     @classmethod
     def search(cls, query: str, max_results: int = 5) -> List[Dict[str, str]]:
         """
@@ -55,31 +58,8 @@ class WebSearchEngine:
         results = []
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-
-            titles = re.findall(r'<h2 class="result__title">([\s\S]*?)</h2>', body)
-            snippets = re.findall(r'<a class="result__snippet"[^>]*>([\s\S]*?)</a>', body)
-
-            for i in range(min(len(titles), len(snippets), max_results)):
-                t_html = titles[i]
-                m_url = re.search(r'href="([^"]+)"', t_html)
-                raw_url = m_url.group(1) if m_url else ""
-                actual_url = raw_url
-                if "uddg=" in raw_url:
-                    actual_url = urllib.parse.unquote(raw_url.split("uddg=")[-1].split("&")[0])
-
-                title = re.sub(r"<[^>]+>", "", t_html).strip()
-                title = html.unescape(title)
-                snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()
-                snippet = html.unescape(snippet)
-
-                if actual_url and title:
-                    results.append({
-                        "title": title,
-                        "url": actual_url,
-                        "snippet": snippet,
-                    })
-
+                body = resp.read(cls.MAX_READ_BYTES).decode("utf-8", errors="replace")
+            results = cls._parse_ddg(body, max_results)
         except Exception as e:
             # Fallback to GitHub Search API if general search encountered network issue
             gh_results = cls.search_github(query, max_results=max_results)
@@ -87,6 +67,29 @@ class WebSearchEngine:
                 return gh_results
             return [{"title": "Search Error", "url": "", "snippet": f"Could not perform web search: {e}"}]
 
+        if not results:
+            return cls.search_github(query, max_results=max_results)
+        return results
+
+    @classmethod
+    def _parse_ddg(cls, body: str, max_results: int) -> List[Dict[str, str]]:
+        """Parses DDG HTML; each snippet is matched to the title block it follows."""
+        results = []
+        title_matches = list(re.finditer(r'<h2 class="result__title">([\s\S]*?)</h2>', body))
+        for idx, m in enumerate(title_matches):
+            if len(results) >= max_results:
+                break
+            t_html = m.group(1)
+            block_end = title_matches[idx + 1].start() if idx + 1 < len(title_matches) else len(body)
+            m_snip = re.search(r'<a class="result__snippet"[^>]*>([\s\S]*?)</a>', body[m.end():block_end])
+            m_url = re.search(r'href="([^"]+)"', t_html)
+            actual_url = m_url.group(1) if m_url else ""
+            if "uddg=" in actual_url:
+                actual_url = urllib.parse.unquote(actual_url.split("uddg=")[-1].split("&")[0])
+            title = html.unescape(re.sub(r"<[^>]+>", "", t_html).strip())
+            snippet = html.unescape(re.sub(r"<[^>]+>", "", m_snip.group(1)).strip()) if m_snip else ""
+            if actual_url and title:
+                results.append({"title": title, "url": actual_url, "snippet": snippet})
         return results
 
     @classmethod
@@ -127,8 +130,10 @@ class WebSearchEngine:
 
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                content_type = resp.headers.get("Content-Type", "")
-                raw = resp.read().decode("utf-8", errors="replace")
+                content_type = resp.headers.get("Content-Type", "").lower()
+                if content_type and not content_type.startswith(cls.TEXT_TYPES):
+                    return f"Error fetching {url}: unsupported content type '{content_type.split(';')[0]}'"
+                raw = resp.read(cls.MAX_READ_BYTES).decode("utf-8", errors="replace")
 
             # Remove scripts, styles, svg, and metadata tags
             text = re.sub(r"<(script|style|noscript|svg|nav|footer|header)[\s\S]*?</\1>", " ", raw, flags=re.I)

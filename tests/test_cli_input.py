@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 
 from myagy.terminal import cli
@@ -102,10 +103,10 @@ def test_slash_exit_command_returns_immediately(monkeypatch):
     assert cli.read_input_prompt("> ") == "/exit"
 
 
-@pytest.mark.asyncio
-async def test_interactive_loop_exits_on_slash_exit(monkeypatch):
+def test_interactive_loop_exits_on_slash_exit(monkeypatch):
     class DummySession:
         json_output = True
+        verbose = False
         multiline_input = True
         active_target = "auto"
 
@@ -120,4 +121,4 @@ async def test_interactive_loop_exits_on_slash_exit(monkeypatch):
 
     session = DummySession()
     monkeypatch.setattr(cli, "read_input_prompt", lambda prompt, multiline: "/exit")
-    await cli.interactive_loop(session)
+    asyncio.run(cli.interactive_loop(session))

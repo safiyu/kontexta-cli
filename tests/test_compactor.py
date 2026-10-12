@@ -1,7 +1,15 @@
 import asyncio
 
+import pytest
+
+from myagy.agents import compactor
 from myagy.agents.compactor import ContextCurator
 from myagy.core.coordinator import CudaCoordinator
+
+
+@pytest.fixture(autouse=True)
+def no_real_llamashift(monkeypatch):
+    monkeypatch.setattr(compactor, "wake_compactor", lambda port=9001, **k: {"ok": False, "reason": "disabled in tests", "log_tail": "", "elapsed": 0.0, "warnings": []})
 
 
 def _history(n):
@@ -11,21 +19,21 @@ def _history(n):
 def test_background_synthesis_runs_and_releases_slot(session, monkeypatch):
     calls = []
     monkeypatch.setattr(ContextCurator, "synthesize_context_cuda_sync", staticmethod(lambda s, t: calls.append(len(t)) or "SUMMARY"))
-    session.history = _history(12)
+    session.history = _history(24)  # 12 turns; the default window keeps 6 turns (12 entries)
 
     async def go():
         ContextCurator.trigger_background_synthesis(session)
         await asyncio.sleep(0.2)
 
     asyncio.run(go())
-    assert calls == [6]
+    assert calls == [12]
     assert CudaCoordinator.state() == "idle"
-    assert len(session.history) == 8  # 2 summary entries + 6 recent
+    assert len(session.history) == 14  # 2 summary entries + 12 recent entries
 
 
 def test_subagent_preempts_compaction_and_slot_recovers(session, monkeypatch):
     monkeypatch.setattr(ContextCurator, "synthesize_context_cuda_sync", staticmethod(lambda s, t: "SUMMARY"))
-    session.history = _history(12)
+    session.history = _history(24)
 
     async def go():
         ContextCurator.trigger_background_synthesis(session)
@@ -49,6 +57,34 @@ def test_no_synthesis_when_history_short(session, monkeypatch):
 
     asyncio.run(go())
     assert calls == [] and CudaCoordinator.state() == "idle"
+
+
+def test_recent_window_is_measured_in_turns_not_entries(session, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ContextCurator, "synthesize_context_cuda_sync", staticmethod(lambda s, t: calls.append(len(t)) or "S"))
+    session.max_recent_turns = 3
+    session.history = _history(6)  # exactly 3 turns: nothing is older than the window
+
+    async def go():
+        ContextCurator.trigger_background_synthesis(session)
+        await asyncio.sleep(0.1)
+
+    asyncio.run(go())
+    assert calls == [] and len(session.history) == 6
+
+    session.history = _history(10)  # 5 turns: 2 turns (4 entries) are older than the window
+    asyncio.run(go())
+    assert calls == [4]
+    assert len(session.history) == 2 + 6
+
+
+def test_compact_history_default_keeps_window_in_entries(session, monkeypatch):
+    monkeypatch.setattr(ContextCurator, "synthesize_context_cuda_sync", staticmethod(lambda s, t: "S"))
+    session.max_recent_turns = 2
+    session.history = _history(10)
+    removed = ContextCurator.compact_history(session, silent=True)
+    assert removed == 6
+    assert len(session.history) == 2 + 4
 
 
 def test_context_estimate_does_not_summarize(session, monkeypatch):

@@ -5,15 +5,21 @@ import os
 import json
 import time
 import asyncio
+import contextvars
 import subprocess
 import urllib.request
 import urllib.error
 from typing import Optional, List, Dict, Any, Tuple
 
 from ..config import OAUTH_TOKEN_PATH
-from ..terminal.ui import UI, RICH_AVAILABLE, console
-from ..core.llamashift import trigger_llamashift_switch
+from ..terminal.ui import UI
+from ..terminal import say
+from ..core.llamashift import wake_compactor, ctx_size_for_port
 from ..core.coordinator import CudaCoordinator
+
+
+# Set by the async path, which wakes :9001 on the event loop so worker threads never touch session state
+_SKIP_CUDA_WAKE: contextvars.ContextVar = contextvars.ContextVar("skip_cuda_wake", default=False)
 
 
 def _parse_completion_response(data: dict) -> Optional[str]:
@@ -128,6 +134,24 @@ def _query_local_endpoint(
         return None
 
 
+_noted_wake_reasons: set = set()
+
+
+def _note_wake_warnings(warnings: list):
+    """Shows LlamaShift VRAM warnings once per distinct text."""
+    for text in warnings:
+        if text not in _noted_wake_reasons:
+            _noted_wake_reasons.add(text)
+            say.warn(text)
+
+
+def _note_wake_skipped(reason: str):
+    """Tells the user once per distinct reason why the compactor model was not started."""
+    if reason not in _noted_wake_reasons:
+        _noted_wake_reasons.add(reason)
+        say.step(f"compactor model not started: {reason}")
+
+
 class ContextCurator:
     """Manages context telemetry, slot tracking, and continuous working memory synthesis on NVIDIA CUDA."""
 
@@ -140,6 +164,7 @@ class ContextCurator:
         tgt = session.resolve_target_alias(target or session.active_target)
         n_tokens = None
         max_ctx = None
+        is_exact = False
 
         if tgt in ("9000", "9001"):
             port = session.endpoints[tgt]["port"]
@@ -153,15 +178,19 @@ class ContextCurator:
                         cache_tok = slot0.get("n_prompt_tokens_cache", 0)
                         n_tokens = max(prompt_tok, cache_tok)
                         max_ctx = slot0.get("n_ctx")
+                        is_exact = bool(n_tokens and max_ctx)
+                        if n_tokens and not max_ctx:
+                            max_ctx = ctx_size_for_port(port) or 131072
             except Exception:
                 pass
 
         if n_tokens is None or n_tokens == 0:
+            is_exact = False
             sys_len = len(session.build_system_context(tgt, include_history=False))
             hist_len = sum(len(h.get("content", "")) for h in session.history)
             n_tokens = int((sys_len + hist_len) / 3.6)
             if tgt in ("9000", "9001"):
-                max_ctx = 131072
+                max_ctx = ctx_size_for_port(session.endpoints[tgt]["port"]) or 131072
             else:
                 max_ctx = 1048576  # Gemini 1M context
 
@@ -171,7 +200,7 @@ class ContextCurator:
             "max_ctx": max_ctx,
             "percentage": pct,
             "headroom": max(0, max_ctx - n_tokens) if max_ctx else 0,
-            "is_exact": (tgt in ("9000", "9001") and max_ctx is not None),
+            "is_exact": is_exact,
         }
 
     @classmethod
@@ -229,23 +258,22 @@ class ContextCurator:
             bar_col = UI.CYAN_BOLD
 
         target_lbl = session.target_name(session.active_target)
-        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}CONTEXT WINDOW TELEMETRY ({target_lbl}){UI.RST}{UI.DARK_GRAY} ────────────────────╮{UI.RST}")
-        print(f"{UI.DARK_GRAY}│{UI.RST}  Usage      : {bar_col}[{bar}]{UI.RST} {pct:.1f}%")
-        print(f"{UI.DARK_GRAY}│{UI.RST}  Active     : {UI.WHITE}{tokens:,}{UI.RST} tokens  /  {UI.GRAY}{max_ctx:,}{UI.RST} limit")
-        print(f"{UI.DARK_GRAY}│{UI.RST}  Headroom   : {UI.GREEN}{headroom:,}{UI.RST} tokens remaining")
-        print(f"{UI.DARK_GRAY}│{UI.RST}  History    : {len(session.history)} recorded turns ({len(session.history)//2} exchanges)")
-        ac_st = f"{UI.GREEN}ENABLED (every {session.autocompact_threshold} turns){UI.RST}" if session.autocompact_threshold > 0 else f"{UI.GRAY}DISABLED{UI.RST}"
-        print(f"{UI.DARK_GRAY}│{UI.RST}  AutoCompact: {ac_st}")
+        ac_st = f"every {session.autocompact_threshold} turns" if session.autocompact_threshold > 0 else "off"
         cuda_syn_st = (
-            f"{UI.GREEN}ONLINE (NVIDIA RTX 4060 :9001 Granite-8B){UI.RST}"
+            "online (:9001 Granite-8B)"
             if session.endpoints.get("9001", {}).get("status") == "online"
-            else f"{UI.GRAY}Standby / Offline (Launch via /home/safiyu/myagy/launch_cuda_compactor.sh or /compactor start){UI.RST}"
+            else "standby or offline (launch_cuda_compactor.sh or /compactor start)"
         )
-        print(f"{UI.DARK_GRAY}│{UI.RST}  Compactor  : {cuda_syn_st}")
-        curation_st = f"{UI.GREEN}ACTIVE (Continuous Rolling Hippocampus){UI.RST}" if session.continuous_curation else f"{UI.GRAY}OFF{UI.RST}"
-        print(f"{UI.DARK_GRAY}│{UI.RST}  Curation   : {curation_st}")
-        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}")
-        print(f"{UI.GRAY}Tip: Use /compact to condense history, or /curation [on|off] to toggle rolling synthesis.{UI.RST}\n")
+        say.card(f"Context window ({target_lbl})", [
+            ("usage", f"{bar_col}{bar}{UI.RST} {pct:.1f}%"),
+            ("active", f"{tokens:,} / {max_ctx:,} tokens"),
+            ("headroom", f"{headroom:,} tokens"),
+            ("history", f"{len(session.history)} entries ({len(session.history)//2} exchanges)"),
+            ("autocompact", ac_st),
+            ("compactor", cuda_syn_st),
+            ("curation", "on (rolling working memory)" if session.continuous_curation else "off"),
+        ], style="info")
+        say.dim("/compact condenses history, /curation [on|off] toggles rolling synthesis.")
 
     @staticmethod
     def synthesize_context_cuda_sync(session: Any, turns: List[Dict[str, str]]) -> Optional[str]:
@@ -259,18 +287,14 @@ class ContextCurator:
             # Defer to running subagent - do not compete for CUDA slots
             return None
         ep9001 = session.endpoints.get("9001", {})
-        if ep9001.get("status") != "online":
-            try:
-                start_res = trigger_llamashift_switch("granite42_8b")
-                if start_res.get("success"):
-                    for _ in range(8):
-                        time.sleep(0.5)
-                        session.refresh_endpoints()
-                        if session.endpoints.get("9001", {}).get("status") == "online":
-                            ep9001 = session.endpoints["9001"]
-                            break
-            except Exception:
-                pass
+        if ep9001.get("status") != "online" and not _SKIP_CUDA_WAKE.get():
+            woke = wake_compactor(9001)
+            _note_wake_warnings(woke["warnings"])
+            if woke["ok"]:
+                session.refresh_endpoints()
+                ep9001 = session.endpoints.get("9001", {})
+            else:
+                _note_wake_skipped(woke["reason"])
         if ep9001.get("status") != "online":
             return None
 
@@ -513,7 +537,7 @@ class ContextCurator:
             except Exception:
                 pass
             if not silent and not session.json_output:
-                print(f"{UI.AMBER}[⚠ CUDA:9001 compactor empty or failed]{UI.RST} {UI.GRAY}Falling back to secondary synthesis tiers...{UI.RST}")
+                say.step("CUDA compactor empty or failed, trying fallback tiers")
 
         # Tier 2: AMD ROCm:9000 Primary Executive
         ep9000 = session.endpoints.get("9000", {})
@@ -541,16 +565,34 @@ class ContextCurator:
         det_syn = cls.extract_deterministic_working_memory(turns)
         return det_syn, "Deterministic Extractive Synthesizer (Local Fallback)"
 
+    @staticmethod
+    async def _wake_cuda_async(session: Any):
+        """Starts :9001 and refreshes endpoints on the event loop, so the synthesis thread never mutates session state."""
+        if session.endpoints.get("9001", {}).get("status") == "online":
+            return
+        woke = await asyncio.to_thread(wake_compactor, 9001)
+        _note_wake_warnings(woke["warnings"])
+        if woke["ok"]:
+            await asyncio.to_thread(session.refresh_endpoints)
+        else:
+            _note_wake_skipped(woke["reason"])
+
     @classmethod
     async def async_synthesize_cuda(cls, session: Any):
         """Background coroutine that pre-computes Working Memory synthesis only when idle."""
         if not CudaCoordinator.start_compaction(asyncio.current_task()):
             return
         try:
-            if len(session.history) <= session.max_recent_turns:
+            keep = session._recent_entries
+            if len(session.history) <= keep:
                 return
-            older = session.history[:-session.max_recent_turns]
-            syn, syn_by = await asyncio.to_thread(cls.synthesize_working_memory, session, older, True)
+            older = session.history[:-keep]
+            await cls._wake_cuda_async(session)
+            skip_token = _SKIP_CUDA_WAKE.set(True)
+            try:
+                syn, syn_by = await asyncio.to_thread(cls.synthesize_working_memory, session, older, True)
+            finally:
+                _SKIP_CUDA_WAKE.reset(skip_token)
             if syn:
                 session._cached_curated_memory = {
                     "summary": syn,
@@ -558,10 +600,12 @@ class ContextCurator:
                     "covered_turns": len(older),
                     "timestamp": time.time(),
                 }
-                if session.continuous_curation and len(session.history) >= (session.max_recent_turns + 2):
-                    removed = cls.compact_history(session, keep_recent=session.max_recent_turns, silent=True)
+                # History grew during synthesis: compacting now would re-synthesize and block the loop, so wait for the next turn
+                still_matches = (len(session.history) - keep) == len(older)
+                if session.continuous_curation and still_matches and len(session.history) >= (keep + 2):
+                    removed = cls.compact_history(session, keep_recent=keep, silent=True)
                     if removed > 0 and not session.json_output:
-                        print(f"\n{UI.DARK_GRAY}⚡ [Hippocampus: {removed} older turns distilled into Working Memory via {syn_by}]{UI.RST}\n", flush=True)
+                        say.step(f"working memory: {removed} older turns distilled via {syn_by}")
         except asyncio.CancelledError:
             # Preempted by on-demand subagent task
             pass
@@ -579,7 +623,7 @@ class ContextCurator:
             return
         if session._synthesis_task and not session._synthesis_task.done():
             return
-        if len(session.history) > session.max_recent_turns:
+        if len(session.history) > session._recent_entries:
             session._synthesis_task = asyncio.create_task(cls.async_synthesize_cuda(session))
 
     @classmethod
@@ -598,10 +642,10 @@ class ContextCurator:
         Compact conversation history into structured Working Memory using the multi-tier pipeline.
         Preserves keep_recent turns verbatim and eliminates empty/corrupted turns.
         """
-        keep = keep_recent if keep_recent is not None else session.max_recent_turns
+        keep = keep_recent if keep_recent is not None else session._recent_entries
         if len(session.history) <= keep:
             if not silent:
-                print(UI.warn(f"Only {len(session.history)} turn(s) in history — nothing to compact."))
+                say.warn(f"Only {len(session.history)} turn(s) in history, nothing to compact.")
             return 0
 
         older = session.history[:-keep] if keep > 0 else session.history
@@ -615,7 +659,7 @@ class ContextCurator:
             synthesized_by = session._cached_curated_memory.get("synthesized_by") or "pre-computed cache"
         else:
             if not silent and not session.json_output:
-                print(f"{UI.CUDA_BOLD}[⚡ Working Memory]{UI.RST} {UI.GRAY}Synthesizing context across multi-tier pipeline...{UI.RST}")
+                say.step("synthesizing working memory across the compaction tiers")
             synthesized_text, synthesized_by = cls.synthesize_working_memory(session, older, silent=silent)
 
         summary_content = f"[Working Memory distilled by {synthesized_by}]\n{synthesized_text}"
@@ -640,10 +684,7 @@ class ContextCurator:
 
         if not silent:
             label_by = f" via {synthesized_by}" if synthesized_by else ""
-            if RICH_AVAILABLE and not session.json_output:
-                console.print(f"\n[bold cyan]✓ History compacted{label_by}:[/bold cyan] [dim]{removed} old turn(s) → working memory. Kept {len(sanitized_recent)} recent verbatim.[/dim]\n")
-            else:
-                print(UI.ok(f"History compacted{label_by}: {removed} old turns → working memory. {len(sanitized_recent)} recent turns kept verbatim."))
+            say.ok(f"History compacted{label_by}: {removed} old entries moved to working memory, {len(sanitized_recent)} recent kept verbatim.")
 
         return removed
 

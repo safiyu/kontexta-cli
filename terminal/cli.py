@@ -6,49 +6,91 @@ import json
 import signal
 import select
 import asyncio
+import threading
 import argparse
 import subprocess
-from typing import Optional
-
-try:
-    from rich.table import Table
-    from rich.text import Text
-    from rich import box
-except ImportError:
-    pass
 
 from ..config import (
     MCP_CONFIG_PATH,
     DEFAULT_CLOUD_MODEL,
     HISTORY_PATH,
 )
-from .ui import UI, RICH_AVAILABLE, console
+from . import say
+from .ui import UI, StreamRenderer
 from ..core.prefs import PREF_DEFAULTS, load_prefs, reset_prefs
-from ..core.llamashift import trigger_llamashift_switch
+from ..core.llamashift import wake_compactor
 from ..context.mcp_loader import load_mcp_servers, McpStdioServer
 from ..core.session import MultiGpuHybridSession
 from ..core.sudo_manager import SudoManager
 from .esc_listener import EscListener, prompt_input
 
 
-SLASH_COMMANDS = [
-    "/auto", "/9000", "/rocm", "/9001", "/cuda", "/cloud", "/gemini", "/models", "/model", "/mode",
-    "/spawn", "/tasks", "/subagent", "/repomap", "/instructions", "/hooks", "/kontexta", "/kxta", "/mcp", "/compact",
-    "/autocompact", "/compactor", "/curation", "/context", "/ctx", "/save", "/load", "/sessions",
-    "/export", "/summarize", "/history", "/clear", "/status", "/metrics", "/verbose", "/steps",
-    "/permissions", "/sudo", "/laya", "/json", "/format", "/multiline", "/singleline", "/paste", "/reload",
-    "/brainstorm", "/search", "/fetch", "/diff", "/undo", "/stats", "/prefs", "/markdown", "/help",
-    "/exit", "/quit",
-]
+COMMANDS: dict = {}
+COMMAND_META: list = []
+SLASH_COMMANDS: list = []
+GROUP_ORDER = ("Session", "Models", "Agents", "Git", "Debug", "Settings")
+_COMPLETION_ONLY = ["/paste"]
+_EXTRA_HELP = [(("/paste",), "Session", "Paste a multi-line block (end with EOF, . or END)")]
+_EXIT = "exit"
+_NO_SAVE = "no_save"
+_TARGET_LABELS = {"auto": "AUTO:Laya", "9000": "ROCm:9000", "9001": "CUDA:9001", "cloud": "CLOUD:OAuth"}
+
+
+class PromptInterrupted(Exception):
+    """Ctrl+C pressed at the first prompt line."""
+
+
+class _ExitSession(Exception):
+    """Raised into a pending prompt read to leave the session."""
+
+
+def command(*names, group=None, help=None):
+    """Registers an async slash-command handler under each name (first registration wins)."""
+    def deco(fn):
+        COMMAND_META.append({"names": names, "group": group or "Other", "help": help or "", "fn": fn})
+        for n in names:
+            COMMANDS.setdefault(n, fn)
+        return fn
+    return deco
+
+
+def help_groups() -> dict:
+    """Maps group name to (aliases, description) rows, built from the command registry."""
+    groups = {g: [] for g in GROUP_ORDER}
+    entries = [(m["names"], m["group"], m["help"]) for m in COMMAND_META] + _EXTRA_HELP
+    for names, group, text in entries:
+        groups.setdefault(group, []).append((", ".join(names), text))
+    return {g: sorted(rows) for g, rows in groups.items() if rows}
+
+
+def _sync_say(session) -> None:
+    say.configure(json_output=session.json_output, verbose=session.verbose)
+
+
 AT_TARGETS = ["@rocm", "@cuda", "@cloud", "@auto", "@local", "@9000", "@9001"]
 _dynamic_targets: list = []
 _pt_session = None
+_toolbar_provider = None
 
 
 def set_completion_targets(ids) -> None:
     """Registers model ids for @<id> completion."""
     global _dynamic_targets
     _dynamic_targets = [f"@{i}" for i in ids if i]
+
+
+def set_toolbar(provider) -> None:
+    """Registers a callable returning prompt_toolkit (style, text) fragments for the bottom toolbar."""
+    global _toolbar_provider
+    _toolbar_provider = provider
+
+
+def _toolbar_fragments():
+    # A broken toolbar must never take the prompt down with it
+    try:
+        return _toolbar_provider() if _toolbar_provider else []
+    except Exception:
+        return []
 
 
 def _get_pt_session():
@@ -60,6 +102,7 @@ def _get_pt_session():
         from prompt_toolkit import PromptSession
         from prompt_toolkit.history import FileHistory
         from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.styles import Style
 
         class _InputCompleter(Completer):
             def get_completions(self, document, complete_event):
@@ -77,10 +120,16 @@ def _get_pt_session():
                         yield Completion(cand, start_position=-len(text))
 
         os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
-        _pt_session = PromptSession(history=FileHistory(HISTORY_PATH), completer=_InputCompleter())
+        style = Style.from_dict({"bottom-toolbar": "noreverse", "bottom-toolbar.text": "noreverse"})
+        _pt_session = PromptSession(history=FileHistory(HISTORY_PATH), completer=_InputCompleter(), style=style)
     except Exception:
         _pt_session = False
     return _pt_session or None
+
+
+def _toolbar_active() -> bool:
+    """True when the live bottom toolbar will be drawn (a real TTY with prompt_toolkit)."""
+    return bool(_toolbar_provider and sys.stdin.isatty() and sys.stdout.isatty() and _get_pt_session() is not None)
 
 
 def _read_line(prompt: str) -> str:
@@ -88,7 +137,9 @@ def _read_line(prompt: str) -> str:
     if sys.stdin.isatty() and sys.stdout.isatty():
         pt = _get_pt_session()
         if pt is not None:
-            from prompt_toolkit.formatted_text import ANSI
+            from prompt_toolkit.formatted_text import ANSI, FormattedText
+            if _toolbar_provider:
+                return pt.prompt(ANSI(prompt), bottom_toolbar=lambda: FormattedText(_toolbar_fragments()), refresh_interval=1.0)
             return pt.prompt(ANSI(prompt))
     return input(prompt)
 
@@ -96,6 +147,7 @@ def _read_line(prompt: str) -> str:
 def read_input_prompt(first_prompt: str, multiline: bool = True) -> str:
     """
     Reads user input with multi-line support enabled by default.
+    - Ctrl+C on the first line raises PromptInterrupted; Ctrl+D returns "".
     - Slash commands (/help, /status, etc.) and exit words submit immediately on first line.
     - Multi-line mode: subsequent lines are prompted with '... '.
     - Pressing Enter on an empty line or pressing Ctrl+D submits the multi-line input.
@@ -103,8 +155,10 @@ def read_input_prompt(first_prompt: str, multiline: bool = True) -> str:
     """
     try:
         first_line = _read_line(first_prompt)
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         return ""
+    except KeyboardInterrupt:
+        raise PromptInterrupted()
 
     stripped = first_line.strip()
     if not multiline:
@@ -145,93 +199,962 @@ def read_input_prompt(first_prompt: str, multiline: bool = True) -> str:
             break
         except KeyboardInterrupt:
             # Ctrl+C cancels the current multi-line entry and returns to main prompt
-            print(f"\n{UI.GRAY}[^C] Input cancelled.{UI.RST}", flush=True)
+            say.dim("[^C] Input cancelled.")
             return ""
 
     return "\n".join(lines).strip()
 
 
-async def interactive_loop(session: MultiGpuHybridSession):
-    if not session.json_output:
-        if UI._use_color:
-            print(f"\n{UI.DARK_GRAY}╭──────────────────────────────────────────────────────────────────────────╮{UI.RST}")
-            print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Antigravity Multi-GPU Hybrid Session{UI.RST}  {UI.ROCM}[ROCm]{UI.RST} {UI.DARK_GRAY}+{UI.RST} {UI.CUDA}[CUDA]{UI.RST} {UI.DARK_GRAY}+{UI.RST} {UI.CLOUD}[Cloud]{UI.RST}         {UI.DARK_GRAY}│{UI.RST}")
-            print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.GRAY}Powered by Laya System 1 (ModernBERT) & Google Antigravity OAuth{UI.RST}       {UI.DARK_GRAY}│{UI.RST}")
-            print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.DIM}Multi-line input enabled (Enter on empty line to submit │ Esc stops agent){UI.RST} {UI.DARK_GRAY}│{UI.RST}")
-            print(f"{UI.DARK_GRAY}╰──────────────────────────────────────────────────────────────────────────╯{UI.RST}")
+def _settle(fut, result, exc):
+    if not fut.done():
+        if exc is not None:
+            fut.set_exception(exc)
         else:
-            print("=" * 65)
-            print(" Antigravity Multi-GPU Hybrid Session (ROCm + CUDA + Cloud)")
-            print(" Powered by Laya System 1 Decision Model & Google OAuth")
-            print(" Multi-line input active (Enter on empty line to submit)")
-            print(" Press Esc to immediately stop agent generation. Type '/help' for info.")
-            print("=" * 65)
-        session.print_status()
+            fut.set_result(result)
+
+
+def _spawn_reader(loop, fn, *args):
+    """Runs a blocking prompt read on a daemon thread so exiting never waits on stdin."""
+    fut = loop.create_future()
+
+    def work():
+        try:
+            res, exc = fn(*args), None
+        except BaseException as e:
+            res, exc = None, e
+        try:
+            loop.call_soon_threadsafe(_settle, fut, res, exc)
+        except RuntimeError:
+            pass
+
+    threading.Thread(target=work, daemon=True, name="PromptReader").start()
+    return fut
+
+
+class _LoopCtx:
+    def __init__(self, loop):
+        self.loop = loop
+        self.task = None
+        self.read_fut = None
+        self.sigint = 0
+
+
+def _prompt_string(session) -> str:
+    """The input prompt itself; status lives in the bottom toolbar."""
+    if UI._use_color:
+        return f"{UI.target_color(session.active_target)}❯{UI.RST} "
+    return "> "
+
+
+def _plain_pill(session) -> str:
+    """One-line status for terminals without the live toolbar."""
+    label = _TARGET_LABELS.get(str(session.active_target), str(session.active_target))
+    tokens = session.get_context_metrics(session.active_target)["tokens"]
+    shown = f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
+    return f"[{label} | {shown} ctx]"
+
+
+async def _confirm(title, rows, prompt="Proceed?", style="warn", assume_yes=False) -> bool:
+    """Shows a confirmation card, then reads y/N unless the caller already said yes."""
+    say.card(title, rows, actions="[y]es / [n]o", style=style)
+    if assume_yes:
+        return True
+    answer = await asyncio.to_thread(prompt_input, f"{UI.AMBER_BOLD}{prompt} [y/N]: {UI.RST}")
+    return answer.strip().lower() in ("y", "yes")
+
+
+# ── Models ────────────────────────────────────────────────────────────
+
+@command("/auto", group="Models", help="Route every prompt automatically with Laya")
+async def _cmd_auto(session, arg, ctx):
+    session.active_target = "auto"
+    say.ok("Default target set to AUTO (Laya System 1 routing in ~33ms)")
+
+
+@command("/9000", "/rocm", "/amd", group="Models", help="Use the AMD ROCm model on port 9000")
+async def _cmd_9000(session, arg, ctx):
+    session.active_target = "9000"
+    await asyncio.to_thread(session.refresh_endpoints)
+    fn = session.endpoints['9000']['filename']
+    say.ok(f"Default target set to AMD ROCm Port 9000 ({fn})")
+
+
+@command("/9001", "/cuda", "/nvidia", group="Models", help="Use the NVIDIA CUDA model on port 9001")
+async def _cmd_9001(session, arg, ctx):
+    session.active_target = "9001"
+    await asyncio.to_thread(session.refresh_endpoints)
+    fn = session.endpoints['9001']['filename']
+    say.ok(f"Default target set to NVIDIA CUDA Port 9001 ({fn})")
+
+
+@command("/cloud", "/gemini", "/oauth", group="Models", help="Use Google cloud via OAuth, or /cloud <model-id>")
+async def _cmd_cloud(session, arg, ctx):
+    if arg:
+        new_model = arg.strip()
+        session.cloud_model = new_model
+        session.active_target = "cloud"
+        session.save_preferences()
+        say.ok(f"Cloud model set to {new_model} and target switched to CLOUD (saved to prefs).")
+    else:
+        session.active_target = "cloud"
+        say.ok(f"Default target set to CLOUD via OAuth ({session.cloud_model})")
+
+
+@command("/model", "/switch", "/shift", "/use", group="Models", help="List local models or switch to one")
+async def _cmd_model(session, arg, ctx):
+    if not arg:
+        session.print_models()
+    else:
+        await session.switch_model(arg)
+
+
+@command("/models", group="Models", help="List available models and their status")
+async def _cmd_models(session, arg, ctx):
+    session.print_models()
+
+
+@command("/mode", group="Models", help="Switch model by number or id")
+async def _cmd_mode(session, arg, ctx):
+    if arg:
+        await session.switch_model(arg)
+    else:
+        say.warn("Usage: /mode <# or id>. Type /models to view list.")
+
+
+@command("/laya", group="Models", help="Show the Laya routing engine details")
+async def _cmd_laya(session, arg, ctx):
+    perm_tag = f"{UI.GREEN_BOLD}ACTIVE{UI.RST}" if session.use_laya_adaptive_permissions else f"{UI.GRAY}INACTIVE{UI.RST}"
+    say.card("Laya System 1 decision engine", [
+        ("Backbone", "ModernBERT-large (~421M params, non-autoregressive)"),
+        ("Latency", "~33ms"),
+        ("Protocol", f"/v1/systemone ({session.laya.endpoint})"),
+        ("Adaptive perm", perm_tag),
+    ])
+
+
+@command("/git-shift", "/gitshift", "/autoshift", group="Git", help="Toggle fast model for git work, dense model for code")
+async def _cmd_git_shift(session, arg, ctx):
+    arg_low = arg.lower().strip()
+    if arg_low in ("on", "true", "1", "enable"):
+        session.auto_git_shift = True
+        say.ok(f"Git auto-shift: ENABLED ({session.fast_git_model} for git/tools, {session.dense_code_model} for deep code)")
+    elif arg_low in ("off", "false", "0", "disable"):
+        session.auto_git_shift = False
+        say.ok("Git auto-shift: DISABLED (manual model control)")
+    elif not arg_low:
+        session.auto_git_shift = not session.auto_git_shift
+        st = f"ENABLED ({session.fast_git_model} for git, {session.dense_code_model} for deep code)" if session.auto_git_shift else "DISABLED"
+        say.ok(f"Git auto-shift: {st}")
+    else:
+        say.warn("Usage: /git-shift [on|off]")
+
+
+# ── Settings ──────────────────────────────────────────────────────────
+
+@command("/skip-permissions", "/dangerously-skip-permissions", group="Settings", help="Toggle auto-approving every tool call")
+async def _cmd_skip_permissions(session, arg, ctx):
+    new_val = not session.dangerously_skip_permissions
+    session.use_laya_adaptive_permissions = False
+    session.set_dangerously_skip_permissions(new_val)
+    say.ok(f"Dangerously skip permissions: {'ENABLED' if new_val else 'DISABLED'}")
+
+
+@command("/permissions", group="Settings", help="Permission mode: auto (Laya), skip, or safe")
+async def _cmd_permissions(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("auto", "laya", "dynamic", "smart"):
+        session.use_laya_adaptive_permissions = True
+        await session.reset_local_agent()
+        say.ok("Permissions: LAYA ADAPTIVE")
+    elif arg_low in ("on", "skip", "true", "1"):
+        session.use_laya_adaptive_permissions = False
+        session.set_dangerously_skip_permissions(True)
+        say.ok("Dangerously skip permissions: ENABLED")
+    elif arg_low in ("off", "safe", "prompt", "false", "0"):
+        session.use_laya_adaptive_permissions = False
+        session.set_dangerously_skip_permissions(False)
+        say.ok("Permissions: SAFE MODE")
+    else:
+        say.warn("Usage: /permissions auto | skip | safe")
+
+
+@command("/sudo", group="Settings", help="Authenticate for root, check status, clear, or run a sudo command")
+async def _cmd_sudo(session, arg, ctx):
+    arg_strip = arg.strip()
+    if not arg_strip:
+        if SudoManager.is_authenticated():
+            rem = int(SudoManager.time_remaining() // 60)
+            say.ok(f"Sudo access is ACTIVE (~{rem}m remaining in session cache).")
+            say.dim("Tip: '/sudo clear' revokes it, '/sudo <command>' runs a command with root privileges.")
+        else:
+            SudoManager.prompt_password_entry()
+    elif arg_strip in ("status", "check"):
+        if SudoManager.is_authenticated():
+            rem = int(SudoManager.time_remaining() // 60)
+            say.card("Sudo status", [
+                ("State", f"{UI.GREEN_BOLD}ACTIVE{UI.RST} (~{rem} minutes remaining)"),
+                ("User", os.environ.get("USER", "root")),
+                ("Timeout", "15 min"),
+                ("Askpass", "Active"),
+            ])
+        else:
+            say.warn("Sudo status: INACTIVE (no cached credentials). Type '/sudo' to authenticate.")
+    elif arg_strip in ("clear", "lock", "reset", "revoke"):
+        SudoManager.clear_credentials()
+        say.ok("Sudo credentials cleared. Root access revoked.")
+    else:
+        subcmd = arg_strip
+        if not subcmd.startswith("sudo "):
+            subcmd = f"sudo {subcmd}"
+        say.dim(f"⚡ Executing: {subcmd}")
+        if not SudoManager.is_authenticated():
+            if not SudoManager.prompt_password_entry(reason=subcmd):
+                say.warn("Execution aborted: sudo authentication required.")
+                return _NO_SAVE
+        try:
+            proc = await asyncio.to_thread(subprocess.run, subcmd, shell=True, env=os.environ)
+            if proc.returncode == 0:
+                say.ok("Command completed cleanly (exit code 0).")
+            else:
+                say.err(f"Command exited with code {proc.returncode}.")
+        except Exception as ex:
+            say.err(f"Execution failed: {ex}")
+
+
+@command("/theme", group="Settings", help="Show or switch the color theme (dark, light, mono)")
+async def _cmd_theme(session, arg, ctx):
+    name = arg.strip().lower()
+    if not name:
+        say.table("Themes", ["Theme", "Active"], [[t, "yes" if t == UI.theme_name else ""] for t in UI.THEMES])
+        say.dim("Use /theme <name> to switch.")
+    elif session.set_theme(name):
+        say.ok(f"Theme set to {name}.")
+    else:
+        say.warn(f"Unknown theme '{name}'. Choose: {', '.join(UI.THEMES)}.")
+
+
+@command("/mcp", group="Settings", help="MCP servers: status, on, off, reload")
+async def _cmd_mcp(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("off", "disable"):
+        session._mcp_servers = []
+        session.enable_mcp = False
+        await session.reset_local_agent()
+        say.ok("MCP disabled.")
+    elif arg_low in ("on", "enable", "reload"):
+        session._mcp_servers = load_mcp_servers()
+        session.enable_mcp = True
+        await session.reset_local_agent()
+        names = ", ".join(s.name for s in session._mcp_servers) or "none"
+        say.ok(f"MCP reloaded: {len(session._mcp_servers)} server(s): {names}")
+    else:
+        rows = [("Enabled", f"{UI.GREEN_BOLD}YES{UI.RST}" if session.enable_mcp else f"{UI.RED_BOLD}NO{UI.RST}"), ("Config", MCP_CONFIG_PATH)]
+        for s in session._mcp_servers:
+            kind = "stdio" if isinstance(s, McpStdioServer) else "http"
+            target = s.command if isinstance(s, McpStdioServer) else s.url
+            rows.append((f"[{kind}] {s.name}", target))
+        if not session._mcp_servers:
+            rows.append(("Servers", "(none loaded)"))
+        say.card("MCP server status", rows)
+        say.dim("Commands: /mcp on | /mcp off | /mcp reload")
+
+
+@command("/kontexta", "/kxta", group="Settings", help="Kontexta integration: status, on, off, reload, register")
+async def _cmd_kontexta(session, arg, ctx):
+    from ..context.kontexta import KontextaManager
+    arg_low = (arg or "").strip().lower()
+    if arg_low in ("off", "disable"):
+        session.enable_kontexta = False
+        session._mcp_servers = [s for s in session._mcp_servers if s.name not in ("kontexta", "kxta")]
+        await session.reset_local_agent()
+        session.save_preferences()
+        say.ok("Inbuilt Kontexta MCP server DISABLED.")
+    elif arg_low in ("on", "enable"):
+        session.enable_kontexta = True
+        session._mcp_servers = load_mcp_servers(enable_kontexta=True)
+        await session.reset_local_agent()
+        session.save_preferences()
+        say.ok("Inbuilt Kontexta MCP server ENABLED.")
+    elif arg_low in ("sync", "reload", "refresh"):
+        session._mcp_servers = load_mcp_servers(enable_kontexta=session.enable_kontexta)
+        await session.reset_local_agent()
+        say.ok("Kontexta MCP integration reloaded.")
+    elif arg_low.startswith("register") or arg_low.startswith("add"):
+        parts = arg.split(maxsplit=1)
+        p_name = parts[1].strip() if len(parts) > 1 else None
+        if KontextaManager.register_project(".", name=p_name):
+            say.ok(f"Project '{os.path.basename(os.path.abspath('.'))}' registered in Kontexta database!")
+        else:
+            say.err("Failed to register project in Kontexta (database locked or unreadable).")
+    else:
+        stat = KontextaManager.get_status(".")
+        st_col = UI.GREEN_BOLD if stat["available"] else UI.RED_BOLD
+        st_text = "READY / ACTIVE" if stat["available"] else "NOT FOUND / OFFLINE"
+        active_proj = stat.get("active_project")
+        proj_str = f"{active_proj['name']} [{active_proj['slug']}]" if active_proj else f"{UI.GRAY}(unmapped; type /kontexta register){UI.RST}"
+        say.card("Kontexta MCP integration", [
+            ("Status", f"{st_col}{st_text}{UI.RST} (enabled: {'YES' if session.enable_kontexta else 'NO'})"),
+            ("Entrypoint", str(stat['mcp_entrypoint'])),
+            ("Data dir", str(stat['data_dir'])),
+            ("Database", f"{stat['db_path']} ({stat['db_size_kb']} KB)"),
+            ("Knowledge", f"{stat['files_count']} indexed file(s), {stat['tags_count']} tag(s)"),
+            ("Active repo", proj_str),
+            ("Projects", f"{stat['projects_count']} registered"),
+        ])
+        say.dim("Commands: /kontexta on | off | reload | register [name]")
+
+
+@command("/memory", "/journal", group="Settings", help="Journal brainstorm results and commits to Kontexta (on|off)")
+async def _cmd_memory(session, arg, ctx):
+    from ..context import kontexta_sync
+    choice = arg.strip().lower()
+    if choice in ("on", "off"):
+        session.kontexta_sync = choice == "on"
+        say.ok(f"Kontexta journal sync {choice}.")
+    elif kontexta_sync.enabled(session, session._repo_root or "."):
+        say.ok("Kontexta journal sync is on. Brainstorm results and commits are journaled. Use /memory off to stop.")
+    elif not session.kontexta_sync:
+        say.dim("Kontexta journal sync is off. Use /memory on to enable.")
+    else:
+        say.warn("Sync is on but inactive: Kontexta is not installed or this repo is not a registered project.")
+
+
+@command("/autocompact", "/auto-compact", group="Settings", help="Auto-compact threshold in turns (on, off, <turns>)")
+async def _cmd_autocompact(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("off", "disable", "false", "0"):
+        session.autocompact_threshold = 0
+        say.ok("Auto-compact DISABLED.")
+    elif arg_low in ("on", "enable", "true"):
+        session.autocompact_threshold = 20
+        say.ok("Auto-compact ENABLED (threshold: 20 turns).")
+    elif arg.isdigit():
+        session.autocompact_threshold = int(arg)
+        say.ok(f"Auto-compact threshold set to {session.autocompact_threshold} turns.")
+    else:
+        st = f"ENABLED ({session.autocompact_threshold} turns)" if session.autocompact_threshold > 0 else "DISABLED"
+        say.card("Auto-compact configuration", [
+            ("Status", st),
+            ("History", f"{len(session.history)} entries recorded"),
+            ("Preserved", f"Keeps {session.max_recent_turns} recent turns verbatim"),
+        ])
+        say.dim("Commands: /autocompact on | off | <turns>")
+
+
+@command("/curation", "/continuous", group="Settings", help="Background context curation on the CUDA model (on|off)")
+async def _cmd_curation(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("off", "disable", "false", "0"):
+        session.continuous_curation = False
+        say.ok("Continuous background context curation DISABLED.")
+    elif arg_low in ("on", "enable", "true", "1"):
+        session.continuous_curation = True
+        say.ok("Continuous background context curation ENABLED (auto-distills older turns on RTX 4060).")
+    else:
+        st = f"{UI.GREEN}ENABLED{UI.RST}" if session.continuous_curation else f"{UI.GRAY}DISABLED{UI.RST}"
+        say.card("Continuous curation", [
+            ("Status", st),
+            ("Engine", "CUDA:9001 (NVIDIA RTX 4060, Granite 8B)"),
+            ("Window", f"Preserves last {session.max_recent_turns} turns verbatim"),
+            ("Trigger", "Runs in the background after every turn"),
+        ])
+        say.dim("Commands: /curation on | off")
+
+
+@command("/repomap", "/ast", group="Settings", help="Repo symbol map: view, on, off, refresh, stats")
+async def _cmd_repomap(session, arg, ctx):
+    arg_low = arg.lower().strip()
+    if arg_low in ("on", "enable", "true"):
+        session.auto_repomap = True
+        await session.reset_local_agent()
+        say.ok("Automatic repository AST symbol map injection ENABLED (cached, zero-latency).")
+    elif arg_low in ("off", "disable", "false"):
+        session.auto_repomap = False
+        await session.reset_local_agent()
+        say.ok("Automatic repository AST symbol map injection DISABLED.")
+    elif arg_low in ("refresh", "reload", "sync"):
+        session.refresh_repomap(".")
+        say.ok("Repository AST symbol map cache invalidated and refreshed.")
+    elif arg_low == "stats":
+        from ..context.repomap import RepoMap
+        st = RepoMap.cache_stats()
+        say.card("Repo map cache", [
+            ("Auto-inject", f"{UI.GREEN}ENABLED{UI.RST}" if session.auto_repomap else f"{UI.GRAY}DISABLED{UI.RST}"),
+            ("Root path", str(st['root'])),
+            ("Indexed", f"{st['file_count']} Python files ({st['char_count']} chars)"),
+        ])
+    else:
+        session.print_repomap(arg or ".")
+        st_tag = "Active (auto-injected into model memory)" if session.auto_repomap else "Disabled"
+        say.dim(f"Auto-injection: {st_tag} | Toggle: /repomap [on|off|refresh]")
+
+
+@command("/instructions", "/rules", "/guidelines", group="Settings", help="Project rule files: view, on, off, refresh")
+async def _cmd_instructions(session, arg, ctx):
+    from ..context.instructions import ProjectInstructions
+    arg_low = arg.lower().strip()
+    if arg_low in ("on", "enable", "true"):
+        session.auto_instructions = True
+        await session.reset_local_agent()
+        say.ok("Automatic project instructions injection (GEMINI.md / antigravity.md) ENABLED.")
+    elif arg_low in ("off", "disable", "false"):
+        session.auto_instructions = False
+        await session.reset_local_agent()
+        say.ok("Automatic project instructions injection DISABLED.")
+    elif arg_low in ("refresh", "reload"):
+        content, loaded = ProjectInstructions.load_instructions(".", force_refresh=True)
+        await session.reset_local_agent()
+        say.ok(f"Project instructions refreshed. Loaded: {', '.join(loaded) if loaded else 'None'}")
+    elif arg_low in ("view", "show", "cat") or not arg:
+        content, loaded = ProjectInstructions.load_instructions(".", force_refresh=False)
+        if loaded:
+            say.group(f"Project instructions ({', '.join(loaded)})")
+            say.plain(content)
+        else:
+            say.warn("No instruction files found (looking for GEMINI.md, antigravity.md, AGENTS.md, etc.)")
+    else:
+        say.dim("Usage: /instructions [on|off|refresh|view]")
+
+
+@command("/hooks", "/hook", group="Settings", help="Lifecycle hooks: view, on, off, refresh")
+async def _cmd_hooks(session, arg, ctx):
+    from ..context.hooks_loader import ExternalHooksManager
+    arg_low = arg.lower().strip()
+    if arg_low in ("on", "enable", "true"):
+        session.enable_hooks = True
+        await session.reset_local_agent()
+        say.ok("External lifecycle hooks (hooks.json) ENABLED.")
+    elif arg_low in ("off", "disable", "false"):
+        session.enable_hooks = False
+        await session.reset_local_agent()
+        say.ok("External lifecycle hooks (hooks.json) DISABLED.")
+    elif arg_low in ("refresh", "reload"):
+        entries, sources = ExternalHooksManager.load_hook_configs(".", force_refresh=True)
+        await session.reset_local_agent()
+        say.ok(f"Lifecycle hooks reloaded. Found {len(entries)} active hook(s) from {len(sources)} file(s).")
+    elif arg_low in ("view", "list", "status") or not arg:
+        entries, sources = ExternalHooksManager.load_hook_configs(".", force_refresh=False)
+        state = "ENABLED" if session.enable_hooks else "DISABLED"
+        if sources:
+            rows = [("Source", sf) for sf in sources]
+            for entry in entries:
+                events = [ev for ev in ["PreToolUse", "PostToolUse", "PreTurn", "PostTurn", "PreInvocation", "PostInvocation", "Stop"] if entry["spec"].get(ev)]
+                rows.append((entry["name"], ", ".join(events)))
+        else:
+            rows = [("Hooks", "No hooks.json found in .agents/hooks.json or ~/.gemini/config/hooks.json")]
+        say.card(f"Lifecycle hooks ({state})", rows)
+        say.dim("Commands: /hooks on | off | refresh | view")
+    else:
+        say.dim("Usage: /hooks [on|off|refresh|view]")
+
+
+@command("/markdown", "/md", group="Settings", help="Toggle Markdown rendering of answers")
+async def _cmd_markdown(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("on", "enable", "true", "1"):
+        session.render_markdown = True
+    elif arg_low in ("off", "disable", "false", "0"):
+        session.render_markdown = False
+    else:
+        session.render_markdown = not session.render_markdown
+    say.ok(f"Markdown rendering of responses: {'ENABLED' if session.render_markdown else 'DISABLED (raw streaming)'}")
+
+
+@command("/multiline", "/multi", group="Settings", help="Toggle multi-line input (Enter on an empty line submits)")
+async def _cmd_multiline(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("off", "disable", "false", "0", "single"):
+        session.multiline_input = False
+        say.ok("Multi-line input DISABLED (single Enter submits).")
+    elif arg_low in ("on", "enable", "true", "1"):
+        session.multiline_input = True
+        say.ok("Multi-line input ENABLED (Enter on empty line to submit).")
+    else:
+        session.multiline_input = not session.multiline_input
+        st = "ENABLED (Enter on empty line to submit)" if session.multiline_input else "DISABLED (single Enter submits)"
+        say.ok(f"Multi-line input mode: {st}")
+
+
+@command("/singleline", "/single", group="Settings", help="Single Enter submits")
+async def _cmd_singleline(session, arg, ctx):
+    session.multiline_input = False
+    say.ok("Single-line input mode ENABLED (single Enter submits).")
+
+
+@command("/format", group="Settings", help="Output format: json or text")
+async def _cmd_format(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("json", "js"):
+        session.json_output = True
+        _sync_say(session)
+        say.ok("Structured JSON output mode: ENABLED")
+    elif arg_low in ("text", "stream", "plain"):
+        session.json_output = False
+        _sync_say(session)
+        say.ok("Standard text stream output mode: ENABLED")
+    else:
+        say.warn("Usage: /format json | text")
+
+
+@command("/prefs", "/preferences", group="Settings", help="Show saved preferences, or '/prefs reset'")
+async def _cmd_prefs(session, arg, ctx):
+    words = arg.lower().split()
+    if words and words[0] == "reset":
+        if not await _confirm("Reset preferences", [("Resets", "all saved preferences to defaults")],
+                              prompt="Reset to defaults?", assume_yes=("-y" in words or "yes" in words)):
+            say.warn("Reset cancelled.")
+            return
+        reset_prefs()
+        session.apply_preferences(PREF_DEFAULTS)
+        await session.reset_local_agent()
+        say.ok("Preferences reset to defaults.")
+    else:
+        say.card("Saved preferences (~/.myagy/config.json)", [(k, f"{UI.CYAN}{v}{UI.RST}") for k, v in session.preferences().items()])
+        say.dim("Settings save automatically after each command. /prefs reset restores defaults.")
+
+
+# ── Debug ─────────────────────────────────────────────────────────────
+
+@command("/metrics", group="Debug", help="Toggle the per-turn generation metrics line")
+async def _cmd_metrics(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("off", "disable", "false", "0"):
+        session.show_metrics = False
+        say.ok("Generation metrics display DISABLED.")
+    elif arg_low in ("on", "enable", "true", "1"):
+        session.show_metrics = True
+        say.ok("Generation metrics display ENABLED.")
+    else:
+        session.show_metrics = not session.show_metrics
+        say.ok(f"Generation metrics: {'ENABLED' if session.show_metrics else 'DISABLED'}")
+
+
+@command("/steps", "/maxsteps", "/max-steps", group="Debug", help="Cap tool steps per turn (<n>, or off)")
+async def _cmd_steps(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("off", "disable", "unlimited", "none", "0"):
+        session.max_tool_steps_per_turn = 0
+        say.ok("Tool step limit DISABLED (unlimited steps per turn; consecutive loop guard remains active).")
+    elif arg.isdigit() and int(arg) > 0:
+        session.max_tool_steps_per_turn = int(arg)
+        say.ok(f"Tool execution step limit set to {session.max_tool_steps_per_turn} steps per turn.")
+    else:
+        limit_str = f"{session.max_tool_steps_per_turn} steps" if session.max_tool_steps_per_turn > 0 else "UNLIMITED (disabled)"
+        say.card("Tool step limit and anti-loop guard", [
+            ("Max steps / turn", limit_str),
+            ("Loop detection", f"{UI.GREEN_BOLD}ACTIVE{UI.RST} (blocks identical consecutive tool calls)"),
+        ])
+        say.dim("Commands: /steps off (unlimited) | /steps <number>")
+
+
+@command("/verbose", "/v", group="Debug", help="Toggle full tool arguments and outputs")
+async def _cmd_verbose(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("off", "disable", "false", "0"):
+        session.verbose = False
+    elif arg_low in ("on", "enable", "true", "1"):
+        session.verbose = True
+    else:
+        session.verbose = not session.verbose
+    _sync_say(session)
+    say.ok("Verbose mode ENABLED (full tool inputs, outputs and step traces)." if session.verbose else "Verbose mode DISABLED (concise tool status).")
+
+
+@command("/json", group="Debug", help="Toggle structured JSON output")
+async def _cmd_json(session, arg, ctx):
+    session.json_output = not session.json_output
+    _sync_say(session)
+    say.ok(f"Structured JSON output mode: {'ENABLED' if session.json_output else 'DISABLED'}")
+
+
+@command("/stats", group="Debug", help="Usage ledger per target (/stats reset clears it)")
+async def _cmd_stats(session, arg, ctx):
+    if arg.lower() == "reset":
+        session.stats.clear()
+        say.ok("Usage ledger reset.")
+    else:
+        session.print_stats()
+
+
+@command("/coordinator", group="Debug", help="CUDA slot arbitration between compactor and subagents")
+async def _cmd_coordinator(session, arg, ctx):
+    from ..core.coordinator import CudaCoordinator
+    c_status = CudaCoordinator.status_summary()
+    st_col = UI.GREEN if c_status['state'] == 'idle' else (UI.CUDA_BOLD if c_status['state'] == 'subagent' else UI.AMBER)
+    permit = f"{UI.GREEN}ALLOWED (idle){UI.RST}" if c_status['can_compact'] else f"{UI.AMBER}PAUSED (subagent has priority){UI.RST}"
+    say.card("NVIDIA CUDA:9001 resource coordinator", [
+        ("State", f"{st_col}{c_status['state'].upper()}{UI.RST}"),
+        ("Subagents", f"{c_status['active_subagents']} running"),
+        ("Compacting", "YES" if c_status['compactor_running'] else "NO"),
+        ("Idle permit", permit),
+    ])
+
+
+# ── Session ───────────────────────────────────────────────────────────
+
+@command("/status", group="Session", help="Full status: endpoints, permissions, context, integrations")
+async def _cmd_status(session, arg, ctx):
+    session.print_status()
+
+
+@command("/history", group="Session", help="Show the conversation history")
+async def _cmd_history(session, arg, ctx):
+    if not session.history:
+        say.dim("(no conversation history)")
+        return
+    rows = []
+    for idx, t in enumerate(session.history, 1):
+        target = t.get("target", "").lower()
+        label = {"rocm": "ROCm:9000", "9000": "ROCm:9000", "cuda": "CUDA:9001", "9001": "CUDA:9001", "cloud": "Cloud"}.get(target, target.upper())
+        role = f"{UI.WHITE}USER{UI.RST}" if t["role"] == "user" else f"{UI.GREEN}ASSISTANT{UI.RST}"
+        preview = t["content"].replace("\n", " ").strip()
+        if len(preview) > 120:
+            preview = preview[:120] + "..."
+        rows.append([str(idx), f"{UI.target_color(target)}{label}{UI.RST}", role, preview])
+    say.table(f"Conversation history ({len(session.history)} entries)", ["#", "Target", "Role", "Preview"], rows)
+
+
+@command("/clear", group="Session", help="Clear the conversation history (asks first)")
+async def _cmd_clear(session, arg, ctx):
+    if session.history:
+        rows = [("Removes", f"{len(session.history)} history entries from this session")]
+        if not await _confirm("Clear conversation", rows, prompt="Clear history?", assume_yes=arg.strip().lower() in ("-y", "--yes", "yes")):
+            say.warn("Clear cancelled.")
+            return
+    session.history.clear()
+    session._cached_curated_memory = None
+    await session.reset_local_agent()
+    say.ok("Conversation history cleared.")
+
+
+@command("/save", group="Session", help="Save the session to a file")
+async def _cmd_save(session, arg, ctx):
+    say.ok(f"Session saved to {session.save_session(arg or None)}")
+
+
+@command("/load", group="Session", help="Resume a saved session by name or file")
+async def _cmd_load(session, arg, ctx):
+    if not arg:
+        say.warn("Usage: /load <session_name_or_file>. Type /sessions to list saved sessions.")
+    elif session.load_session(arg):
+        say.ok(f"Session '{arg}' loaded! Restored {len(session.history)//2} turns.")
+    else:
+        say.err(f"Could not find session '{arg}'. Type /sessions to view available sessions.")
+
+
+@command("/sessions", group="Session", help="List saved sessions")
+async def _cmd_sessions(session, arg, ctx):
+    sess_list = session.list_sessions()
+    if not sess_list:
+        say.dim("(No saved sessions found in ~/.gemini/antigravity-cli/sessions/)")
+        return
+    rows = [[s['file'], f"{s['turns']}", s['saved_at'][:19].replace('T', ' '), f"{s['size_kb']} KB"] for s in sess_list]
+    say.table(f"Saved sessions ({len(sess_list)})", ["File", "Turns", "Saved", "Size"], rows)
+    say.dim("Use '/load <filename>' to resume a session.")
+
+
+@command("/export", group="Session", help="Export the transcript as Markdown")
+async def _cmd_export(session, arg, ctx):
+    say.ok(f"Session transcript exported to {session.export_markdown(arg or None)}")
+
+
+@command("/summarize", group="Session", help="Summarize the conversation so far")
+async def _cmd_summarize(session, arg, ctx):
+    if not session.history:
+        say.warn("No conversation history to summarize.")
+    else:
+        say.group("Conversation context summary")
+        say.plain(session.summarize_history_sync(session.history).strip())
+
+
+@command("/context", "/ctx", group="Session", help="Show context window usage per target")
+async def _cmd_context(session, arg, ctx):
+    session.print_context_summary()
+
+
+@command("/compact", group="Session", help="Compact older history now (/compact <turns> keeps that many)")
+async def _cmd_compact(session, arg, ctx):
+    keep = int(arg) if arg.isdigit() else None
+    removed = session.compact_history(keep_recent=keep)
+    if removed > 0:
+        await session.reset_local_agent()
+
+
+@command("/last", group="Session", help="Re-show the previous answer in full")
+async def _cmd_last(session, arg, ctx):
+    text = session.last_answer
+    if not text:
+        say.warn("No previous answer yet.")
+        return
+    renderer = StreamRenderer(markdown=session.render_markdown)
+    renderer.feed(text)
+    renderer.stop()
+
+
+def _reload_flags(prefs: dict, json_output: bool = False) -> list:
+    """CLI flags that reproduce the saved preferences in the restarted process."""
+    flags = []
+    if prefs.get("cloud_model"):
+        flags += ["--cloud-model", prefs["cloud_model"]]
+    if prefs.get("active_target") in ("auto", "9000", "9001", "cloud"):
+        flags += ["--target", prefs["active_target"]]
+    if "dangerously_skip_permissions" in prefs:
+        flags.append("-y" if prefs["dangerously_skip_permissions"] else "--safe")
+    if prefs.get("verbose"):
+        flags.append("--verbose")
+    if json_output:
+        flags.append("--json")
+    if prefs.get("enable_mcp") is False:
+        flags.append("--no-mcp")
+    if prefs.get("enable_kontexta") is False:
+        flags.append("--no-kontexta")
+    if prefs.get("multiline_input") is False:
+        flags.append("--single-line")
+    return flags
+
+
+@command("/reload", "/restart", group="Session", help="Restart the agent in place, keeping this session")
+async def _cmd_reload(session, arg, ctx):
+    if session.history:
+        session.save_session("latest_session")
+    session.save_preferences()
+    say.card("Hot reload", [("Action", "Restarting antigravity_agent.py"), ("Session", "Saved as latest_session and restored after restart")])
+    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    runner_script = os.path.join(pkg_root, "antigravity_agent.py")
+    new_args = [sys.executable, runner_script, "--load", "latest_session"]
+    new_args += _reload_flags(session.preferences(), session.json_output)
+    os.execv(sys.executable, new_args)
+
+
+@command("/help", group="Session", help="Show this list, or '/help <group>' for one group")
+async def _cmd_help(session, arg, ctx):
+    wanted = arg.strip().lower()
+    groups = help_groups()
+    shown = {g: rows for g, rows in groups.items() if not wanted or g.lower() == wanted}
+    if not shown:
+        say.warn(f"Unknown group '{arg}'. Groups: {', '.join(groups)}.")
+        return
+    for group_name, rows in shown.items():
+        say.group(group_name)
+        say.table("", ["Command", "What it does"], [[name, text] for name, text in rows])
+    say.dim("!<cmd> runs a shell command | @model <prompt> targets one turn | Esc stops generation | Ctrl+C twice exits")
+
+
+@command("/exit", "/quit", group="Session", help="Leave the session")
+async def _cmd_exit(session, arg, ctx):
+    say.dim("Exiting session.")
+    return _EXIT
+
+
+# ── Agents ────────────────────────────────────────────────────────────
+
+@command("/compactor", "/curator", group="Agents", help="CUDA compactor: status or start")
+async def _cmd_compactor(session, arg, ctx):
+    arg_low = arg.lower()
+    if arg_low in ("start", "on", "launch", "wake"):
+        say.step("starting the compactor model on port 9001 via LlamaShift")
+        res = await asyncio.to_thread(wake_compactor, 9001)
+        for warning in res["warnings"]:
+            say.warn(warning)
+        if res["ok"]:
+            say.ok(f"NVIDIA Compactor ready in {res['elapsed']:.1f}s.")
+            await asyncio.to_thread(session.refresh_endpoints)
+        else:
+            say.err(f"Compactor not started: {res['reason']}")
+            if res["log_tail"]:
+                say.detail(res["log_tail"])
+    elif arg_low in ("status", ""):
+        await asyncio.to_thread(session.refresh_endpoints)
+        ep = session.endpoints.get("9001", {})
+        st = f"{UI.GREEN}ONLINE{UI.RST}" if ep.get("status") == "online" else f"{UI.RED}OFFLINE{UI.RST}"
+        fn = ep.get("filename") or "granite-4.2-8b-Q4_K_M.gguf"
+        say.plain(f"{UI.WHITE}NVIDIA Compactor (RTX 4060 :9001){UI.RST}: {st} ({fn})")
+        say.dim("Controls: /compactor start | /compactor status")
+
+
+@command("/spawn", "/subagent", "/task", group="Agents", help="Run a background subagent (view, inject, cancel, list)")
+async def _cmd_spawn(session, arg, ctx):
+    sub_parts = arg.split(maxsplit=1)
+    sub_cmd = sub_parts[0].lower() if sub_parts else ""
+    sub_arg = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+
+    if sub_cmd == "view":
+        if sub_arg.isdigit():
+            session.print_subagent_detail(int(sub_arg))
+        else:
+            say.dim("Usage: /subagent view <#>")
+    elif sub_cmd == "inject":
+        if sub_arg.lower() in ("all", "*"):
+            count = session.inject_all_subagents()
+            if count > 0:
+                say.ok(f"Successfully injected findings from {count} completed subagent(s) into conversation context.")
+            else:
+                say.warn("No uninjected completed subagents found to inject.")
+        elif sub_arg.isdigit():
+            if session.inject_subagent(int(sub_arg)):
+                say.ok(f"Subagent #{sub_arg} result successfully injected into conversation memory.")
+            else:
+                say.warn(f"Could not inject Subagent #{sub_arg}. Ensure it has finished and produced output.")
+        else:
+            say.dim("Usage: /subagent inject <#|all>")
+    elif sub_cmd in ("cancel", "kill", "stop"):
+        if not sub_arg.isdigit():
+            say.dim("Usage: /subagent cancel <#>")
+        elif session.cancel_subagent(int(sub_arg)):
+            say.ok(f"Subagent #{sub_arg} cancelled.")
+        else:
+            say.warn(f"Subagent #{sub_arg} is not running or not found in queue.")
+    elif sub_cmd == "list" or not arg:
+        session.print_subagents()
+    elif sub_cmd and sub_cmd.isdigit() and not sub_arg:
+        session.print_subagent_detail(int(sub_cmd))
+    else:
+        session.spawn_subagent(arg)
+
+
+@command("/build", "/test", group="Agents", help="Run build and tests on the CUDA subagent")
+async def _cmd_build(session, arg, ctx):
+    task = session.run_build_subagent(custom_cmd=arg.strip() if arg else None, repo_root=".")
+    if not session.json_output:
+        say.step(f"Pushed build and test verification to NVIDIA Subagent #{task.id} (port 9001). Type /subagent view {task.id} to inspect.")
+
+
+@command("/tasks", "/subagents", group="Agents", help="List subagent tasks")
+async def _cmd_tasks(session, arg, ctx):
+    session.print_subagents()
+
+
+@command("/brainstorm", "/spec", "/plan", group="Agents", help="Spec-driven plan, build, review and commit workflow")
+async def _cmd_brainstorm(session, arg, ctx):
+    from ..agents.brainstorm import BrainstormWorkflow
+    ctx.task = asyncio.create_task(BrainstormWorkflow.execute_workflow(arg, session, repo_root="."))
+    esc_listener = EscListener(
+        on_escape=lambda: ctx.loop.call_soon_threadsafe(
+            lambda: ctx.task.cancel() if ctx.task and not ctx.task.done() else None
+        )
+    )
+    try:
+        with esc_listener:
+            await ctx.task
+    except asyncio.CancelledError:
+        say.warn("[Esc] Brainstorm workflow stopped by user.")
+    finally:
+        ctx.task = None
+
+
+@command("/search", "/web", "/google", "/ddg", group="Agents", help="Search the web")
+async def _cmd_search(session, arg, ctx):
+    from ..tools.web_search import WebSearchEngine
+    if not arg:
+        say.dim("Usage: /search <query to search online>")
+    else:
+        say.step(f"Searching the web for '{arg}'...")
+        results = await asyncio.to_thread(WebSearchEngine.search, arg, 5)
+        WebSearchEngine.print_search_results(arg, results)
+
+
+@command("/fetch", "/browse", "/readurl", group="Agents", help="Fetch a web page as clean Markdown")
+async def _cmd_fetch(session, arg, ctx):
+    from ..tools.web_search import WebSearchEngine
+    if not arg:
+        say.dim("Usage: /fetch <url to inspect>")
+    else:
+        say.step(f"Fetching and distilling {arg}...")
+        content = await asyncio.to_thread(WebSearchEngine.fetch_url, arg, 4000)
+        say.group(f"Webpage content ({arg})")
+        say.plain(content)
+
+
+# ── Git ───────────────────────────────────────────────────────────────
+
+@command("/diff", group="Git", help="Show the file changes from a recent turn (/diff <n>)")
+async def _cmd_diff(session, arg, ctx):
+    nth = int(arg) if arg.isdigit() else 1
+    text = await asyncio.to_thread(session.turn_diff, nth)
+    if not text:
+        say.warn("No recorded file changes for that turn (needs a git repo and a turn that edited files).")
+        return
+    stat = await asyncio.to_thread(session.turn_diff, nth, True)
+    say.dim(stat)
+    for line in text.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            say.plain(f"{UI.GREEN}{line}{UI.RST}")
+        elif line.startswith("-") and not line.startswith("---"):
+            say.plain(f"{UI.RED}{line}{UI.RST}")
+        elif line.startswith("@@") or line.startswith("diff "):
+            say.plain(f"{UI.CYAN}{line}{UI.RST}")
+        else:
+            say.plain(line)
+
+
+@command("/undo", group="Git", help="Revert the files changed by the last turn (asks first)")
+async def _cmd_undo(session, arg, ctx):
+    plan = await asyncio.to_thread(session.undo_plan)
+    if not plan or not plan["files"]:
+        say.warn("Nothing to undo: no recorded turn with file changes.")
+        return
+    cp = plan["checkpoint"]
+    verbs = {"A": "delete (created by turn)", "M": "restore", "D": "restore (deleted by turn)"}
+    rows = [(st, f"{path}  ->  {verbs.get(st, 'restore')}") for path, st in sorted(plan["files"].items())]
+    if await _confirm(f"Revert turn: {cp['prompt']}", rows, prompt="Revert these files?"):
+        touched = await asyncio.to_thread(session.apply_undo, plan)
+        say.ok(f"Reverted {len(touched)} file(s). The model has been told.")
+    else:
+        say.warn("Undo cancelled.")
+
+
+SLASH_COMMANDS[:] = list(COMMANDS) + [c for c in _COMPLETION_ONLY if c not in COMMANDS]
+
+
+async def interactive_loop(session: MultiGpuHybridSession):
+    _sync_say(session)
+    set_toolbar(lambda: session.toolbar_fragments())
+    if not session.json_output:
+        session.print_header()
 
     set_completion_targets([m['id'] for m in session.get_catalog() if m.get('type') == 'local'])
-    loop = asyncio.get_event_loop()
-    _current_task: Optional[asyncio.Task] = None
-    _sigint_count = 0
+    loop = asyncio.get_running_loop()
+    ctx = _LoopCtx(loop)
 
     def _sigint_handler():
-        nonlocal _sigint_count, _current_task
-        _sigint_count += 1
-        if _current_task and not _current_task.done():
-            # First Ctrl+C: cancel the running request, stay in session
-            print(f"\n{UI.AMBER_BOLD}[^C] Cancelling request... (Ctrl+C again to exit){UI.RST}", flush=True)
-            _current_task.cancel()
-        else:
-            # Ctrl+C at the prompt or second press: exit
-            print(f"\n{UI.GRAY}Exiting session.{UI.RST}", flush=True)
-            raise SystemExit(0)
+        ctx.sigint += 1
+        if ctx.task and not ctx.task.done():
+            say.warn("[^C] Cancelling request...")
+            ctx.task.cancel()
+        elif ctx.read_fut and not ctx.read_fut.done():
+            if ctx.sigint >= 2:
+                say.dim("Exiting session.")
+                ctx.read_fut.set_exception(_ExitSession())
+            else:
+                say.dim("[^C] Press Ctrl+C again to exit.")
 
     loop.add_signal_handler(signal.SIGINT, _sigint_handler)
 
     try:
         while True:
-            _sigint_count = 0
-
-            # Build prompt label and badge with live context size pill
-            ctx_pill = session.format_context_pill(session.active_target)
-            if session.active_target == "auto":
-                target_label = "AUTO:Laya"
-                target_badge = f"{UI.LAYA_BOLD}[⚡ AUTO:Laya │ {ctx_pill}{UI.LAYA_BOLD}]{UI.RST}"
-                arrow_col = UI.LAYA
-            elif session.active_target == "9000":
-                target_label = "ROCm:9000"
-                target_badge = f"{UI.ROCM_BOLD}[⚡ ROCm:9000 │ {ctx_pill}{UI.ROCM_BOLD}]{UI.RST}"
-                arrow_col = UI.ROCM
-            elif session.active_target == "9001":
-                target_label = "CUDA:9001"
-                target_badge = f"{UI.CUDA_BOLD}[⚡ CUDA:9001 │ {ctx_pill}{UI.CUDA_BOLD}]{UI.RST}"
-                arrow_col = UI.CUDA
-            elif session.active_target == "cloud":
-                target_label = "CLOUD:OAuth"
-                target_badge = f"{UI.CLOUD_BOLD}[☁ CLOUD:OAuth │ {ctx_pill}{UI.CLOUD_BOLD}]{UI.RST}"
-                arrow_col = UI.CLOUD
-            else:
-                target_label = str(session.active_target)
-                target_badge = f"{UI.GRAY}[{session.active_target} │ {ctx_pill}{UI.GRAY}]{UI.RST}"
-                arrow_col = UI.GRAY
-
             try:
-                if UI._use_color:
-                    prompt_str = f"{target_badge} {UI.WHITE}You{UI.RST} {arrow_col}❯{UI.RST} "
-                else:
-                    raw_ctx = session.get_context_metrics(session.active_target)
-                    t_val = raw_ctx["tokens"]
-                    t_str = f"{t_val/1000:.1f}k" if t_val >= 1000 else str(t_val)
-                    prompt_str = f"[{target_label} | {t_str} ctx] You > "
-                user_input = await asyncio.to_thread(read_input_prompt, prompt_str, session.multiline_input)
-            except (EOFError, SystemExit):
+                if not session.json_output and not _toolbar_active():
+                    say.dim(_plain_pill(session))
+                ctx.read_fut = _spawn_reader(loop, read_input_prompt, _prompt_string(session), session.multiline_input)
+                user_input = await ctx.read_fut
+            except PromptInterrupted:
+                ctx.sigint += 1
+                if ctx.sigint >= 2:
+                    say.dim("Exiting session.")
+                    break
+                say.dim("[^C] Press Ctrl+C again to exit.")
+                continue
+            except (EOFError, SystemExit, _ExitSession):
                 break
-
+            finally:
+                ctx.read_fut = None
+            ctx.sigint = 0
             user_input = user_input.strip()
             if not user_input:
                 continue
 
             if user_input.lower() in ("exit", "quit", "q", "/exit", "/quit"):
-                print(f"{UI.GRAY}Exiting session.{UI.RST}")
+                say.dim("Exiting session.")
                 break
 
             # Multi-line block detection (inline triple-quotes)
@@ -242,7 +1165,7 @@ async def interactive_loop(session: MultiGpuHybridSession):
                     user_input = remainder.split(quote_type, 1)[0].strip()
                 else:
                     collected = [remainder]
-                    print(f"{UI.GRAY}[Multi-line block mode — enter text, type {quote_type} on an empty line to finish]:{UI.RST}")
+                    say.dim(f"[Multi-line block mode: enter text, type {quote_type} on an empty line to finish]")
                     q_prompt = f"{UI.DARK_GRAY}  │{UI.RST} " if UI._use_color else "... "
                     while True:
                         try:
@@ -259,10 +1182,10 @@ async def interactive_loop(session: MultiGpuHybridSession):
 
             # Multi-line paste mode
             if user_input.lower().startswith("/paste"):
-                print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}PASTE MODE{UI.RST}{UI.DARK_GRAY} ──────────────────────────────────────────────╮{UI.RST}")
-                print(f"{UI.DARK_GRAY}│{UI.RST}  Paste code or text below.                                   {UI.DARK_GRAY}│{UI.RST}")
-                print(f"{UI.DARK_GRAY}│{UI.RST}  Type {UI.WHITE}EOF{UI.RST}, {UI.WHITE}.{UI.RST}, or {UI.WHITE}END{UI.RST} on an empty line (or Ctrl+D) to submit.   {UI.DARK_GRAY}│{UI.RST}")
-                print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}\n")
+                say.card("Paste mode", [
+                    ("Paste", "Paste code or text below."),
+                    ("Submit", "Type EOF, . or END on an empty line (or Ctrl+D)."),
+                ])
                 paste_lines = []
                 while True:
                     try:
@@ -274,7 +1197,7 @@ async def interactive_loop(session: MultiGpuHybridSession):
                         break
                 pasted_text = "\n".join(paste_lines).strip()
                 if not pasted_text:
-                    print(UI.warn("No input provided in paste mode."))
+                    say.warn("No input provided in paste mode.")
                     continue
                 user_input = pasted_text
 
@@ -282,24 +1205,22 @@ async def interactive_loop(session: MultiGpuHybridSession):
             if user_input.startswith("!"):
                 raw_cmd = user_input[1:].strip()
                 if not raw_cmd:
-                    print(UI.warn("Usage: !<shell command>"))
+                    say.warn("Usage: !<shell command>")
                     continue
 
                 is_sudo = SudoManager.is_sudo_command(raw_cmd)
                 if is_sudo and not SudoManager.is_authenticated():
                     if not SudoManager.prompt_password_entry(reason=raw_cmd):
-                        print(UI.warn("Execution aborted: sudo authentication required."))
+                        say.warn("Execution aborted: sudo authentication required.")
                         continue
 
                 try:
-                    print(f"{UI.GRAY}$ {raw_cmd}{UI.RST}\n")
+                    say.dim(f"$ {raw_cmd}")
                     proc = await asyncio.to_thread(subprocess.run, raw_cmd, shell=True, env=os.environ)
                     if proc.returncode != 0:
-                        print(f"\n{UI.RED_BOLD}[Exit {proc.returncode}]{UI.RST}\n")
-                    else:
-                        print()
+                        say.err(f"Exit {proc.returncode}")
                 except Exception as ex:
-                    print(UI.err(f"Shell execution failed: {ex}"))
+                    say.err(f"Shell execution failed: {ex}")
                 continue
 
             # Handle slash commands
@@ -307,682 +1228,15 @@ async def interactive_loop(session: MultiGpuHybridSession):
                 parts = user_input.split(maxsplit=1)
                 cmd = parts[0].lower()
                 arg = parts[1].strip() if len(parts) > 1 else ""
-
-                if cmd == "/auto":
-                    session.active_target = "auto"
-                    print(UI.ok("Default target set to AUTO (Laya System 1 Non-Autoregressive Routing in ~33ms)"))
-                elif cmd in ("/9000", "/rocm", "/amd"):
-                    session.active_target = "9000"
-                    await asyncio.to_thread(session.refresh_endpoints)
-                    fn = session.endpoints['9000']['filename']
-                    print(UI.ok(f"Default target set to AMD ROCm Port 9000 ({fn})"))
-                elif cmd in ("/9001", "/cuda", "/nvidia"):
-                    session.active_target = "9001"
-                    await asyncio.to_thread(session.refresh_endpoints)
-                    fn = session.endpoints['9001']['filename']
-                    print(UI.ok(f"Default target set to NVIDIA CUDA Port 9001 ({fn})"))
-                elif cmd in ("/cloud", "/gemini", "/oauth"):
-                    if arg:
-                        # /cloud <model-id> — change cloud model mid-session and persist
-                        new_model = arg.strip()
-                        session.cloud_model = new_model
-                        session.active_target = "cloud"
-                        session.save_preferences()
-                        print(UI.ok(f"Cloud model set to {UI.CLOUD}{new_model}{UI.RST} and target switched to CLOUD (saved to prefs)."))
-                    else:
-                        session.active_target = "cloud"
-                        print(UI.ok(f"Default target set to CLOUD via OAuth ({session.cloud_model})"))
-                elif cmd in ("/model", "/switch", "/shift", "/use"):
-                    if not arg:
-                        session.print_models()
-                    else:
-                        await session.switch_model(arg)
-                elif cmd == "/mode":
-                    if arg:
-                        await session.switch_model(arg)
-                    else:
-                        print(UI.warn("Usage: /mode <# or id>. Type /models to view list."))
-                elif cmd in ("/skip-permissions", "/dangerously-skip-permissions"):
-                    new_val = not session.dangerously_skip_permissions
-                    session.use_laya_adaptive_permissions = False
-                    session.set_dangerously_skip_permissions(new_val)
-                    status_text = "ENABLED" if new_val else "DISABLED"
-                    print(UI.ok(f"Dangerously skip permissions: {status_text}"))
-                elif cmd == "/permissions":
-                    arg_low = arg.lower()
-                    if arg_low in ("auto", "laya", "dynamic", "smart"):
-                        session.use_laya_adaptive_permissions = True
-                        session._active_local_agent = None
-                        print(UI.ok("Permissions: LAYA ADAPTIVE"))
-                    elif arg_low in ("on", "skip", "true", "1"):
-                        session.use_laya_adaptive_permissions = False
-                        session.set_dangerously_skip_permissions(True)
-                        print(UI.ok("Dangerously skip permissions: ENABLED"))
-                    elif arg_low in ("off", "safe", "prompt", "false", "0"):
-                        session.use_laya_adaptive_permissions = False
-                        session.set_dangerously_skip_permissions(False)
-                        print(UI.ok("Permissions: SAFE MODE"))
-                    else:
-                        print(UI.warn("Usage: /permissions auto | skip | safe"))
-                elif cmd == "/sudo":
-                    arg_strip = arg.strip()
-                    if not arg_strip:
-                        if SudoManager.is_authenticated():
-                            rem = int(SudoManager.time_remaining() // 60)
-                            print(f"\n{UI.GREEN_BOLD}[✓] Sudo access is currently ACTIVE (~{rem}m remaining in session cache).{UI.RST}")
-                            print(f"{UI.DARK_GRAY}Tip: Use '/sudo clear' to revoke or '/sudo <command>' to execute with root privileges.{UI.RST}\n")
-                        else:
-                            SudoManager.prompt_password_entry()
-                    elif arg_strip in ("status", "check"):
-                        if SudoManager.is_authenticated():
-                            rem = int(SudoManager.time_remaining() // 60)
-                            print(f"\n{UI.GREEN_BOLD}[✓] Sudo Status: ACTIVE (~{rem} minutes remaining in session){UI.RST}")
-                            print(f"{UI.DARK_GRAY}User: {os.environ.get('USER', 'root')} │ Timeout: 15 min │ Askpass: Active{UI.RST}\n")
-                        else:
-                            print(f"\n{UI.AMBER_BOLD}[○] Sudo Status: INACTIVE (No cached credentials){UI.RST}")
-                            print(f"{UI.DARK_GRAY}Type '/sudo' to authenticate and unlock root access.{UI.RST}\n")
-                    elif arg_strip in ("clear", "lock", "reset", "revoke"):
-                        SudoManager.clear_credentials()
-                        print(f"\n{UI.ok('Sudo credentials cleared. Root access revoked.')}\n")
-                    else:
-                        subcmd = arg_strip
-                        if not subcmd.startswith("sudo "):
-                            subcmd = f"sudo {subcmd}"
-                        print(f"{UI.GRAY}⚡ Executing: {UI.WHITE}{subcmd}{UI.RST}\n")
-                        if not SudoManager.is_authenticated():
-                            if not SudoManager.prompt_password_entry(reason=subcmd):
-                                print(UI.warn("Execution aborted: sudo authentication required."))
-                                continue
-                        try:
-                            proc = await asyncio.to_thread(subprocess.run, subcmd, shell=True, env=os.environ)
-                            if proc.returncode == 0:
-                                print(f"\n{UI.GREEN_BOLD}[✓] Command completed cleanly (exit code 0).{UI.RST}\n")
-                            else:
-                                print(f"\n{UI.RED_BOLD}[x] Command exited with code {proc.returncode}.{UI.RST}\n")
-                        except Exception as ex:
-                            print(UI.err(f"Execution failed: {ex}"))
-                elif cmd in ("/git-shift", "/gitshift", "/autoshift"):
-                    arg_low = arg.lower().strip()
-                    if arg_low in ("on", "true", "1", "enable"):
-                        session.auto_git_shift = True
-                        print(UI.ok(f"Git Auto-Shift: ENABLED ({session.fast_git_model} for git/tools ↔ {session.dense_code_model} for deep code)"))
-                    elif arg_low in ("off", "false", "0", "disable"):
-                        session.auto_git_shift = False
-                        print(UI.ok("Git Auto-Shift: DISABLED (manual model control)"))
-                    elif not arg_low:
-                        session.auto_git_shift = not session.auto_git_shift
-                        st = f"ENABLED ({session.fast_git_model} for git ↔ {session.dense_code_model} for deep code)" if session.auto_git_shift else "DISABLED"
-                        print(UI.ok(f"Git Auto-Shift: {st}"))
-                    else:
-                        print(UI.warn("Usage: /git-shift [on|off]"))
-                elif cmd == "/laya":
-                    print(f"\n{UI.DARK_GRAY}╭─── {UI.LAYA_BOLD}LAYA SYSTEM 1 DECISION ENGINE (Convai Innovations){UI.RST}{UI.DARK_GRAY} ─────╮{UI.RST}")
-                    print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Backbone{UI.RST}     : {UI.LAYA}ModernBERT-large (~421M params, Non-Autoregressive){UI.RST}")
-                    print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Latency{UI.RST}      : {UI.GREEN}~33ms{UI.RST}  |  {UI.WHITE}Protocol{UI.RST}: /v1/systemone ({session.laya.endpoint})")
-                    perm_tag = f"{UI.GREEN_BOLD}ACTIVE{UI.RST}" if session.use_laya_adaptive_permissions else f"{UI.GRAY}INACTIVE{UI.RST}"
-                    print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Adaptive Perm{UI.RST}: {perm_tag}")
-                    print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────────╯{UI.RST}\n")
-                elif cmd == "/status":
-                    session.print_status()
-                elif cmd == "/models":
-                    session.print_models()
-                elif cmd == "/history":
-                    if RICH_AVAILABLE and not session.json_output:
-                        if not session.history:
-                            print(f"\n{UI.GRAY}(no conversation history){UI.RST}\n")
-                        else:
-                            table = Table(
-                                title=Text.from_ansi(f"{UI.WHITE}CROSS-GPU CONVERSATION HISTORY ({len(session.history)} entries){UI.RST}"),
-                                box=box.ROUNDED,
-                                header_style="bold cyan",
-                                border_style="bright_black"
-                            )
-                            table.add_column("Turn", justify="center", style="bold dim", width=6)
-                            table.add_column("Target", style="bold", width=12)
-                            table.add_column("Role", style="bold", width=11)
-                            table.add_column("Content Preview", style="none")
-
-                            for idx, t in enumerate(session.history, 1):
-                                target = t.get("target", "").lower()
-                                if target in ("rocm", "9000"):
-                                    t_col = f"{UI.ROCM}ROCm:9000{UI.RST}"
-                                elif target in ("cuda", "9001"):
-                                    t_col = f"{UI.CUDA}CUDA:9001{UI.RST}"
-                                elif target == "cloud":
-                                    t_col = f"{UI.CLOUD}Cloud{UI.RST}"
-                                else:
-                                    t_col = f"{UI.LAYA}{target.upper()}{UI.RST}"
-
-                                role_str = f"{UI.WHITE}USER{UI.RST}" if t["role"] == "user" else f"{UI.GREEN}ASSISTANT{UI.RST}"
-                                content_preview = t["content"].replace("\n", " ").strip()
-                                if len(content_preview) > 120:
-                                    content_preview = content_preview[:120] + "..."
-
-                                table.add_row(
-                                    str(idx),
-                                    Text.from_ansi(t_col),
-                                    Text.from_ansi(role_str),
-                                    Text.from_ansi(content_preview)
-                                )
-
-                            console.print()
-                            console.print(table)
-                            console.print()
-                    else:
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}Cross-GPU Session History ({len(session.history)} entries){UI.RST}{UI.DARK_GRAY} ──────────────╮{UI.RST}")
-                        if session.history:
-                            for t in session.history:
-                                c = UI.target_color(t.get('target', ''))
-                                role_color = UI.WHITE if t['role'] == 'user' else c
-                                print(f"{UI.DARK_GRAY}│{UI.RST} {c}[{t['target'].upper()}]{UI.RST} {role_color}{t['role'].upper()}{UI.RST}: {t['content']}")
-                        else:
-                            print(f"{UI.DARK_GRAY}│{UI.RST}   {UI.GRAY}(no conversation history){UI.RST}")
-                        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────────╯{UI.RST}\n")
-                elif cmd == "/clear":
-                    session.history.clear()
-                    session._cached_curated_memory = None
-                    await session.reset_local_agent()
-                    print(UI.ok("Conversation history cleared."))
-                elif cmd == "/mcp":
-                    arg_low = arg.lower()
-                    if arg_low in ("off", "disable"):
-                        session._mcp_servers = []
-                        session.enable_mcp = False
-                        session._active_local_agent = None
-                        print(UI.ok("MCP disabled."))
-                    elif arg_low in ("on", "enable", "reload"):
-                        session._mcp_servers = load_mcp_servers()
-                        session.enable_mcp = True
-                        session._active_local_agent = None
-                        names = ", ".join(s.name for s in session._mcp_servers) or "none"
-                        print(UI.ok(f"MCP reloaded: {len(session._mcp_servers)} server(s): {names}"))
-                    else:
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}MCP SERVER STATUS{UI.RST}{UI.DARK_GRAY} ──────────────────────────────────────────╮{UI.RST}")
-                        mcp_st = f"{UI.GREEN_BOLD}YES{UI.RST}" if session.enable_mcp else f"{UI.RED_BOLD}NO{UI.RST}"
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Enabled{UI.RST} : {mcp_st}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Config{UI.RST}  : {UI.GRAY}{MCP_CONFIG_PATH}{UI.RST}")
-                        if session._mcp_servers:
-                            for s in session._mcp_servers:
-                                kind = "stdio" if isinstance(s, McpStdioServer) else "http"
-                                detail = s.command if isinstance(s, McpStdioServer) else s.url
-                                print(f"{UI.DARK_GRAY}│{UI.RST}   {UI.AMBER}[{kind}]{UI.RST} {UI.WHITE}{s.name}{UI.RST}: {UI.GRAY}{detail}{UI.RST}")
-                        else:
-                            print(f"{UI.DARK_GRAY}│{UI.RST}   {UI.GRAY}(no servers loaded){UI.RST}")
-                        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}")
-                        print(f"{UI.GRAY}Commands: /mcp on | /mcp off | /mcp reload{UI.RST}\n")
-                elif cmd in ("/kontexta", "/kxta"):
-                    from ..context.kontexta import KontextaManager
-                    arg_low = (arg or "").strip().lower()
-                    if arg_low in ("off", "disable"):
-                        session.enable_kontexta = False
-                        session._mcp_servers = [s for s in session._mcp_servers if s.name not in ("kontexta", "kxta")]
-                        session._active_local_agent = None
-                        session.save_preferences()
-                        print(UI.ok("Inbuilt Kontexta MCP server DISABLED."))
-                    elif arg_low in ("on", "enable"):
-                        session.enable_kontexta = True
-                        session._mcp_servers = load_mcp_servers(enable_kontexta=True)
-                        session._active_local_agent = None
-                        session.save_preferences()
-                        print(UI.ok("Inbuilt Kontexta MCP server ENABLED."))
-                    elif arg_low in ("sync", "reload", "refresh"):
-                        session._mcp_servers = load_mcp_servers(enable_kontexta=session.enable_kontexta)
-                        session._active_local_agent = None
-                        print(UI.ok("Kontexta MCP integration reloaded."))
-                    elif arg_low.startswith("register") or arg_low.startswith("add"):
-                        parts = arg.split(maxsplit=1)
-                        p_name = parts[1].strip() if len(parts) > 1 else None
-                        ok = KontextaManager.register_project(".", name=p_name)
-                        if ok:
-                            print(UI.ok(f"Project '{os.path.basename(os.path.abspath('.'))}' registered in Kontexta database!"))
-                        else:
-                            print(UI.err("Failed to register project in Kontexta (database locked or unreadable)."))
-                    else:
-                        stat = KontextaManager.get_status(".")
-                        st_col = UI.GREEN_BOLD if stat["available"] else UI.RED_BOLD
-                        st_text = "READY / ACTIVE" if stat["available"] else "NOT FOUND / OFFLINE"
-                        active_proj = stat.get("active_project")
-                        proj_str = f"{active_proj['name']} [{active_proj['slug']}]" if active_proj else f"{UI.GRAY}(unmapped; type /kontexta register){UI.RST}"
-
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}INBUILT KONTEXTA MCP INTEGRATION{UI.RST}{UI.DARK_GRAY} ─────────────────────────────╮{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Status       : {st_col}{st_text}{UI.RST} (Enabled: {'YES' if session.enable_kontexta else 'NO'})")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Entrypoint   : {UI.CYAN}{stat['mcp_entrypoint']}{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Data Dir     : {UI.GRAY}{stat['data_dir']}{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Database     : {UI.GRAY}{stat['db_path']}{UI.RST} ({stat['db_size_kb']} KB)")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Knowledge    : {stat['files_count']} indexed file(s), {stat['tags_count']} tag(s)")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Active Repo  : {UI.WHITE}{proj_str}{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Total Projects: {stat['projects_count']} registered")
-                        print(f"{UI.DARK_GRAY}╰──────────────────────────────────────────────────────────────────╯{UI.RST}")
-                        print(f"{UI.GRAY}Commands: /kontexta on | /kontexta off | /kontexta reload | /kontexta register [name]{UI.RST}\n")
-                elif cmd == "/metrics":
-                    arg_low = arg.lower()
-                    if arg_low in ("off", "disable", "false", "0"):
-                        session.show_metrics = False
-                        print(UI.ok("Generation metrics display DISABLED."))
-                    elif arg_low in ("on", "enable", "true", "1"):
-                        session.show_metrics = True
-                        print(UI.ok("Generation metrics display ENABLED."))
-                    else:
-                        session.show_metrics = not session.show_metrics
-                        st = "ENABLED" if session.show_metrics else "DISABLED"
-                        print(UI.ok(f"Generation metrics: {st}"))
-                elif cmd == "/save":
-                    saved_path = session.save_session(arg or None)
-                    print(UI.ok(f"Session saved to {saved_path}"))
-                elif cmd == "/load":
-                    if not arg:
-                        print(UI.warn("Usage: /load <session_name_or_file>. Type /sessions to list saved sessions."))
-                    else:
-                        ok = session.load_session(arg)
-                        if ok:
-                            print(UI.ok(f"Session '{arg}' loaded! Restored {len(session.history)//2} turns."))
-                        else:
-                            print(UI.err(f"Could not find session '{arg}'. Type /sessions to view available sessions."))
-                elif cmd == "/sessions":
-                    sess_list = session.list_sessions()
-                    print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}SAVED SESSIONS ({len(sess_list)}){UI.RST}{UI.DARK_GRAY} ────────────────────────────────────────╮{UI.RST}")
-                    if sess_list:
-                        for s in sess_list:
-                            saved_dt = s['saved_at'][:19].replace('T', ' ')
-                            print(f"{UI.DARK_GRAY}│{UI.RST}  • {UI.CYAN}{s['file']:30s}{UI.RST} │ {s['turns']:2d} turns │ {UI.GRAY}{saved_dt}{UI.RST} │ {s['size_kb']} KB")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}\n{UI.DARK_GRAY}│{UI.RST}  {UI.GRAY}Use '/load <filename>' to resume a session.{UI.RST}")
-                    else:
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.GRAY}(No saved sessions found in ~/.gemini/antigravity-cli/sessions/){UI.RST}")
-                    print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}\n")
-                elif cmd == "/export":
-                    export_path = session.export_markdown(arg or None)
-                    print(UI.ok(f"Session transcript exported to {export_path}"))
-                elif cmd == "/summarize":
-                    if not session.history:
-                        print(UI.warn("No conversation history to summarize."))
-                    else:
-                        summary = session.summarize_history_sync(session.history)
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}CONVERSATION CONTEXT SUMMARY{UI.RST}{UI.DARK_GRAY} ─────────────────────────────╮{UI.RST}")
-                        for line in summary.strip().splitlines():
-                            print(f"{UI.DARK_GRAY}│{UI.RST}  {line}")
-                        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}\n")
-                elif cmd in ("/context", "/ctx"):
-                    session.print_context_summary()
-                elif cmd == "/compact":
-                    keep = int(arg) if arg.isdigit() else None
-                    removed = session.compact_history(keep_recent=keep)
-                    if removed > 0:
-                        session._active_local_agent = None
-                elif cmd in ("/autocompact", "/auto-compact"):
-                    arg_low = arg.lower()
-                    if arg_low in ("off", "disable", "false", "0"):
-                        session.autocompact_threshold = 0
-                        print(UI.ok("Auto-compact DISABLED."))
-                    elif arg_low in ("on", "enable", "true"):
-                        session.autocompact_threshold = 20
-                        print(UI.ok("Auto-compact ENABLED (threshold: 20 turns)."))
-                    elif arg.isdigit():
-                        session.autocompact_threshold = int(arg)
-                        print(UI.ok(f"Auto-compact threshold set to {session.autocompact_threshold} turns."))
-                    else:
-                        st = f"ENABLED ({session.autocompact_threshold} turns)" if session.autocompact_threshold > 0 else "DISABLED"
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}AUTO-COMPACT CONFIGURATION{UI.RST}{UI.DARK_GRAY} ─────────────────────────────╮{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Status     : {st}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  History    : {len(session.history)} turn(s) recorded")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Preserved  : Keeps {session.max_recent_turns} recent turns verbatim")
-                        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}")
-                        print(f"{UI.GRAY}Commands: /autocompact on | /autocompact off | /autocompact <turns>{UI.RST}\n")
-                elif cmd in ("/compactor", "/curator"):
-                    arg_low = arg.lower()
-                    if arg_low in ("start", "on", "launch", "wake"):
-                        print(f"{UI.AMBER}[⚡ Llama-Launcher]{UI.RST} Starting IBM Granite 4.2 8B on NVIDIA RTX 4060 (Port 9001)...")
-                        res = await asyncio.to_thread(trigger_llamashift_switch, "granite42_8b")
-                        if res.get("success"):
-                            print(UI.ok("NVIDIA Compactor started successfully via Llama-Launcher."))
-                            session.refresh_endpoints()
-                        else:
-                            print(UI.err(f"Failed to start compactor: {res.get('error', res)}"))
-                    elif arg_low in ("status", ""):
-                        session.refresh_endpoints()
-                        ep = session.endpoints.get("9001", {})
-                        st = f"{UI.GREEN}ONLINE{UI.RST}" if ep.get("status") == "online" else f"{UI.RED}OFFLINE{UI.RST}"
-                        fn = ep.get("filename") or "granite-4.2-8b-Q4_K_M.gguf"
-                        print(f"{UI.WHITE}NVIDIA Compactor (RTX 4060 :9001){UI.RST}: {st} ({fn})")
-                        print(f"{UI.GRAY}Controls: /compactor start | /compactor status{UI.RST}")
-                elif cmd in ("/curation", "/continuous"):
-                    arg_low = arg.lower()
-                    if arg_low in ("off", "disable", "false", "0"):
-                        session.continuous_curation = False
-                        print(UI.ok("Continuous background context curation DISABLED."))
-                    elif arg_low in ("on", "enable", "true", "1"):
-                        session.continuous_curation = True
-                        print(UI.ok("Continuous background context curation ENABLED (auto-distills older turns on RTX 4060)."))
-                    else:
-                        st = f"{UI.GREEN}ENABLED{UI.RST}" if session.continuous_curation else f"{UI.GRAY}DISABLED{UI.RST}"
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}CONTINUOUS CURATION CONFIGURATION{UI.RST}{UI.DARK_GRAY} ──────────────╮{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Status    : {st}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Engine    : CUDA:9001 (NVIDIA RTX 4060 - Granite 8B)")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Window    : Preserves last {session.max_recent_turns} turns verbatim")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Trigger   : Asynchronously runs after EVERY turn in background")
-                        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}")
-                        print(f"{UI.GRAY}Commands: /curation on | /curation off{UI.RST}\n")
-                elif cmd in ("/spawn", "/subagent", "/task"):
-                    sub_parts = arg.split(maxsplit=1)
-                    sub_cmd = sub_parts[0].lower() if sub_parts else ""
-                    sub_arg = sub_parts[1].strip() if len(sub_parts) > 1 else ""
-
-                    if sub_cmd == "view" and sub_arg.isdigit():
-                        session.print_subagent_detail(int(sub_arg))
-                    elif sub_cmd == "inject":
-                        if sub_arg.lower() in ("all", "*"):
-                            count = session.inject_all_subagents()
-                            if count > 0:
-                                print(UI.ok(f"Successfully injected findings from {count} completed subagent(s) into conversation context."))
-                            else:
-                                print(UI.warn("No uninjected completed subagents found to inject."))
-                        elif sub_arg.isdigit():
-                            ok = session.inject_subagent(int(sub_arg))
-                            if ok:
-                                print(UI.ok(f"Subagent #{sub_arg} result successfully injected into conversation memory."))
-                            else:
-                                print(UI.warn(f"Could not inject Subagent #{sub_arg}. Ensure it has finished and produced output."))
-                        else:
-                            print(f"{UI.GRAY}Usage: /subagent inject <#|all>{UI.RST}")
-                    elif sub_cmd in ("cancel", "kill", "stop") and sub_arg.isdigit():
-                        ok = session.cancel_subagent(int(sub_arg))
-                        if ok:
-                            print(UI.ok(f"Subagent #{sub_arg} cancelled."))
-                        else:
-                            print(UI.warn(f"Subagent #{sub_arg} is not running or not found in queue."))
-                    elif sub_cmd == "list" or not arg:
-                        session.print_subagents()
-                    elif sub_cmd and sub_cmd.isdigit() and not sub_arg:
-                        session.print_subagent_detail(int(sub_cmd))
-                    else:
-                        # Full argument string is treated as a new task description
-                        session.spawn_subagent(arg)
-                elif cmd in ("/build", "/test"):
-                    custom_cmd = arg.strip() if arg else None
-                    task = session.run_build_subagent(custom_cmd=custom_cmd, repo_root=".")
-                    if not session.json_output:
-                        print(f"{UI.CUDA}⚡ Pushed build & test verification to NVIDIA Subagent #{task.id} (Port 9001). Type {UI.CYAN}/subagent view {task.id}{UI.CUDA} to inspect.{UI.RST}\n")
-                elif cmd in ("/tasks", "/subagents"):
-                    session.print_subagents()
-                elif cmd in ("/cuda", "/coordinator"):
-                    from ..core.coordinator import CudaCoordinator
-                    c_status = CudaCoordinator.status_summary()
-                    st_col = UI.GREEN if c_status['state'] == 'idle' else (UI.CUDA_BOLD if c_status['state'] == 'subagent' else UI.AMBER)
-                    print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}NVIDIA CUDA:9001 RESOURCE COORDINATOR{UI.RST}{UI.DARK_GRAY} ─────────────╮{UI.RST}")
-                    print(f"{UI.DARK_GRAY}│{UI.RST}  State        : {st_col}{c_status['state'].upper()}{UI.RST}")
-                    print(f"{UI.DARK_GRAY}│{UI.RST}  Subagents    : {c_status['active_subagents']} running")
-                    print(f"{UI.DARK_GRAY}│{UI.RST}  Compacting   : {'YES' if c_status['compactor_running'] else 'NO'}")
-                    permit_str = f"{UI.GREEN}ALLOWED (IDLE){UI.RST}" if c_status['can_compact'] else f"{UI.AMBER}PAUSED (Subagent has priority){UI.RST}"
-                    print(f"{UI.DARK_GRAY}│{UI.RST}  Idle Permit  : {permit_str}")
-                    print(f"{UI.DARK_GRAY}╰──────────────────────────────────────────────────────────────────╯{UI.RST}\n")
-                elif cmd in ("/repomap", "/ast"):
-                    arg_low = arg.lower().strip()
-                    if arg_low in ("on", "enable", "true"):
-                        session.auto_repomap = True
-                        session._active_local_agent = None
-                        print(UI.ok("Automatic repository AST symbol map injection ENABLED (cached, zero-latency)."))
-                    elif arg_low in ("off", "disable", "false"):
-                        session.auto_repomap = False
-                        session._active_local_agent = None
-                        print(UI.ok("Automatic repository AST symbol map injection DISABLED."))
-                    elif arg_low in ("refresh", "reload", "sync"):
-                        session.refresh_repomap(".")
-                        print(UI.ok("Repository AST symbol map cache invalidated & refreshed."))
-                    elif arg_low == "stats":
-                        from ..context.repomap import RepoMap
-                        st = RepoMap.cache_stats()
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}REPO MAP CACHE TELEMETRY{UI.RST}{UI.DARK_GRAY} ─────────────────────────────╮{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Auto-Inject : {UI.GREEN}ENABLED{UI.RST}" if session.auto_repomap else f"{UI.DARK_GRAY}│{UI.RST}  Auto-Inject : {UI.GRAY}DISABLED{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Root Path   : {UI.CYAN}{st['root']}{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Indexed     : {st['file_count']} Python files ({st['char_count']} chars)")
-                        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}\n")
-                    else:
-                        scan_path = arg or "."
-                        session.print_repomap(scan_path)
-                        st_tag = f"{UI.GREEN}Active (Auto-injected into model memory){UI.RST}" if session.auto_repomap else f"{UI.GRAY}Disabled{UI.RST}"
-                        print(f"{UI.GRAY}Auto-injection status: {st_tag} │ Toggle: /repomap [on|off|refresh]{UI.RST}\n")
-
-                elif cmd in ("/instructions", "/rules", "/guidelines"):
-                    from ..context.instructions import ProjectInstructions
-                    arg_low = arg.lower().strip()
-                    if arg_low in ("on", "enable", "true"):
-                        session.auto_instructions = True
-                        session._active_local_agent = None
-                        print(UI.ok("Automatic project instructions injection (GEMINI.md / antigravity.md) ENABLED."))
-                    elif arg_low in ("off", "disable", "false"):
-                        session.auto_instructions = False
-                        session._active_local_agent = None
-                        print(UI.ok("Automatic project instructions injection DISABLED."))
-                    elif arg_low in ("refresh", "reload"):
-                        content, loaded = ProjectInstructions.load_instructions(".", force_refresh=True)
-                        session._active_local_agent = None
-                        print(UI.ok(f"Project instructions refreshed. Loaded: {', '.join(loaded) if loaded else 'None'}"))
-                    elif arg_low in ("view", "show", "cat") or not arg:
-                        content, loaded = ProjectInstructions.load_instructions(".", force_refresh=False)
-                        if loaded:
-                            print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}PROJECT INSTRUCTIONS ({', '.join(loaded)}){UI.RST}{UI.DARK_GRAY} ─────────────╮{UI.RST}")
-                            for line in content.splitlines():
-                                print(f"{UI.DARK_GRAY}│{UI.RST}  {line}")
-                            print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}\n")
-                        else:
-                            print(UI.warn("No instruction files found (looking for GEMINI.md, antigravity.md, AGENTS.md, etc.)"))
-                    else:
-                        print(f"{UI.GRAY}Usage: /instructions [on|off|refresh|view]{UI.RST}")
-
-                elif cmd in ("/hooks", "/hook"):
-                    from ..context.hooks_loader import ExternalHooksManager
-                    arg_low = arg.lower().strip()
-                    if arg_low in ("on", "enable", "true"):
-                        session.enable_hooks = True
-                        session._active_local_agent = None
-                        print(UI.ok("External lifecycle hooks (hooks.json) ENABLED."))
-                    elif arg_low in ("off", "disable", "false"):
-                        session.enable_hooks = False
-                        session._active_local_agent = None
-                        print(UI.ok("External lifecycle hooks (hooks.json) DISABLED."))
-                    elif arg_low in ("refresh", "reload"):
-                        entries, sources = ExternalHooksManager.load_hook_configs(".", force_refresh=True)
-                        session._active_local_agent = None
-                        print(UI.ok(f"Lifecycle hooks reloaded. Found {len(entries)} active hook(s) from {len(sources)} file(s)."))
-                    elif arg_low in ("view", "list", "status") or not arg:
-                        entries, sources = ExternalHooksManager.load_hook_configs(".", force_refresh=False)
-                        st = f"{UI.GREEN}ENABLED{UI.RST}" if session.enable_hooks else f"{UI.GRAY}DISABLED{UI.RST}"
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}EXTERNAL LIFECYCLE HOOKS ({st}){UI.RST}{UI.DARK_GRAY} ────────────────────────╮{UI.RST}")
-                        if sources:
-                            print(f"{UI.DARK_GRAY}│{UI.RST}  Source Files:")
-                            for sf in sources:
-                                print(f"{UI.DARK_GRAY}│{UI.RST}    • {UI.CYAN}{sf}{UI.RST}")
-                            print(f"{UI.DARK_GRAY}│{UI.RST}")
-                            print(f"{UI.DARK_GRAY}│{UI.RST}  Active Hooks ({len(entries)}):")
-                            for entry in entries:
-                                events = [ev for ev in ["PreToolUse", "PostToolUse", "PreTurn", "PostTurn", "PreInvocation", "PostInvocation", "Stop"] if entry["spec"].get(ev)]
-                                print(f"{UI.DARK_GRAY}│{UI.RST}    • {UI.WHITE}{entry['name']:20s}{UI.RST} ➔ Events: {UI.AMBER}{', '.join(events)}{UI.RST}")
-                        else:
-                            print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.GRAY}No hooks.json discovered in .agents/hooks.json or ~/.gemini/config/hooks.json{UI.RST}")
-                        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}")
-                        print(f"{UI.GRAY}Commands: /hooks on | /hooks off | /hooks refresh | /hooks view{UI.RST}\n")
-                    else:
-                        print(f"{UI.GRAY}Usage: /hooks [on|off|refresh|view]{UI.RST}")
-
-                elif cmd in ("/search", "/web", "/google", "/ddg"):
-                    from ..tools.web_search import WebSearchEngine
-                    if not arg:
-                        print(f"{UI.GRAY}Usage: /search <query to search online>{UI.RST}")
-                    else:
-                        print(f"{UI.CYAN}Searching the web for '{arg}'...{UI.RST}")
-                        results = await asyncio.to_thread(WebSearchEngine.search, arg, 5)
-                        WebSearchEngine.print_search_results(arg, results)
-
-                elif cmd in ("/fetch", "/browse", "/readurl"):
-                    from ..tools.web_search import WebSearchEngine
-                    if not arg:
-                        print(f"{UI.GRAY}Usage: /fetch <url to inspect>{UI.RST}")
-                    else:
-                        print(f"{UI.CYAN}Fetching and distilling {arg}...{UI.RST}")
-                        content = await asyncio.to_thread(WebSearchEngine.fetch_url, arg, 4000)
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}WEBPAGE CONTENT ({arg}){UI.RST}{UI.DARK_GRAY} ─────────────────────────────╮{UI.RST}")
-                        for line in content.splitlines():
-                            print(f"{UI.DARK_GRAY}│{UI.RST}  {line}")
-                        print(f"{UI.DARK_GRAY}╰────────────────────────────────────────────────────────────────────────╯\n")
-
-                elif cmd in ("/steps", "/maxsteps", "/max-steps"):
-                    arg_low = arg.lower()
-                    if arg_low in ("off", "disable", "unlimited", "none", "0"):
-                        session.max_tool_steps_per_turn = 0
-                        print(UI.ok("Tool step limit DISABLED (unlimited steps per turn; consecutive loop guard remains active)."))
-                    elif arg.isdigit() and int(arg) > 0:
-                        session.max_tool_steps_per_turn = int(arg)
-                        print(UI.ok(f"Tool execution step limit set to {session.max_tool_steps_per_turn} steps per turn."))
-                    else:
-                        limit_str = f"{session.max_tool_steps_per_turn} steps" if session.max_tool_steps_per_turn > 0 else "UNLIMITED (disabled)"
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}TOOL STEP LIMIT & ANTI-LOOP GUARD{UI.RST}{UI.DARK_GRAY} ────────────────────────╮{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Max steps / turn : {UI.CYAN_BOLD}{limit_str}{UI.RST}")
-                        print(f"{UI.DARK_GRAY}│{UI.RST}  Loop detection   : {UI.GREEN_BOLD}ACTIVE{UI.RST} (blocks identical consecutive tool calls)")
-                        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}")
-                        print(f"{UI.GRAY}Commands: /steps off (unlimited) | /steps <number>{UI.RST}\n")
-                elif cmd in ("/verbose", "/v"):
-                    arg_low = arg.lower()
-                    if arg_low in ("off", "disable", "false", "0"):
-                        session.verbose = False
-                        print(UI.ok("Verbose mode DISABLED (showing concise tool status)."))
-                    elif arg_low in ("on", "enable", "true", "1"):
-                        session.verbose = True
-                        print(UI.ok("Verbose mode ENABLED (showing full tool arguments, outputs, and detailed step traces)."))
-                    else:
-                        session.verbose = not session.verbose
-                        st = "ENABLED (showing full tool inputs and outputs)" if session.verbose else "DISABLED (showing concise tool status)"
-                        print(UI.ok(f"Verbose mode: {st}"))
-                elif cmd == "/json":
-                    session.json_output = not session.json_output
-                    st = "ENABLED" if session.json_output else "DISABLED"
-                    print(UI.ok(f"Structured JSON output mode: {st}"), file=sys.stderr if session.json_output else sys.stdout)
-                elif cmd == "/format":
-                    arg_low = arg.lower()
-                    if arg_low in ("json", "js"):
-                        session.json_output = True
-                        print(UI.ok("Structured JSON output mode: ENABLED"), file=sys.stderr)
-                    elif arg_low in ("text", "stream", "plain"):
-                        session.json_output = False
-                        print(UI.ok("Standard text stream output mode: ENABLED"))
-                    else:
-                        print(UI.warn("Usage: /format json | text"))
-                elif cmd in ("/multiline", "/multi"):
-                    arg_low = arg.lower()
-                    if arg_low in ("off", "disable", "false", "0", "single"):
-                        session.multiline_input = False
-                        print(UI.ok("Multi-line input DISABLED (single Enter submits)."))
-                    elif arg_low in ("on", "enable", "true", "1"):
-                        session.multiline_input = True
-                        print(UI.ok("Multi-line input ENABLED (Enter on empty line to submit)."))
-                    else:
-                        session.multiline_input = not session.multiline_input
-                        st = "ENABLED (Enter on empty line to submit)" if session.multiline_input else "DISABLED (single Enter submits)"
-                        print(UI.ok(f"Multi-line input mode: {st}"))
-                elif cmd in ("/singleline", "/single"):
-                    session.multiline_input = False
-                    print(UI.ok("Single-line input mode ENABLED (single Enter submits)."))
-                elif cmd in ("/reload", "/restart"):
-                    if session.history:
-                        session.save_session("latest_session")
-                    session.save_preferences()
-                    print(f"\n{UI.CYAN}⚡ Hot-reloading antigravity_agent.py (preserving session context)...{UI.RST}\n")
-                    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                    runner_script = os.path.join(pkg_root, "antigravity_agent.py")
-                    new_args = [sys.executable, runner_script, "--load", "latest_session", "--cloud-model", session.cloud_model]
-                    if session.active_target in ("auto", "9000", "9001", "cloud"):
-                        new_args += ["--target", session.active_target]
-                    new_args.append("-y" if session.dangerously_skip_permissions else "--safe")
-                    if session.verbose:
-                        new_args.append("--verbose")
-                    if session.json_output:
-                        new_args.append("--json")
-                    if not session.enable_mcp:
-                        new_args.append("--no-mcp")
-                    if not session.multiline_input:
-                        new_args.append("--single-line")
-                    os.execv(sys.executable, new_args)
-                elif cmd in ("/brainstorm", "/spec", "/plan"):
-                    from ..agents.brainstorm import BrainstormWorkflow
-                    _current_task = asyncio.create_task(BrainstormWorkflow.execute_workflow(arg, session, repo_root="."))
-                    esc_listener = EscListener(
-                        on_escape=lambda: loop.call_soon_threadsafe(
-                            lambda: _current_task.cancel() if _current_task and not _current_task.done() else None
-                        )
-                    )
-                    try:
-                        with esc_listener:
-                            await _current_task
-                    except asyncio.CancelledError:
-                        print(f"\n{UI.AMBER_BOLD}[Esc]{UI.RST} {UI.AMBER}Brainstorm workflow stopped by user.{UI.RST}\n")
-                    finally:
-                        _current_task = None
-                elif cmd == "/diff":
-                    nth = int(arg) if arg.isdigit() else 1
-                    text = await asyncio.to_thread(session.turn_diff, nth)
-                    if not text:
-                        print(UI.warn("No recorded file changes for that turn (needs a git repo and a turn that edited files)."))
-                    else:
-                        stat = await asyncio.to_thread(session.turn_diff, nth, True)
-                        print(f"\n{UI.GRAY}{stat}{UI.RST}")
-                        for line in text.splitlines():
-                            if line.startswith("+") and not line.startswith("+++"):
-                                print(f"{UI.GREEN}{line}{UI.RST}")
-                            elif line.startswith("-") and not line.startswith("---"):
-                                print(f"{UI.RED}{line}{UI.RST}")
-                            elif line.startswith("@@") or line.startswith("diff "):
-                                print(f"{UI.CYAN}{line}{UI.RST}")
-                            else:
-                                print(line)
-                        print()
-                elif cmd == "/undo":
-                    plan = await asyncio.to_thread(session.undo_plan)
-                    if not plan or not plan["files"]:
-                        print(UI.warn("Nothing to undo: no recorded turn with file changes."))
-                    else:
-                        cp = plan["checkpoint"]
-                        print(f"\n{UI.AMBER_BOLD}Revert turn:{UI.RST} {cp['prompt']}")
-                        for path, st in sorted(plan["files"].items()):
-                            verb = {"A": "delete (created by turn)", "M": "restore", "D": "restore (deleted by turn)"}.get(st, "restore")
-                            print(f"  {UI.GRAY}{st}{UI.RST} {path} {UI.DARK_GRAY}-> {verb}{UI.RST}")
-                        ans = (await asyncio.to_thread(prompt_input, f"{UI.AMBER_BOLD}Revert these files? [y/N]: {UI.RST}")).strip().lower()
-                        if ans in ("y", "yes"):
-                            touched = await asyncio.to_thread(session.apply_undo, plan)
-                            print(UI.ok(f"Reverted {len(touched)} file(s). The model has been told."))
-                        else:
-                            print(UI.warn("Undo cancelled."))
-                elif cmd == "/stats":
-                    if arg.lower() == "reset":
-                        session.stats.clear()
-                        print(UI.ok("Usage ledger reset."))
-                    else:
-                        session.print_stats()
-                elif cmd in ("/markdown", "/md"):
-                    arg_low = arg.lower()
-                    if arg_low in ("on", "enable", "true", "1"):
-                        session.render_markdown = True
-                    elif arg_low in ("off", "disable", "false", "0"):
-                        session.render_markdown = False
-                    else:
-                        session.render_markdown = not session.render_markdown
-                    print(UI.ok(f"Markdown rendering of responses: {'ENABLED' if session.render_markdown else 'DISABLED (raw streaming)'}"))
-                elif cmd in ("/prefs", "/preferences"):
-                    if arg.lower() == "reset":
-                        reset_prefs()
-                        session.apply_preferences(PREF_DEFAULTS)
-                        session._active_local_agent = None
-                        print(UI.ok("Preferences reset to defaults."))
-                    else:
-                        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}SAVED PREFERENCES (~/.myagy/config.json){UI.RST}{UI.DARK_GRAY} ─────────╮{UI.RST}")
-                        for k, v in session.preferences().items():
-                            print(f"{UI.DARK_GRAY}│{UI.RST}  {k:32s} {UI.CYAN}{v}{UI.RST}")
-                        print(f"{UI.DARK_GRAY}╰─────────────────────────────────────────────────────────────╯{UI.RST}")
-                        print(f"{UI.GRAY}Settings save automatically after each command. /prefs reset restores defaults.{UI.RST}\n")
-                elif cmd == "/help":
-                    session.print_help()
-                elif cmd in ("/exit", "/quit"):
-                    print(f"{UI.GRAY}Exiting session.{UI.RST}")
-                    break
+                handler = COMMANDS.get(cmd)
+                if handler is None:
+                    say.warn(f"Unknown command '{cmd}'. Type /help for available commands.")
                 else:
-                    print(UI.warn(f"Unknown command '{cmd}'. Type /help for available commands."))
+                    result = await handler(session, arg, ctx)
+                    if result is _EXIT:
+                        break
+                    if result is _NO_SAVE:
+                        continue
                 session.save_preferences()
                 continue
 
@@ -1031,44 +1285,44 @@ async def interactive_loop(session: MultiGpuHybridSession):
                     else:
                         force_target = matched["id"]
                     prompt = rest_prompt.strip()
+                else:
+                    say.warn(f"Unknown model target '@{prefix_query}'. Type /models to list targets; nothing was sent.")
+                    continue
 
             # Run chat as a cancellable task with ESC-key interrupt support
-            _current_task = asyncio.create_task(session.chat(prompt, force_target=force_target))
+            ctx.task = asyncio.create_task(session.chat(prompt, force_target=force_target))
             esc_listener = EscListener(
                 on_escape=lambda: loop.call_soon_threadsafe(
-                    lambda: _current_task.cancel() if _current_task and not _current_task.done() else None
+                    lambda: ctx.task.cancel() if ctx.task and not ctx.task.done() else None
                 )
             )
             try:
                 with esc_listener:
-                    await _current_task
+                    await ctx.task
             except asyncio.CancelledError:
                 if session.json_output:
                     print(json.dumps({"status": "cancelled", "interrupted_by": "esc" if esc_listener.interrupted else "sigint", "prompt": prompt}, indent=2))
+                elif esc_listener.interrupted:
+                    say.warn("[Esc] Interrupted by user. Resuming prompt.")
                 else:
-                    if esc_listener.interrupted:
-                        print(f"\n{UI.AMBER_BOLD}[Esc]{UI.RST} {UI.AMBER}Interrupted by user. Resuming prompt.{UI.RST}\n", flush=True)
-                    else:
-                        print(f"\n{UI.AMBER}[Cancelled] Request stopped. Resuming prompt.{UI.RST}\n", flush=True)
-                session._active_local_agent = None
+                    say.warn("[Cancelled] Request stopped. Resuming prompt.")
+                await session.reset_local_agent()
             except Exception as e:
                 err = str(e)
                 if "CancelledError" in err or "cancelled" in err.lower() or esc_listener.interrupted:
                     if session.json_output:
                         print(json.dumps({"status": "cancelled", "interrupted_by": "esc" if esc_listener.interrupted else "exception", "prompt": prompt}, indent=2))
+                    elif esc_listener.interrupted:
+                        say.warn("[Esc] Interrupted by user. Resuming prompt.")
                     else:
-                        if esc_listener.interrupted:
-                            print(f"\n{UI.AMBER_BOLD}[Esc]{UI.RST} {UI.AMBER}Interrupted by user. Resuming prompt.{UI.RST}\n", flush=True)
-                        else:
-                            print(f"\n{UI.AMBER}[Cancelled] Request stopped.{UI.RST}\n", flush=True)
-                    session._active_local_agent = None
+                        say.warn("[Cancelled] Request stopped.")
+                    await session.reset_local_agent()
+                elif session.json_output:
+                    print(json.dumps({"status": "error", "error": err, "prompt": prompt}, indent=2))
                 else:
-                    if session.json_output:
-                        print(json.dumps({"status": "error", "error": err, "prompt": prompt}, indent=2))
-                    else:
-                        print(f"\n{UI.RED_BOLD}[Error during turn]:{UI.RST} {UI.RED}{e}{UI.RST}\n")
+                    say.err(f"Error during turn: {e}")
             finally:
-                _current_task = None
+                ctx.task = None
 
     finally:
         try:
@@ -1211,6 +1465,7 @@ async def main():
     )
     handled = {"active_target", "cloud_model", "dangerously_skip_permissions", "use_laya_adaptive_permissions", "enable_kontexta", "multiline_input", "verbose"}
     session.apply_preferences({k: v for k, v in prefs.items() if k not in handled})
+    _sync_say(session)
 
     if args.load_session:
         session.load_session(args.load_session)

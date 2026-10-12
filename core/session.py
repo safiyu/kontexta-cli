@@ -1,8 +1,10 @@
 """Multi-GPU Hybrid Agent Session with unified memory, Laya System 1 decision engine, and tool execution."""
 
 import os
+import re
 import sys
 import json
+import subprocess
 import time
 import shutil
 import asyncio
@@ -29,15 +31,6 @@ from google.antigravity import (
 from google.antigravity.hooks import policy
 from google.antigravity.types import McpStdioServer, McpStreamableHttpServer
 
-try:
-    from rich.live import Live
-    from rich.table import Table
-    from rich.markdown import Markdown
-    from rich.text import Text
-    from rich import box
-except ImportError:
-    pass
-
 from ..config import (
     SESSIONS_DIR,
     DEFAULT_MODEL_DIR,
@@ -54,19 +47,63 @@ from .llamashift import (
     trigger_llamashift_switch,
     get_llamashift_active,
     get_llamashift_models,
+    get_logs_tail,
+    model_is_running,
+    shift_state,
+    vram_snapshot,
 )
 from ..context.mcp_loader import load_mcp_servers, check_oauth_available
 from ..context.kontexta import KontextaManager
+from ..context import kontexta_sync
 from .laya import LayaDecisionEngine
 from ..agents.compactor import ContextCurator
 from .coordinator import CudaCoordinator
 from .checkpoints import Checkpoints
+from ..terminal import receipt, say
 from .prefs import PREF_DEFAULTS, load_prefs, save_prefs
 from ..agents.subagent import SubagentManager, SubagentTask
 from ..context.repomap import RepoMap
 from ..context.instructions import ProjectInstructions
 from ..context.hooks_loader import ExternalHooksManager
 from .sudo_manager import SudoManager
+
+
+_SGR_256 = re.compile(r"38;5;(\d+)")
+_XTERM16 = ["#000000", "#cd0000", "#00cd00", "#cdcd00", "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+            "#7f7f7f", "#ff0000", "#00ff00", "#ffff00", "#5c5cff", "#ff00ff", "#00ffff", "#ffffff"]
+
+
+def _xterm_hex(idx: int) -> str:
+    if idx < 16:
+        return _XTERM16[idx]
+    if idx >= 232:
+        v = 8 + 10 * (idx - 232)
+        return f"#{v:02x}{v:02x}{v:02x}"
+    levels = (0, 95, 135, 175, 215, 255)
+    idx -= 16
+    return f"#{levels[idx // 36]:02x}{levels[(idx // 6) % 6]:02x}{levels[idx % 6]:02x}"
+
+
+def _pt_style(ansi: str, bold: bool = False) -> str:
+    """Turns a UI color escape into a prompt_toolkit style string; empty when colors are off."""
+    parts = []
+    m = _SGR_256.search(ansi or "")
+    if m:
+        parts.append(f"fg:{_xterm_hex(int(m.group(1)))}")
+    if bold or (ansi and re.search(r"\[(?:\d+;)*1(?:;\d+)*m", ansi)):
+        parts.append("bold")
+    return " ".join(parts)
+
+
+def _short_count(n: float) -> str:
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+    if n >= 100_000:
+        return f"{n / 1000:.0f}k"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k".replace(".0k", "k")
+    return str(n)
 
 
 class MultiGpuHybridSession:
@@ -90,6 +127,7 @@ class MultiGpuHybridSession:
         multiline_input: bool = True,
         verbose: bool = False,
     ):
+        self._shift_noted: str = "up"
         self.cloud_model = cloud_model
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.has_oauth = check_oauth_available()
@@ -102,8 +140,13 @@ class MultiGpuHybridSession:
         self.verbose = verbose
         self.auto_repomap: bool = True
         self.auto_instructions: bool = True
+        self.kontexta_sync: bool = True
         self.enable_hooks: bool = True
         self.render_markdown: bool = True
+        self.last_answer: str = ""
+        self._tool_pending: List[Dict[str, Any]] = []
+        self._approved_actions: set = set()
+        self._ctx_cache: tuple = (0.0, None)
 
         # Load MCP servers once at startup (including Inbuilt Kontexta)
         self._mcp_servers: List[McpStdioServer | McpStreamableHttpServer] = []
@@ -112,9 +155,9 @@ class MultiGpuHybridSession:
             if not self.json_output:
                 if self._mcp_servers:
                     names = ", ".join(s.name for s in self._mcp_servers)
-                    print(f"{UI.GRAY}[MCP] Loaded {len(self._mcp_servers)} server(s): {names}{UI.RST}")
+                    say.step(f"MCP: {len(self._mcp_servers)} server(s) ({names})")
                 else:
-                    print(f"{UI.GRAY}[MCP] No MCP servers found (add to ~/.gemini/config/mcp_config.json){UI.RST}")
+                    say.step("MCP: no servers found (add to ~/.gemini/config/mcp_config.json)")
 
         # Laya Decision Engine (System 1)
         self.laya = LayaDecisionEngine(endpoint=laya_endpoint)
@@ -128,6 +171,10 @@ class MultiGpuHybridSession:
         self._active_local_agent: Optional[Agent] = None
         self._current_agent_target: Optional[str] = None
         self._active_local_model: Optional[str] = None
+        # Agents detached from sync code; closed on the next async call so MCP children are not leaked
+        self._stale_agents: List[Agent] = []
+        # Post-routing target of the turn in flight, used to attribute errors in /stats
+        self._turn_target: Optional[str] = None
 
         # Dynamically discover live models on ports 9000 and 9001
         self.refresh_endpoints()
@@ -138,8 +185,8 @@ class MultiGpuHybridSession:
         # Conversation history: list of {"role": "user"|"assistant", "target": str, "content": str}
         self.history: List[Dict[str, str]] = []
         self.show_metrics: bool = True
+        # Both settings count user/assistant turns; history stores two entries per turn
         self.max_recent_turns: int = 6
-        # Autocompact: compress history when turn count exceeds threshold (0 = disabled)
         self.autocompact_threshold: int = 20
         # Anti-loop guard: 0 = unlimited tool steps per turn; consecutive duplicate loop detection remains active
         self.max_tool_steps_per_turn: int = 0
@@ -163,16 +210,61 @@ class MultiGpuHybridSession:
         self._synthesis_task: Optional[asyncio.Task] = None
         self.continuous_curation: bool = True
 
+    @property
+    def _recent_entries(self) -> int:
+        return max(self.max_recent_turns, 0) * 2
+
+    @property
+    def json_output(self) -> bool:
+        return self._json_output
+
+    @json_output.setter
+    def json_output(self, value: bool):
+        self._json_output = bool(value)
+        say.configure(self._json_output, getattr(self, "_verbose", False))
+
+    @property
+    def verbose(self) -> bool:
+        return self._verbose
+
+    @verbose.setter
+    def verbose(self, value: bool):
+        self._verbose = bool(value)
+        say.configure(getattr(self, "_json_output", False), self._verbose)
+
+    @property
+    def theme(self) -> str:
+        return UI.theme_name
+
+    def set_theme(self, name: str) -> bool:
+        """Switches the color theme, remembers it, and returns False for unknown names."""
+        if not UI.set_theme(str(name).strip().lower()):
+            return False
+        self.save_preferences()
+        return True
+
+    def _notice(self, msg: str):
+        say.plain(msg)
+
+    def _invalidate_local_agent(self):
+        """Sync-safe: detaches the cached agent; it is closed by the next async call."""
+        if self._active_local_agent is not None:
+            self._stale_agents.append(self._active_local_agent)
+            self._active_local_agent = None
+
+    async def _close_stale_agents(self):
+        stale, self._stale_agents = self._stale_agents, []
+        for agent in stale:
+            try:
+                await agent.__aexit__(None, None, None)
+            except Exception:
+                pass
+
     def refresh_endpoints(self) -> Dict[str, Any]:
-        """
-        Dynamically refreshes Port 9000 and Port 9001 model state. Zero hardcoding.
-        Strategy:
-          1. Single GET /api/active call — resolves all running models in one shot.
-          2. Per-port fallback via detect_port_model() for any port not covered by /api/active.
-        """
+        """Refreshes port 9000/9001 model state from one cached LlamaShift /api/status, then probes ports directly."""
         model_dir = DEFAULT_MODEL_DIR
 
-        # Try to resolve all ports in one shot via /api/active
+        # Resolve running models from the cached LlamaShift status in one shot
         active_by_port: Dict[int, Dict] = {}
         try:
             active_list = get_llamashift_active()
@@ -188,6 +280,15 @@ class MultiGpuHybridSession:
                     active_by_port[int(m_port)] = m
         except Exception:
             pass
+
+        state = shift_state()
+        if state != self._shift_noted:
+            note = {"down": "LlamaShift is not reachable, probing the model ports directly",
+                    "starting": "LlamaShift is still starting",
+                    "unauthorized": "LlamaShift rejected the request, set LLAMASHIFT_API_KEY to its management key",
+                    "up": "LlamaShift is reachable again"}[state]
+            say.step(note)
+            self._shift_noted = state
 
         for port_str, ep in self.endpoints.items():
             port_int = ep["port"]
@@ -236,93 +337,113 @@ class MultiGpuHybridSession:
     def set_dangerously_skip_permissions(self, enable: bool):
         if self._dangerously_skip_permissions != enable:
             self._dangerously_skip_permissions = enable
-            self._active_local_agent = None
+            self._invalidate_local_agent()
+
+    @staticmethod
+    def _ask(prompt: str) -> str:
+        return prompt_input(f"{UI.AMBER_BOLD}{prompt}{UI.RST} ").strip().lower()
+
+    @staticmethod
+    def _action_signature(tool_name: str, args: Any) -> tuple:
+        try:
+            return (tool_name, json.dumps(args, sort_keys=True, default=str))
+        except Exception:
+            return (tool_name, str(args))
+
+    @staticmethod
+    def _arg_rows(args: Any) -> List[tuple]:
+        if not isinstance(args, dict):
+            return [("Args", str(args))] if args else []
+        rows = []
+        for key, val in args.items():
+            text = val if isinstance(val, str) else json.dumps(val, ensure_ascii=False, default=str)
+            shown, hidden = say.truncate_lines(text, 6)
+            rows.append(("Command" if key == "CommandLine" else str(key), shown + (f"\n+{hidden} lines" if hidden else "")))
+        return rows
+
+    def _sudo_gate(self, tool_name: str, cmd_line: str) -> bool:
+        user = os.environ.get("USER", "root")
+        authed = SudoManager.is_authenticated()
+        rows = [("Tool", f"{tool_name} (root elevation)"), ("Command", cmd_line), ("Target", f"host system ({user})")]
+        if authed:
+            rows.append(("Credentials", f"cached, ~{int(SudoManager.time_remaining() // 60)}m remaining"))
+        say.card(
+            "Sudo elevation required", rows,
+            actions="[Y]es / [n]o / [c]hange password" if authed else "[y]es / [N]o", style="danger",
+        )
+        try:
+            choice = self._ask("Authorize root execution?" if authed else "Authorize execution with sudo?")
+        except (KeyboardInterrupt, EOFError):
+            say.warn("Execution denied")
+            return False
+
+        if authed:
+            if choice in ("c", "change", "change-password"):
+                if not SudoManager.prompt_password_entry(reason=cmd_line):
+                    return False
+                say.step("root execution approved")
+                return True
+            if choice in ("", "y", "yes"):
+                say.step("root execution approved")
+                return True
+            say.warn("Execution denied by user")
+            return False
+
+        if choice in ("y", "yes"):
+            if SudoManager.prompt_password_entry(reason=cmd_line):
+                say.step("root execution approved")
+                return True
+            say.err("Sudo authorization failed. Execution denied.")
+            return False
+        say.warn("Execution denied by user")
+        return False
 
     def permission_prompt_handler(self, tool: Any, args: Dict[str, Any]) -> bool:
         tool_name = getattr(tool, "name", str(tool))
         cmd_line = args.get("CommandLine", "") if isinstance(args, dict) else ""
-        is_sudo = (tool_name == "run_command" and SudoManager.is_sudo_command(cmd_line))
-
-        # ── SUDO COMMAND HANDLING & PASSWORD ENTRY SECTION ──
-        if is_sudo:
-            user = os.environ.get("USER", "root")
-            print(f"\n{UI.AMBER_BOLD}╭──────────────── 🛡️  SUDO PRIVILEGE ELEVATION REQUIRED ────────────────╮{UI.RST}")
-            print(f"{UI.AMBER_BOLD}│{UI.RST}  Tool     : {UI.WHITE}{tool_name}{UI.RST} (Administrative / Root Elevation)")
-            print(f"{UI.AMBER_BOLD}│{UI.RST}  Command  : {UI.CYAN}{cmd_line}{UI.RST}")
-            print(f"{UI.AMBER_BOLD}│{UI.RST}  Target   : {UI.WHITE}Host System ({user}){UI.RST}")
-            print(f"{UI.AMBER_BOLD}╰───────────────────────────────────────────────────────────────────────╯{UI.RST}")
-
-            if SudoManager.is_authenticated():
-                rem_min = int(SudoManager.time_remaining() // 60)
-                print(f"{UI.GREEN_BOLD}[🛡️  Sudo credentials active: ~{rem_min}m remaining in session cache]{UI.RST}")
-                try:
-                    choice = prompt_input(f"{UI.AMBER_BOLD}Authorize root execution? [Y/n/change-password]: {UI.RST}").strip().lower()
-                except (KeyboardInterrupt, EOFError):
-                    print(f"\n{UI.RED_BOLD}[x] Execution denied.{UI.RST}")
-                    return False
-
-                if choice in ("c", "change", "change-password"):
-                    if not SudoManager.prompt_password_entry(reason=cmd_line):
-                        return False
-                    print(f"{UI.GREEN_BOLD}[✓] Root execution approved.{UI.RST}")
-                    return True
-                elif choice in ("", "y", "yes"):
-                    print(f"{UI.GREEN_BOLD}[✓] Root execution approved.{UI.RST}")
-                    return True
-                else:
-                    print(f"{UI.RED_BOLD}[x] Execution denied by user.{UI.RST}")
-                    return False
-            else:
-                try:
-                    choice = prompt_input(f"{UI.AMBER_BOLD}Authorize execution with sudo? [y/N]: {UI.RST}").strip().lower()
-                except (KeyboardInterrupt, EOFError):
-                    print(f"\n{UI.RED_BOLD}[x] Execution denied.{UI.RST}")
-                    return False
-
-                if choice in ("y", "yes"):
-                    ok = SudoManager.prompt_password_entry(reason=cmd_line)
-                    if ok:
-                        print(f"{UI.GREEN_BOLD}[✓] Root execution approved.{UI.RST}")
-                        return True
-                    else:
-                        print(f"{UI.RED_BOLD}[x] Sudo authorization failed. Execution denied.{UI.RST}")
-                        return False
-                else:
-                    print(f"{UI.RED_BOLD}[x] Execution denied by user.{UI.RST}")
-                    return False
+        if tool_name == "run_command" and SudoManager.is_sudo_command(cmd_line):
+            return self._sudo_gate(tool_name, cmd_line)
 
         if self._dangerously_skip_permissions and not self.use_laya_adaptive_permissions:
-            print(f"{UI.AMBER_BOLD}[⚡ Auto-approved '{tool_name}' (skip-permissions mode)]{UI.RST}")
+            say.step(f"auto-approved {tool_name} (skip-permissions mode)")
             return True
 
-        action_summary = f"Tool: {tool_name} Args: {json.dumps(args)}"
-
+        reason = "Safe mode: confirmation required before running tools"
+        risk = ""
         if self.use_laya_adaptive_permissions:
+            action_summary = f"Tool: {tool_name} Args: {json.dumps(args)}"
             is_safe, p_safe = self.laya.evaluate_action_safety(action_summary)
             if is_safe:
-                print(f"{UI.LAYA_BOLD}[⚡ Laya System 1 (33ms) 'noul': P(Safe)={p_safe:.2f} ≥ 0.90 ➔ {UI.GREEN_BOLD}Auto-approved '{tool_name}']{UI.RST}")
+                say.step(f"auto-approved {tool_name} (laya P(safe)={p_safe:.2f})")
+                say.detail(f"Laya System 1 'noul': P(Safe)={p_safe:.2f} >= 0.90")
                 return True
-            else:
-                print(f"\n{UI.AMBER_BOLD}[⚡ Laya System 1 (33ms) 'noul': P(Safe)={p_safe:.2f} < 0.90 ➔ Elevated Risk Detected]{UI.RST}")
+            risk = f"P(safe) {p_safe:.2f} is below the 0.90 threshold"
+            reason = "Laya flagged elevated risk"
 
-        print(f"\n{UI.AMBER_BOLD}╭────────────────────── ⚠ PERMISSION REQUIRED ──────────────────────╮{UI.RST}")
-        print(f"{UI.AMBER_BOLD}│{UI.RST} Tool: {UI.WHITE}{tool_name}{UI.RST}")
-        if args:
-            args_str = json.dumps(args, indent=2)
-            for line in args_str.splitlines():
-                print(f"{UI.AMBER_BOLD}│{UI.RST}   {line}")
-        print(f"{UI.AMBER_BOLD}╰───────────────────────────────────────────────────────────────────╯{UI.RST}")
+        sig = self._action_signature(tool_name, args)
+        if sig in self._approved_actions:
+            say.step(f"approved {tool_name} (same call allowed earlier this session)")
+            return True
+
+        rows = [("Tool", tool_name), *self._arg_rows(args)]
+        if risk:
+            rows.append(("Risk", risk))
+        rows.append(("Reason", reason))
+        say.card("Permission required", rows, actions="[y]es / [n]o / [a]lways", style="warn")
         try:
-            choice = prompt_input(f"{UI.AMBER_BOLD}Authorize execution? [y/N]: {UI.RST}").strip().lower()
-            allowed = choice in ("y", "yes")
-            if allowed:
-                print(f"{UI.GREEN_BOLD}[✓] Execution approved.{UI.RST}")
-            else:
-                print(f"{UI.RED_BOLD}[x] Execution denied by user.{UI.RST}")
-            return allowed
+            choice = self._ask("Authorize?")
         except (KeyboardInterrupt, EOFError):
-            print(f"\n{UI.RED_BOLD}[x] Execution denied.{UI.RST}")
+            say.warn("Execution denied")
             return False
+        if choice in ("a", "always"):
+            self._approved_actions.add(sig)
+            say.step(f"approved {tool_name} (this exact call, rest of session)")
+            return True
+        if choice in ("y", "yes"):
+            say.step(f"approved {tool_name}")
+            return True
+        say.warn("Execution denied by user")
+        return False
 
     def get_policies(self) -> List[Any]:
         return policy.confirm_run_command(handler=self.permission_prompt_handler)
@@ -342,7 +463,9 @@ class MultiGpuHybridSession:
         return ContextCurator.summarize_history_sync(self, turns)
 
     def compact_history(self, keep_recent: Optional[int] = None, silent: bool = False) -> int:
-        return ContextCurator.compact_history(self, keep_recent=keep_recent, silent=silent)
+        """keep_recent is in turns; the curator works on history entries (2 per turn)."""
+        keep_entries = self._recent_entries if keep_recent is None else max(keep_recent, 0) * 2
+        return ContextCurator.compact_history(self, keep_recent=keep_entries, silent=silent)
 
     def target_name(self, target: str) -> str:
         tgt = self.resolve_target_alias(target)
@@ -404,10 +527,27 @@ class MultiGpuHybridSession:
 
     def refresh_repomap(self, root_dir: str = ".") -> str:
         RepoMap.invalidate_cache()
-        self._active_local_agent = None
+        self._invalidate_local_agent()
         return RepoMap.get_cached_map(root_dir)
 
     # ── Tool Hooks & System Context ───────────────────────────────────
+
+    def _pop_pending_tool(self, res: Any) -> Dict[str, Any]:
+        """Matches a finished tool result to the call recorded when it started."""
+        rid = getattr(res, "id", None)
+        raw_name = getattr(res, "name", "")
+        rname = str(getattr(raw_name, "value", raw_name) or "")
+        if rid is not None:
+            for i, p in enumerate(self._tool_pending):
+                if p["id"] == rid:
+                    return self._tool_pending.pop(i)
+        if rname:
+            for i, p in enumerate(self._tool_pending):
+                if p["name"] == rname:
+                    return self._tool_pending.pop(i)
+        if self._tool_pending:
+            return self._tool_pending.pop(0)
+        return {"name": rname or "tool", "summary": "", "t0": None, "step": 0}
 
     def build_tool_hooks(self) -> List[Any]:
         """Creates async PreToolCallDecideHook and PostToolCallHook for live step tracking,
@@ -418,7 +558,6 @@ class MultiGpuHybridSession:
             c_name = getattr(call, "name", str(call))
             c_args = getattr(call, "args", {}) or {}
 
-            # Human-readable summary for live display
             summary = (
                 c_args.get("CommandLine")
                 or c_args.get("AbsolutePath")
@@ -430,25 +569,14 @@ class MultiGpuHybridSession:
                 or c_args.get("task")
                 or ""
             )
-            term_cols = shutil.get_terminal_size((120, 24)).columns
-            max_summary = max(100, term_cols - 35)
-            summary_clean = str(summary).replace("\r\n", " ").replace("\n", " ").strip()
-            summary_str = f" ➔ {summary_clean}" if len(summary_clean) <= max_summary else f" ➔ {summary_clean[:max_summary - 3]}..."
-            ctx_pill = self.format_context_pill()
-            if self.max_tool_steps_per_turn > 0:
-                step_badge = f"{UI.DARK_GRAY}[Step {self._current_turn_tool_count}/{self.max_tool_steps_per_turn} │ {ctx_pill}{UI.DARK_GRAY}]{UI.RST} "
-            else:
-                step_badge = f"{UI.DARK_GRAY}[Step {self._current_turn_tool_count} │ {ctx_pill}{UI.DARK_GRAY}]{UI.RST} "
+            summary_clean = " ".join(str(summary).split())
 
-            if not self.json_output:
-                print(f"\n{step_badge}{UI.AMBER_BOLD}[⚙ Local Tool: {c_name}]{UI.RST}{UI.WHITE}{summary_str}{UI.RST}", flush=True)
-                if self.verbose and c_args:
-                    try:
-                        args_json = json.dumps(c_args, indent=2, ensure_ascii=False)
-                        for line in args_json.splitlines():
-                            print(f"{UI.DARK_GRAY}  │   {line}{UI.RST}")
-                    except Exception:
-                        pass
+            if not self.json_output and self.verbose and c_args:
+                try:
+                    for line in json.dumps(c_args, indent=2, ensure_ascii=False).splitlines():
+                        say.detail(f"    {line}")
+                except Exception:
+                    pass
 
             # Consecutive duplicate loop detection
             try:
@@ -463,7 +591,7 @@ class MultiGpuHybridSession:
                     f"3 times consecutively. You must stop calling tools and provide your final response to the user now."
                 )
                 if not self.json_output:
-                    print(f"\n{UI.RED_BOLD}[⚠ Loop Guard Triggered]{UI.RST} {UI.AMBER}Blocked repeated {c_name} call (3x identical). Forcing model to respond.{UI.RST}", flush=True)
+                    say.warn(f"Loop guard: blocked repeated {c_name} call (3x identical), forcing the model to respond")
                 return types.HookResult(allow=False, message=msg)
 
             self._recent_tool_calls.append(sig)
@@ -477,19 +605,27 @@ class MultiGpuHybridSession:
                     f"Do not call any more tools. Conclude your turn and provide your final response to the user now."
                 )
                 if not self.json_output:
-                    print(f"\n{UI.RED_BOLD}[⚠ Step Limit Reached ({self.max_tool_steps_per_turn} steps)]{UI.RST} {UI.AMBER}Halting tool execution to prevent infinite loop. Forcing final response.{UI.RST}", flush=True)
+                    say.warn(f"Step limit reached ({self.max_tool_steps_per_turn} steps), forcing a final response")
                 return types.HookResult(allow=False, message=msg)
 
+            self._tool_pending.append({
+                "id": getattr(call, "id", None), "name": str(getattr(c_name, "value", c_name)), "summary": summary_clean,
+                "t0": time.perf_counter(), "step": self._current_turn_tool_count,
+            })
             return types.HookResult(allow=True)
 
         @hooks.post_tool_call
         def on_tool_result(res: types.ToolResult):
+            pending = self._pop_pending_tool(res)
             if self.json_output:
                 return
+            elapsed = (time.perf_counter() - pending["t0"]) if pending.get("t0") else None
+            step_tag = f"step {pending['step']}/{self.max_tool_steps_per_turn}" if (self.max_tool_steps_per_turn > 0 and pending.get("step")) else ""
 
             if res.error:
-                err_msg = str(res.error)
-                print(f"{UI.DARK_GRAY}  └── {UI.RED_BOLD}[✗ Error]:{UI.RST} {UI.RED}{err_msg[:140]}{UI.RST}", flush=True)
+                err_msg = " ".join(str(res.error).split())
+                say.tool_row(pending["name"], pending["summary"], ok=False, elapsed=elapsed, extra=err_msg[:40])
+                say.detail(f"    error: {err_msg[:400]}")
                 return
 
             out_str = ""
@@ -501,23 +637,16 @@ class MultiGpuHybridSession:
                 out_str = str(res.result)
 
             lines = [l for l in out_str.strip().splitlines() if l.strip()]
-            line_count = len(lines)
-            char_count = len(out_str)
+            extra = " · ".join(x for x in (f"{len(lines)} lines" if lines else "", step_tag) if x)
+            say.tool_row(pending["name"], pending["summary"], ok=True, elapsed=elapsed, extra=extra)
 
             if self.verbose and lines:
-                term_cols = shutil.get_terminal_size((120, 24)).columns
-                max_line = max(100, term_cols - 20)
-                print(f"{UI.DARK_GRAY}  │ [Result preview ({line_count} lines, {char_count} chars)]:{UI.RST}")
-                for l in lines[:10]:
-                    l_str = l if len(l) <= max_line else (l[:max_line - 3] + "...")
-                    print(f"{UI.DARK_GRAY}  │   {UI.GRAY}{l_str}{UI.RST}")
-                if line_count > 10:
-                    print(f"{UI.DARK_GRAY}  │   {UI.DARK_GRAY}... (+{line_count - 10} more lines){UI.RST}")
-
-            if line_count > 0:
-                print(f"{UI.DARK_GRAY}  └── {UI.GREEN}✓ Completed{UI.RST} {UI.GRAY}({line_count} lines, {char_count} chars){UI.RST}", flush=True)
-            else:
-                print(f"{UI.DARK_GRAY}  └── {UI.GREEN}✓ Completed{UI.RST}", flush=True)
+                max_line = max(60, shutil.get_terminal_size((120, 24)).columns - 8)
+                shown, hidden = say.truncate_lines("\n".join(lines), 10)
+                for l in shown.splitlines():
+                    say.detail("    " + (l if len(l) <= max_line else l[:max_line - 3] + "..."))
+                if hidden:
+                    say.detail(f"    +{hidden} lines")
 
         all_hooks = [loop_guard, on_tool_result]
 
@@ -576,9 +705,9 @@ class MultiGpuHybridSession:
 
         # Sliding window: keep the last max_recent_turns verbatim, summarize earlier turns
         history_lines = ["\n[Conversation History]"]
-        if len(self.history) > self.max_recent_turns:
-            older = self.history[:-self.max_recent_turns]
-            recent = self.history[-self.max_recent_turns:]
+        if len(self.history) > self._recent_entries:
+            older = self.history[:-self._recent_entries]
+            recent = self.history[-self._recent_entries:]
             condensed = self.summarize_history_sync(older)
             history_lines.append("[Prior Context Summary (Condensed)]")
             history_lines.append(condensed)
@@ -633,7 +762,7 @@ class MultiGpuHybridSession:
         self.history = data.get("history", [])
         if "active_target" in data:
             self.active_target = self.resolve_target_alias(data["active_target"])
-        self._active_local_agent = None
+        self._invalidate_local_agent()
         return True
 
     def list_sessions(self) -> List[Dict[str, Any]]:
@@ -686,6 +815,7 @@ class MultiGpuHybridSession:
 
     async def get_or_switch_local_agent(self, target: str) -> Agent:
         target = self.resolve_target_alias(target)
+        await self._close_stale_agents()
         await asyncio.to_thread(self.refresh_endpoints)
         ep = self.endpoints[target]
         live_model = ep["model"]
@@ -714,17 +844,14 @@ class MultiGpuHybridSession:
 
         if self._active_local_agent is not None:
             if self._active_local_model != live_model:
-                print(f"{UI.AMBER_BOLD}[⚡ llama-shift]{UI.RST} {UI.WHITE}Seamless switch detected on {ep['name']} ➔ {ep['filename']}{UI.RST}")
-            try:
-                await self._active_local_agent.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._active_local_agent = None
+                say.step(f"model switched on {ep['name']}: {ep['filename']}")
+            await self.reset_local_agent()
 
+        system_instructions = await asyncio.to_thread(self.build_system_context, target)
         config = LocalOpenAIAgentConfig(
             model=ep["model"],
             base_url=ep["url"],
-            system_instructions=self.build_system_context(target),
+            system_instructions=system_instructions,
             capabilities=CapabilitiesConfig(),
             policies=self.get_policies(),
             hooks=self.build_tool_hooks(),
@@ -771,7 +898,7 @@ class MultiGpuHybridSession:
         context_prefix = ""
         if self.history:
             lines = []
-            recent = self.history[-self.max_recent_turns:]
+            recent = self.history[-self._recent_entries:] if self._recent_entries else []
             # Keep the distilled working memory if it fell outside the recent window
             first = self.history[0]
             if first not in recent and "[SYSTEM: Context compacted" in first.get("content", ""):
@@ -809,7 +936,7 @@ class MultiGpuHybridSession:
         if status:
             status.start()
         elif not self.json_output:
-            print(f"{UI.GRAY}⚡ Contacting Google Cloud ({self.cloud_model})...{UI.RST}", flush=True)
+            say.step(f"contacting Google Cloud ({self.cloud_model})")
 
         stderr_lines = []
         async def drain_stderr():
@@ -868,16 +995,14 @@ class MultiGpuHybridSession:
                             or params.get("task")
                             or ""
                         )
-                        term_cols = shutil.get_terminal_size((120, 24)).columns
-                        max_summary = max(100, term_cols - 35)
-                        summary_clean = str(summary).replace("\r\n", " ").replace("\n", " ").strip()
-                        summary_str = f" ➔ {summary_clean}" if len(summary_clean) <= max_summary else f" ➔ {summary_clean[:max_summary - 3]}..."
-                        tool_msg = f"{UI.AMBER_BOLD}[⚡ Cloud Tool: {tool_name}]{UI.RST}{UI.WHITE}{summary_str}{UI.RST}"
+                        summary_clean = " ".join(str(summary).split())
                         if status:
-                            status.update(f"[bold yellow]⚙ Cloud Tool: {tool_name}[/bold yellow] [dim]{summary_str}[/dim]")
+                            clip = summary_clean if len(summary_clean) <= 90 else summary_clean[:87] + "..."
+                            status.update(f"[bold yellow]⚙ {tool_name}[/bold yellow] [dim]{clip.replace('[', chr(92) + '[')}[/dim]")
                         else:
-                            sys.stdout.write(f"\r\033[K{tool_msg}\n")
+                            sys.stdout.write("\r\033[K")
                             sys.stdout.flush()
+                            say.tool_row(f"cloud:{tool_name}", summary_clean)
 
                     elif stype == "agent_response":
                         delta = su.get("text_delta")
@@ -901,9 +1026,12 @@ class MultiGpuHybridSession:
             await proc.wait()
         except asyncio.CancelledError:
             # ESC/Ctrl+C: don't leave the agy subprocess running in the background
+            stderr_task.cancel()
             try:
                 proc.kill()
-                stderr_task.cancel()
+            except ProcessLookupError:
+                pass
+            try:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except BaseException:
                 pass
@@ -912,6 +1040,7 @@ class MultiGpuHybridSession:
             renderer.stop()
             raise
         except asyncio.TimeoutError as te:
+            stderr_task.cancel()
             try:
                 proc.kill()
                 await proc.wait()
@@ -945,8 +1074,99 @@ class MultiGpuHybridSession:
 
         return combined_out
 
+    def _validate_target(self, target: str) -> str:
+        if target != "cloud" and target not in self.endpoints:
+            raise ValueError(f"Unknown target '{target}'. Use auto, 9000 (rocm), 9001 (cuda) or cloud.")
+        return target
+
+    async def _route_auto(self, prompt: str) -> str:
+        """Laya System 1 decision pass for target 'auto'; returns a concrete target id."""
+        if self.auto_git_shift:
+            is_git, git_conf = self.laya.is_git_action(prompt)
+            if is_git and self.endpoints["9000"]["status"] == "online":
+                say.step(f"routed to ROCm (git action, laya {git_conf * 100:.0f}%)")
+                say.detail(f"Laya System 1 (~33ms): Git Action -> AMD ROCm (Gemma 4 A4B Fast MoE), confidence {git_conf * 100:.1f}%")
+                return "9000"
+        is_build, build_conf = self.laya.is_build_action(prompt)
+        if is_build:
+            say.step(f"routed to CUDA (build and test, laya {build_conf * 100:.0f}%)")
+            say.detail(f"Laya System 1 (~33ms): Build & Test Verification -> NVIDIA CUDA Subagent (:9001), confidence {build_conf * 100:.1f}%")
+            return "9001"
+        routed_id, conf = self.laya.route_prompt(prompt)
+        if routed_id == "cloud":
+            short, routed_name = "Cloud", f"Google Cloud ({self.cloud_model})"
+        elif routed_id in self.endpoints:
+            ep = self.endpoints[routed_id]
+            fn = ep.get("filename") or ep.get("name_friendly") or "Unknown Model"
+            short, routed_name = ep["name"].split(" ")[0], f"{ep['desc']} [{fn}]"
+        else:
+            short = routed_name = routed_id
+        say.step(f"routed to {short} (laya {conf * 100:.0f}%)")
+        say.detail(f"Laya System 1 (~33ms): 'choice' -> {routed_name}, confidence {conf * 100:.1f}%")
+        return routed_id
+
+    async def _autoshift_rocm_model(self, prompt: str):
+        """Hot-swaps the :9000 model (Gemma 4 MoE for git, Qwen Dense for heavy reasoning) when needed."""
+        ep_9000 = self.endpoints.get("9000", {})
+        current = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
+        is_git, git_conf = self.laya.is_git_action(prompt)
+        if is_git:
+            if "gemma" in current:
+                return
+            say.step("git action: swapping :9000 to Gemma 4 A4B")
+            say.detail(f"Laya Auto-Shift: git action detected (P={git_conf*100:.1f}%), hot-swapping for rapid execution")
+            wanted = self.fast_git_model
+        else:
+            is_heavy, heavy_conf = self.laya.is_heavy_reasoning(prompt)
+            if not is_heavy or "qwen" in current:
+                return
+            catalog = await asyncio.to_thread(self.get_catalog)
+            if not any(self.dense_code_model.lower() in m.get("id", "").lower() for m in catalog):
+                return
+            say.step("deep reasoning: swapping :9000 to Qwen 27B Dense")
+            say.detail(f"Laya Auto-Shift: deep reasoning detected (P={heavy_conf*100:.1f}%)")
+            wanted = self.dense_code_model
+        if await self.switch_model(wanted):
+            await asyncio.to_thread(self.refresh_endpoints)
+
+    def _escalation_label(self, target: str) -> str:
+        if target == "cloud":
+            return f"Cloud ({self.cloud_model})"
+        ep = self.endpoints[target]
+        return f"{ep['name']} [{ep['filename']}]"
+
+    def _print_local_metrics(self, target: str, tokens: int, tps: float, ttft_ms: float, total_dur: float):
+        if not self.show_metrics or self.json_output or tokens <= 0:
+            return
+        ctx_badge = self.format_context_badge(target, reset_col=UI.GRAY)
+        say.dim(f"  {tps:.1f} tok/s · {tokens} tokens · TTFT {ttft_ms:.0f}ms · {total_dur:.2f}s · {ctx_badge}")
+
+    async def _run_escalation(self, escalate_to: str, prompt: str):
+        """Runs the prompt on the escalation target; returns (text, tokens, tps, ttft_ms, total_s, final_target)."""
+        if escalate_to == "cloud":
+            t_start = time.perf_counter()
+            text = await self.chat_cloud_oauth(prompt)
+            total = time.perf_counter() - t_start
+            if self.show_metrics and not self.json_output:
+                ctx_badge = self.format_context_badge("cloud", reset_col=UI.GRAY)
+                say.dim(f"  cloud · {total:.2f}s · {ctx_badge}")
+            return text, 0, None, None, total, "cloud"
+
+        agent = await self.get_or_switch_local_agent(escalate_to)
+        t_start = time.perf_counter()
+        stream = await agent.chat(prompt)
+        text, tokens, t_first = await self._consume_token_stream(stream)
+        t_end = time.perf_counter()
+        ttft_ms = ((t_first - t_start) * 1000) if t_first else 0
+        gen_dur = t_end - (t_first or t_start)
+        tps = (tokens / gen_dur) if gen_dur > 0 else 0
+        total = t_end - t_start
+        self._print_local_metrics(escalate_to, tokens, tps, ttft_ms, total)
+        return text, tokens, tps, ttft_ms, total, escalate_to
+
     async def _chat_impl(self, prompt: str, force_target: Optional[str] = None) -> str:
-        target = self.resolve_target_alias(force_target or self.active_target)
+        requested = self.resolve_target_alias(force_target or self.active_target)
+        target = requested if requested == "auto" else self._validate_target(requested)
 
         # Dynamic check of ports before routing
         await asyncio.to_thread(self.refresh_endpoints)
@@ -954,6 +1174,8 @@ class MultiGpuHybridSession:
         # Telemetry & metric trackers
         self._current_turn_tool_count = 0
         self._recent_tool_calls.clear()
+        self._tool_pending.clear()
+        self._ctx_cache = (0.0, None)
         executed_tools: List[Dict[str, Any]] = []
         self._turn_executed_tools = executed_tools
         token_count: int = 0
@@ -961,144 +1183,52 @@ class MultiGpuHybridSession:
         ttft_ms: Optional[float] = None
         total_dur: Optional[float] = None
 
-        # Laya System 1 Auto-Routing (~33ms decision pass)
         if target == "auto":
-            # Priority 1: Git and Version Control actions fast-track to local Gemma 4 MoE
-            if self.auto_git_shift:
-                is_git, git_conf = self.laya.is_git_action(prompt)
-                if is_git:
-                    msg = f"\n{UI.LAYA_BOLD}[⚡ Laya System 1 (~33ms): Git Action ➔ AMD ROCm (Gemma 4 A4B Fast MoE) (Confidence: {git_conf * 100:.1f}%)]\033[0m"
-                    if not self.json_output:
-                        print(msg)
-                    else:
-                        print(msg, file=sys.stderr)
-            # Priority 2: Project Build, Compilation & Automated Tests push to NVIDIA Subagent (:9001)
-            if target == "auto":
-                is_build, build_conf = self.laya.is_build_action(prompt)
-                if is_build:
-                    msg = f"\n{UI.LAYA_BOLD}[⚡ Laya System 1 (~33ms): Build & Test Verification ➔ NVIDIA CUDA Subagent (:9001) (Confidence: {build_conf * 100:.1f}%)]\033[0m"
-                    if not self.json_output:
-                        print(msg)
-                    else:
-                        print(msg, file=sys.stderr)
-                    target = "9001"
+            target = self._validate_target(await self._route_auto(prompt))
 
-            if target == "auto":
-                routed_id, conf = self.laya.route_prompt(prompt)
-                if routed_id == "cloud":
-                    routed_name = f"Google Cloud ({self.cloud_model})"
-                elif routed_id in self.endpoints:
-                    ep = self.endpoints[routed_id]
-                    fn = ep.get("filename") or ep.get("name_friendly") or "Unknown Model"
-                    routed_name = f"{ep['desc']} [{fn}]"
-                else:
-                    routed_name = routed_id
-                msg = f"\n{UI.LAYA_BOLD}[⚡ Laya System 1 (~33ms): 'choice' ➔ {routed_name} (Confidence: {conf * 100:.1f}%)]\033[0m"
-                if not self.json_output:
-                    print(msg)
-                else:
-                    print(msg, file=sys.stderr)
-                target = routed_id
-
-        # Dynamic in-GPU Model Hot-Swap on Port 9000 (Gemma 4 A4B ↔ Qwen 27B Dense)
-        if self.auto_git_shift and target in ("9000", "rocm", "local"):
-            is_git, git_conf = self.laya.is_git_action(prompt)
-            ep_9000 = self.endpoints.get("9000", {})
-            curr_id = (ep_9000.get("id") or "").lower()
-            curr_fn = (ep_9000.get("filename") or "").lower()
-            curr_name = (ep_9000.get("name_friendly") or "").lower()
-
-            if is_git:
-                is_gemma_active = ("gemma" in curr_id or "gemma" in curr_fn or "gemma" in curr_name)
-                if not is_gemma_active:
-                    shift_msg = f"\n{UI.LAYA_BOLD}[⚡ Laya Auto-Shift (~33ms)]{UI.RST} {UI.WHITE}Git action detected (P={git_conf*100:.1f}%) ➔ Hot-swapping to Gemma 4 A4B for rapid execution...{UI.RST}"
-                    if not self.json_output:
-                        print(shift_msg)
-                    else:
-                        print(shift_msg, file=sys.stderr)
-                    swapped = await self.switch_model(self.fast_git_model)
-                    if swapped:
-                        await asyncio.to_thread(self.refresh_endpoints)
-            else:
-                is_heavy, heavy_conf = self.laya.is_heavy_reasoning(prompt)
-                if is_heavy:
-                    is_qwen_active = ("qwen" in curr_id or "qwen" in curr_fn or "qwen" in curr_name)
-                    if not is_qwen_active:
-                        catalog = self.get_catalog()
-                        has_dense = any(self.dense_code_model.lower() in m.get("id", "").lower() for m in catalog)
-                        if has_dense:
-                            shift_msg = f"\n{UI.LAYA_BOLD}[⚡ Laya Auto-Shift (~33ms)]{UI.RST} {UI.WHITE}Deep reasoning task detected (P={heavy_conf*100:.1f}%) ➔ Hot-swapping to Qwen 27B Dense...{UI.RST}"
-                            if not self.json_output:
-                                print(shift_msg)
-                            else:
-                                print(shift_msg, file=sys.stderr)
-                            swapped = await self.switch_model(self.dense_code_model)
-                            if swapped:
-                                await asyncio.to_thread(self.refresh_endpoints)
+        if self.auto_git_shift and target == "9000":
+            await self._autoshift_rocm_model(prompt)
 
         initial_target = target
+        self._turn_target = target
 
         if target == "cloud":
             auth_info = "OAuth token" if self.has_oauth else "API key"
             if not self.json_output:
-                print(f"\n{UI.CLOUD_BOLD}┌── [Google Cloud ✦ Gemini: {self.cloud_model} ✦ {auth_info}]{UI.RST}\n")
+                say.turn_header(f"Gemini {self.cloud_model} · {auth_info}", "cloud")
             else:
-                print(f"[Google Cloud (Gemini: {self.cloud_model})] Thinking & responding...", file=sys.stderr)
+                say.step(f"Google Cloud (Gemini: {self.cloud_model}) thinking and responding")
             t_cloud_start = time.perf_counter()
             try:
                 response_text = await self.chat_cloud_oauth(prompt)
-                t_cloud_end = time.perf_counter()
-                dur = t_cloud_end - t_cloud_start
+                dur = time.perf_counter() - t_cloud_start
                 total_dur = dur
                 if self.show_metrics and not self.json_output:
                     approx_words = len(response_text.split())
                     ctx_badge = self.format_context_badge(target, reset_col=UI.GRAY)
-                    print(f"\n{UI.DARK_GRAY}└── {UI.badge(f'Metrics: Cloud Gemini │ Duration {dur:.2f}s │ ~{approx_words} words │ {ctx_badge}', UI.GRAY)}{UI.RST}\n")
+                    say.dim(f"  cloud · {dur:.2f}s · ~{approx_words} words · {ctx_badge}")
             except Exception as cloud_err:
-                msg = f"\n{UI.AMBER_BOLD}[⚠ Cloud model unreachable: {cloud_err}]{UI.RST}\n"
-                if not self.json_output:
-                    print(msg)
-                else:
-                    print(msg, file=sys.stderr)
+                say.warn(f"Cloud model unreachable: {cloud_err}")
                 candidates = []
                 if self.endpoints["9000"]["status"] == "online":
                     candidates.append("rocm")
                 if self.endpoints["9001"]["status"] == "online":
                     candidates.append("cuda")
-                if candidates:
-                    winner, conf = self.laya.choose_escalation_target("cloud", prompt, candidates)
-                    escalate_to = self.resolve_target_alias(winner)
-                    ep_esc = self.endpoints[escalate_to]
-                    esc_label = f"{ep_esc['name']} [{ep_esc['filename']}]"
-                    esc_msg = f"{UI.LAYA_BOLD}[⚡ Laya Escalation (~33ms): Cloud unreachable ➔ Escalating to {esc_label} (Confidence: {conf*100:.1f}%)]\033[0m\n"
-                    if not self.json_output:
-                        print(esc_msg)
-                    else:
-                        print(esc_msg, file=sys.stderr)
-                    agent = await self.get_or_switch_local_agent(escalate_to)
-                    t_esc_start = time.perf_counter()
-                    escalate_resp = await agent.chat(prompt)
-                    response_text, esc_tok_count, t_esc_first = await self._consume_token_stream(escalate_resp)
-                    target = escalate_to
-                    t_esc_end = time.perf_counter()
-                    total_dur = t_esc_end - t_esc_start
-                    dur = t_esc_end - (t_esc_first or t_esc_start)
-                    tps = (esc_tok_count / dur) if dur > 0 else 0
-                    ttft_ms = ((t_esc_first - t_esc_start) * 1000) if t_esc_first else 0
-                    if self.show_metrics and not self.json_output and esc_tok_count > 0:
-                        ctx_badge = self.format_context_badge(target, reset_col=UI.GRAY)
-                        print(f"{UI.DARK_GRAY}└── {UI.badge(f'Metrics: {tps:.1f} tok/s │ {esc_tok_count} tokens │ TTFT {ttft_ms:.0f}ms │ Total {total_dur:.2f}s │ {ctx_badge}', UI.GRAY)}{UI.RST}\n")
-                else:
+                if not candidates:
                     raise
+                winner, conf = self.laya.choose_escalation_target("cloud", prompt, candidates)
+                escalate_to = self._validate_target(self.resolve_target_alias(winner))
+                say.step(f"escalating to {self._escalation_label(escalate_to)} (laya {conf*100:.0f}%)")
+                response_text, token_count, tps, ttft_ms, total_dur, target = await self._run_escalation(escalate_to, prompt)
+                self._turn_target = target
         else:
             ep = self.endpoints[target]
             display_fn = ep["filename"] or ep["model"].split("/")[-1]
-            t_color = UI.target_color(target)
-            header = f"{ep['name']} ✦ {display_fn} ✦ {ep['desc']}"
+            header = f"{ep['name']} · {display_fn}"
             if not self.json_output:
-                print(f"\n{t_color}┌── [{header}]{UI.RST}\n")
+                say.turn_header(header, target)
             else:
-                print(f"[{header}] Thinking & responding...", file=sys.stderr)
+                say.step(f"{header} thinking and responding")
 
             agent = await self.get_or_switch_local_agent(target)
 
@@ -1129,7 +1259,6 @@ class MultiGpuHybridSession:
             response_text = ""
 
             for attempt in range(1, MAX_ATTEMPTS + 1):
-                current_response = None
                 try:
                     t_start = time.perf_counter()
                     t_first = None
@@ -1144,45 +1273,30 @@ class MultiGpuHybridSession:
                     tps = (token_count / gen_dur) if gen_dur > 0 else 0
                     total_dur = t_end - t_start
 
-                    if self.show_metrics and not self.json_output and token_count > 0:
-                        ctx_badge = self.format_context_badge(target, reset_col=UI.GRAY)
-                        print(f"{UI.DARK_GRAY}└── {UI.badge(f'Metrics: {tps:.1f} tok/s │ {token_count} tokens │ TTFT {ttft_ms:.0f}ms │ Total {total_dur:.2f}s │ {ctx_badge}', UI.GRAY)}{UI.RST}\n")
+                    self._print_local_metrics(target, token_count, tps, ttft_ms, total_dur)
                     break
 
                 except Exception as turn_err:
-                    if _is_exceed_context_error(turn_err):
-                        compact_msg = (
-                            f"\n{UI.AMBER_BOLD}[⚠ Context size exceeded!]{UI.RST} {UI.WHITE}Auto-compacting conversation history...{UI.RST}"
-                        )
-                        if not self.json_output:
-                            print(compact_msg)
-                        else:
-                            print(compact_msg, file=sys.stderr)
-                        removed = self.compact_history(keep_recent=4, silent=True)
+                    can_retry = attempt < MAX_ATTEMPTS
+                    if _is_exceed_context_error(turn_err) and can_retry:
+                        say.warn("Context size exceeded, auto-compacting conversation history")
+                        removed = await asyncio.to_thread(self.compact_history, keep_recent=2, silent=True)
                         if removed == 0 and len(self.history) > 2:
-                            removed = self.compact_history(keep_recent=2, silent=True)
-                        self._active_local_agent = None
-                        if not self.json_output:
-                            ctx_msg = f"{UI.GREEN}✓ Compacted {removed} turn(s). Retrying with fresh context window...{UI.RST}"
-                            print(ctx_msg)
-                        else:
-                            print(f"[AutoCompact] Compacted {removed} turn(s). Retrying.", file=sys.stderr)
+                            removed = await asyncio.to_thread(self.compact_history, keep_recent=1, silent=True)
+                        await self.reset_local_agent()
+                        say.step(f"compacted {removed} turn(s), retrying with a fresh context window")
                         agent = await self.get_or_switch_local_agent(target)
-                    elif _is_empty_turn_400(turn_err) and attempt < MAX_ATTEMPTS:
-                        msg = (
-                            f"\n{UI.AMBER_BOLD}[⚠ Model produced empty turn after tool execution "
-                            f"(HTTP 400, attempt {attempt}/{MAX_ATTEMPTS}). Pruning history and retrying...]{UI.RST}\n"
+                    elif _is_empty_turn_400(turn_err) and can_retry:
+                        say.warn(
+                            f"Model produced an empty turn after tool execution "
+                            f"(HTTP 400, attempt {attempt}/{MAX_ATTEMPTS}), pruning history and retrying"
                         )
-                        if not self.json_output:
-                            print(msg)
-                        else:
-                            print(msg, file=sys.stderr)
                         _prune_empty_history()
-                        self._active_local_agent = None
+                        await self.reset_local_agent()
                         agent = await self.get_or_switch_local_agent(target)
-                    elif _is_empty_turn_400(turn_err) or _is_unreachable_error(turn_err):
+                    elif _is_empty_turn_400(turn_err) or _is_unreachable_error(turn_err) or _is_exceed_context_error(turn_err):
                         _prune_empty_history()
-                        self._active_local_agent = None
+                        await self.reset_local_agent()
                         await asyncio.to_thread(self.refresh_endpoints)
 
                         candidates = []
@@ -1193,48 +1307,18 @@ class MultiGpuHybridSession:
                         candidates.append("cloud")
 
                         winner, conf = self.laya.choose_escalation_target(target, prompt, candidates)
-                        escalate_to = self.resolve_target_alias(winner)
+                        escalate_to = self._validate_target(self.resolve_target_alias(winner))
 
-                        if escalate_to == "cloud":
-                            escalate_label = f"Cloud ({self.cloud_model})"
+                        if _is_unreachable_error(turn_err):
+                            cause = "Endpoint unreachable"
+                        elif _is_exceed_context_error(turn_err):
+                            cause = "Context window still exceeded after compaction"
                         else:
-                            ep_esc = self.endpoints[escalate_to]
-                            escalate_label = f"{ep_esc['name']} [{ep_esc['filename']}]"
-
-                        cause = "Endpoint unreachable" if _is_unreachable_error(turn_err) else f"Failed after {MAX_ATTEMPTS} attempts"
-                        esc_msg = (
-                            f"\n{UI.AMBER_BOLD}⚠ [{target.upper()} {cause}]{UI.RST}\n"
-                            f"{UI.LAYA_BOLD}[⚡ Laya Escalation (~33ms): Escalating to {escalate_label} (Confidence: {conf*100:.1f}%)]\033[0m\n"
-                        )
-                        if not self.json_output:
-                            print(esc_msg)
-                        else:
-                            print(esc_msg, file=sys.stderr)
-
-                        if escalate_to == "cloud":
-                            t_esc_start = time.perf_counter()
-                            response_text = await self.chat_cloud_oauth(prompt)
-                            t_esc_end = time.perf_counter()
-                            total_dur = t_esc_end - t_esc_start
-                            target = "cloud"
-                            if self.show_metrics and not self.json_output:
-                                ctx_badge = self.format_context_badge(target, reset_col=UI.GRAY)
-                                print(f"\n{UI.DARK_GRAY}└── {UI.badge(f'Metrics: Cloud Gemini │ Duration {total_dur:.2f}s │ {ctx_badge}', UI.GRAY)}{UI.RST}\n")
-                        else:
-                            agent = await self.get_or_switch_local_agent(escalate_to)
-                            t_esc_start = time.perf_counter()
-                            escalate_resp = await agent.chat(prompt)
-                            response_text, esc_tok_count, t_esc_first = await self._consume_token_stream(escalate_resp)
-                            t_esc_end = time.perf_counter()
-                            token_count = esc_tok_count
-                            ttft_ms = ((t_esc_first - t_esc_start) * 1000) if t_esc_first else 0
-                            dur = t_esc_end - (t_esc_first or t_esc_start)
-                            tps = (esc_tok_count / dur) if dur > 0 else 0
-                            total_dur = t_esc_end - t_esc_start
-                            target = escalate_to
-                            if self.show_metrics and not self.json_output and esc_tok_count > 0:
-                                ctx_badge = self.format_context_badge(target, reset_col=UI.GRAY)
-                                print(f"{UI.DARK_GRAY}└── {UI.badge(f'Metrics: {tps:.1f} tok/s │ {esc_tok_count} tokens │ TTFT {ttft_ms:.0f}ms │ Total {total_dur:.2f}s │ {ctx_badge}', UI.GRAY)}{UI.RST}\n")
+                            cause = f"Failed after {MAX_ATTEMPTS} attempts"
+                        say.warn(f"{target.upper()}: {cause}")
+                        say.step(f"escalating to {self._escalation_label(escalate_to)} (laya {conf*100:.0f}%)")
+                        response_text, token_count, tps, ttft_ms, total_dur, target = await self._run_escalation(escalate_to, prompt)
+                        self._turn_target = target
                         break
                     else:
                         raise
@@ -1242,27 +1326,28 @@ class MultiGpuHybridSession:
         self.history.append({"role": "user", "target": target, "content": prompt})
         if response_text:
             self.history.append({"role": "assistant", "target": target, "content": response_text})
+            self.last_answer = response_text
         else:
             if not self.json_output:
-                print(UI.warn("Model returned an empty response — skipping history entry to prevent API errors."))
+                say.warn("Model returned an empty response, skipping history entry to prevent API errors")
 
         # Proactive autocompact
-        if self.autocompact_threshold > 0 and len(self.history) >= self.autocompact_threshold:
-            removed = self.compact_history(silent=True)
+        if self.autocompact_threshold > 0 and len(self.history) // 2 >= self.autocompact_threshold:
+            removed = await asyncio.to_thread(self.compact_history, silent=True)
             if removed > 0:
-                if not self.json_output:
-                    print(f"\n{UI.DARK_GRAY}╭── {UI.CYAN_BOLD}[Auto-compact]{UI.RST} {UI.GRAY}Context reached {self.autocompact_threshold} turns → compacted {removed} old turns into summary.{UI.RST}\n")
-                else:
-                    print(f"[AutoCompact] Proactively compacted {removed} turns (threshold={self.autocompact_threshold}).", file=sys.stderr)
+                say.step(f"auto-compacted {removed} old turns into a summary (threshold {self.autocompact_threshold})")
         else:
             self.trigger_background_synthesis()
 
         approx_tokens = token_count if token_count else len(response_text.split())
-        self._record_stats(initial_target, target, approx_tokens, tps, ttft_ms, total_dur)
+        if response_text:
+            self._record_stats(initial_target, target, approx_tokens, tps, ttft_ms, total_dur)
+        else:
+            self._record_error(target)
 
         if self.json_output:
             json_payload = {
-                "status": "success",
+                "status": "success" if response_text else "empty_response",
                 "target": target,
                 "target_name": self.endpoints[target]["name"] if target in self.endpoints else "Google Cloud",
                 "model": self.endpoints[target]["filename"] if target in self.endpoints else self.cloud_model,
@@ -1283,15 +1368,17 @@ class MultiGpuHybridSession:
 
     async def chat(self, prompt: str, force_target: Optional[str] = None) -> str:
         """One user turn: PreTurn hooks, model run, checkpoint, PostTurn/Stop hooks."""
+        self._turn_target = None
         if self.enable_hooks:
             verdict = await asyncio.to_thread(ExternalHooksManager.run_turn_event, self, "PreTurn", {"prompt": prompt})
             if verdict.get("deny"):
                 msg = f"Turn blocked by PreTurn hook: {verdict.get('reason') or 'denied'}"
-                print(UI.warn(msg) if not self.json_output else msg, file=sys.stderr if self.json_output else sys.stdout)
+                self._notice(UI.warn(msg) if not self.json_output else msg)
                 return ""
             prompt = verdict.get("prompt") or prompt
 
         before = await self._checkpoint_before()
+        t_turn = time.perf_counter()
         response = ""
         try:
             response = await self._chat_impl(prompt, force_target) or ""
@@ -1305,15 +1392,54 @@ class MultiGpuHybridSession:
                     if not stop.get("block"):
                         break
                     note = f"Stop hook requires more work: {stop['reason']}"
-                    print(UI.warn(note) if not self.json_output else note, file=sys.stderr if self.json_output else sys.stdout)
+                    self._notice(UI.warn(note) if not self.json_output else note)
                     response = await self._chat_impl(stop["reason"], force_target) or response
         except Exception:
-            st = self.stats.setdefault(self.resolve_target_alias(force_target or self.active_target), {})
-            st["errors"] = st.get("errors", 0) + 1
+            self._record_error(self._error_target(force_target))
             raise
         finally:
-            self._checkpoint_after(before, prompt)
+            cp = await self._checkpoint_after(before, prompt)
+            await self._print_receipt(cp, time.perf_counter() - t_turn)
+            await self._sync_commit_to_kontexta()
         return response
+
+    async def _print_receipt(self, cp: Optional[Dict[str, Any]], elapsed: float):
+        """Shows what the turn actually did (files, commands) under the answer; never fails the turn."""
+        if self.json_output:
+            return
+        try:
+            files = []
+            if cp and self._repo_root:
+                raw = await asyncio.to_thread(Checkpoints.diff, self._repo_root, cp["before"], cp["after"], False, True)
+                files = receipt.files_from_numstat(raw)
+            commands = []
+            for call in self._turn_executed_tools:
+                args = call.get("args") or {}
+                cmd = next((args[k] for k in ("command", "CommandLine", "cmd") if isinstance(args.get(k), str)), None)
+                if cmd:
+                    commands.append(cmd)
+            receipt.render_receipt(files, commands, None, elapsed, getattr(self, "_last_tps", None), self._turn_target or self.active_target)
+        except Exception:
+            pass
+
+    async def _sync_commit_to_kontexta(self):
+        """Journals a commit the agent made this turn; never affects the turn itself."""
+        try:
+            if not self._repo_root or not any(kontexta_sync.is_commit_call(c) for c in self._turn_executed_tools):
+                return
+            info = await asyncio.to_thread(kontexta_sync.commit_info, self._repo_root)
+            if info:
+                kontexta_sync.sync_event(self, "commit", info["subject"], self._repo_root, commit=info, quiet=True)
+        except Exception:
+            pass
+
+    def _error_target(self, force_target: Optional[str]) -> str:
+        target = self._turn_target or self.resolve_target_alias(force_target or self.active_target)
+        return target if (target == "cloud" or target in self.endpoints) else "unrouted"
+
+    def _record_error(self, target: str):
+        st = self.stats.setdefault(target, {})
+        st["errors"] = st.get("errors", 0) + 1
 
     # ── Checkpoints (/diff, /undo) ────────────────────────────────────
 
@@ -1324,13 +1450,16 @@ class MultiGpuHybridSession:
             return None
         return await asyncio.to_thread(Checkpoints.snapshot, self._repo_root)
 
-    def _checkpoint_after(self, before: Optional[str], prompt: str):
+    async def _checkpoint_after(self, before: Optional[str], prompt: str) -> Optional[Dict[str, Any]]:
         if not before or not self._repo_root:
-            return
-        after = Checkpoints.snapshot(self._repo_root)
+            return None
+        after = await asyncio.to_thread(Checkpoints.snapshot, self._repo_root)
         if after and after != before:
-            self.checkpoints.append({"prompt": prompt.strip().splitlines()[0][:80] if prompt.strip() else "", "before": before, "after": after, "time": time.time()})
+            cp = {"prompt": prompt.strip().splitlines()[0][:80] if prompt.strip() else "", "before": before, "after": after, "time": time.time()}
+            self.checkpoints.append(cp)
             del self.checkpoints[:-Checkpoints.MAX_TURNS]
+            return cp
+        return None
 
     def turn_diff(self, nth: int = 1, stat: bool = False) -> Optional[str]:
         """Diff of the nth most recent turn that changed files (1 = latest); None if unavailable."""
@@ -1358,12 +1487,13 @@ class MultiGpuHybridSession:
             {"role": "user", "target": self.active_target, "content": f"[SYSTEM: The user reverted all file changes from the turn \"{cp['prompt']}\" with /undo. Files restored: {', '.join(touched) or 'none'}.]"},
             {"role": "assistant", "target": self.active_target, "content": "[SYSTEM: Acknowledged. Those file changes no longer exist.]"},
         ])
-        self._active_local_agent = None
+        self._invalidate_local_agent()
         return touched
 
     # ── Usage ledger (/stats) ─────────────────────────────────────────
 
     def _record_stats(self, routed: str, final: str, tokens: int, tps: Optional[float], ttft_ms: Optional[float], dur: Optional[float]):
+        self._last_tps = tps
         st = self.stats.setdefault(final, {})
         st["turns"] = st.get("turns", 0) + 1
         st["tokens"] = st.get("tokens", 0) + tokens
@@ -1380,29 +1510,17 @@ class MultiGpuHybridSession:
 
     def print_stats(self):
         if not self.stats:
-            print(f"\n{UI.GRAY}(no turns recorded yet this session){UI.RST}\n")
+            say.dim("(no turns recorded yet this session)")
             return
         rows = []
         for tgt, st in sorted(self.stats.items()):
             tps = f"{st['tps_sum'] / st['tps_n']:.1f}" if st.get("tps_n") else "-"
             ttft = f"{st['ttft_sum'] / st['ttft_n']:.0f}ms" if st.get("ttft_n") else "-"
             label = self.endpoints[tgt]["name"] if tgt in self.endpoints else ("Cloud" if tgt == "cloud" else tgt)
-            rows.append((label, int(st.get("turns", 0)), int(st.get("tokens", 0)), tps, ttft, f"{st.get('seconds', 0.0):.1f}s", int(st.get("escalations", 0)), int(st.get("errors", 0))))
-        headers = ("Target", "Turns", "Tokens", "Avg tok/s", "Avg TTFT", "Time", "Escalated away", "Errors")
-        if RICH_AVAILABLE and not self.json_output:
-            table = Table(title=Text.from_ansi(f"{UI.WHITE}SESSION USAGE LEDGER{UI.RST}"), box=box.ROUNDED, header_style="bold cyan", border_style="bright_black")
-            for i, h in enumerate(headers):
-                table.add_column(h, justify="left" if i == 0 else "right")
-            for r in rows:
-                table.add_row(*[str(c) for c in r])
-            console.print()
-            console.print(table)
-            console.print(f"[dim]Cloud token counts are word-count estimates.[/dim]\n")
-        else:
-            print()
-            for r in rows:
-                print("  " + " | ".join(f"{h}: {c}" for h, c in zip(headers, r)))
-            print()
+            rows.append([label, str(int(st.get("turns", 0))), str(int(st.get("tokens", 0))), tps, ttft, f"{st.get('seconds', 0.0):.1f}s", str(int(st.get("escalations", 0))), str(int(st.get("errors", 0)))])
+        say.group("Session usage")
+        say.table("", ["Target", "Turns", "Tokens", "Avg tok/s", "Avg TTFT", "Time", "Escalated away", "Errors"], rows)
+        say.dim("Cloud token counts are word-count estimates.")
 
     # ── Preferences ───────────────────────────────────────────────────
 
@@ -1420,6 +1538,8 @@ class MultiGpuHybridSession:
                 self._dangerously_skip_permissions = val
             elif key == "cloud_model" and isinstance(val, str) and val.strip():
                 self.cloud_model = val.strip()
+            elif key == "theme":
+                UI.set_theme(str(val).strip().lower())
             else:
                 setattr(self, key, val)
 
@@ -1439,21 +1559,13 @@ class MultiGpuHybridSession:
                 parts.append(f"[Codebase Symbol Map]\n{rmap[:6000]}\n[End of Symbol Map]")
         return "\n\n".join(parts) + "\n\n" if parts else ""
 
-    async def chat_turn(self, prompt: str, target: Optional[str] = None):
-        """Runs one chat turn on an explicit target (used by workflows)."""
-        await self.chat(prompt, force_target=target)
-
     async def reset_local_agent(self):
         """Closes and drops the cached local agent so the next turn starts fresh."""
-        agent, self._active_local_agent = self._active_local_agent, None
-        if agent is not None:
-            try:
-                await agent.__aexit__(None, None, None)
-            except Exception:
-                pass
+        self._invalidate_local_agent()
+        await self._close_stale_agents()
 
     async def chat_turn(self, prompt: str, target: Optional[str] = None):
-        """Convenience alias for chat() with explicit target routing."""
+        """Runs one chat turn on an explicit target (used by workflows)."""
         return await self.chat(prompt, force_target=target)
 
     async def close(self):
@@ -1462,18 +1574,17 @@ class MultiGpuHybridSession:
                 self.save_session("latest_session")
             except Exception:
                 pass
-        if self._active_local_agent is not None:
-            try:
-                await self._active_local_agent.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._active_local_agent = None
+        task = self._synthesis_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await kontexta_sync.drain()
+        await self.reset_local_agent()
         SudoManager.cleanup()
 
     # ── Status, Catalog & Model Switch UI ─────────────────────────────
 
-    def print_status(self):
-        self.refresh_endpoints()
+    def _status_rows(self) -> List[tuple]:
         if self.use_laya_adaptive_permissions:
             perm_desc = f"{UI.LAYA}LAYA ADAPTIVE{UI.RST} (Bayesian 'noul' safe-action gating)"
         elif self._dangerously_skip_permissions:
@@ -1492,88 +1603,22 @@ class MultiGpuHybridSession:
 
         auth_status = f"{UI.GREEN_BOLD}✓ Google OAuth Active{UI.RST} (~/.gemini/antigravity-cli)" if self.has_oauth else f"{UI.AMBER}API Key{UI.RST}"
 
-        ep9000 = self.endpoints['9000']
-        ep9001 = self.endpoints['9001']
-
         def _fmt_model(ep, col):
-            fn = ep['filename']
             st_color = UI.GREEN if ep['status'] == 'online' else UI.RED
             status_badge = f"{st_color}[{ep['status'].upper()}]{UI.RST}"
-            model_name = f"{col}{ep['name_friendly'] or fn}{UI.RST}"
+            model_name = f"{col}{ep['name_friendly'] or ep['filename']}{UI.RST}"
             src = f" {UI.GRAY}[{ep['source']}]{UI.RST}" if ep['source'] != 'none' else ""
             return f"{status_badge} {model_name}{src}"
 
-        m0_str = _fmt_model(ep9000, UI.ROCM)
-        m1_str = _fmt_model(ep9001, UI.CUDA)
+        def _on_off(enabled, on_text):
+            return f"{UI.GREEN}{on_text}{UI.RST}" if enabled else f"{UI.GRAY}Disabled{UI.RST}"
+
         ml_status = f"{UI.GREEN}ON{UI.RST} (Enter on empty line submits)" if self.multiline_input else f"{UI.GRAY}OFF{UI.RST} (single Enter)"
-        curation_badge = f"{UI.GREEN}Active (Auto-distills in background){UI.RST}" if self.continuous_curation else f"{UI.GRAY}Disabled{UI.RST}"
-
-        if RICH_AVAILABLE and not self.json_output:
-            table = Table(
-                title=Text.from_ansi(f"{UI.WHITE}MULTI-GPU HYBRID AGENT STATUS{UI.RST}"),
-                box=box.ROUNDED,
-                header_style="bold cyan",
-                border_style="bright_black",
-                show_header=False,
-            )
-            table.add_column("Property", style="bold white", width=25)
-            table.add_column("Value")
-            table.add_row("Active Target", Text.from_ansi(active_label))
-            table.add_row("Permissions", Text.from_ansi(perm_desc))
-            table.add_row("Laya Decision Engine", Text.from_ansi(f"{UI.LAYA}ModernBERT-large (~421M, ~33ms){UI.RST} {UI.GRAY}[/v1/systemone]{UI.RST}"))
-            table.add_row("Primary Agent (ROCm :9000)", Text.from_ansi(m0_str))
-            table.add_row("Compactor (NVIDIA :9001)", Text.from_ansi(m1_str))
-            table.add_row("Continuous Curation", Text.from_ansi(curation_badge))
-            repomap_tag = f"{UI.GREEN}Active (Auto-injected into context){UI.RST}" if self.auto_repomap else f"{UI.GRAY}Disabled{UI.RST}"
-            table.add_row("Codebase AST Map", Text.from_ansi(repomap_tag))
-            _, instr_files = ProjectInstructions.load_instructions(".")
-            instr_desc = f"{UI.GREEN}Loaded ({', '.join(instr_files)}){UI.RST}" if instr_files else (f"{UI.GREEN}Active (Scanning root){UI.RST}" if self.auto_instructions else f"{UI.GRAY}Disabled{UI.RST}")
-            table.add_row("Project Guidelines", Text.from_ansi(instr_desc))
-            hook_entries, hook_files = ExternalHooksManager.load_hook_configs(".")
-            hook_tag = f"{UI.GREEN}Active ({len(hook_entries)} hooks loaded from {', '.join(hook_files)}){UI.RST}" if hook_entries else (f"{UI.GREEN}Active (Scanning hooks.json){UI.RST}" if self.enable_hooks else f"{UI.GRAY}Disabled{UI.RST}")
-            table.add_row("Lifecycle Hooks", Text.from_ansi(hook_tag))
-
-            if self.enable_kontexta:
-                k_stat = KontextaManager.get_status(".")
-                if k_stat["available"]:
-                    p_info = k_stat["active_project"]["name"] if k_stat["active_project"] else f"{k_stat['projects_count']} projects"
-                    k_str = f"{UI.GREEN}Active{UI.RST} (Inbuilt MCP 'kxta' ➔ {p_info})"
-                else:
-                    k_str = f"{UI.AMBER}Offline (Node script missing){UI.RST}"
-            else:
-                k_str = f"{UI.GRAY}Disabled{UI.RST}"
-            table.add_row("Kontexta Engine", Text.from_ansi(k_str))
-
-            table.add_row("Cloud Model", Text.from_ansi(f"{UI.CLOUD}{self.cloud_model}{UI.RST}"))
-            table.add_row("Cloud Auth", Text.from_ansi(auth_status))
-            table.add_row("Multi-line Input", Text.from_ansi(ml_status))
-            table.add_row("Conversation Turns", Text.from_ansi(f"{UI.CYAN}{len(self.history) // 2}{UI.RST}"))
-            shift_tag = f"{UI.GREEN}Active (Git ➔ Gemma 4 A4B │ Deep ➔ Qwen 27B){UI.RST}" if self.auto_git_shift else f"{UI.GRAY}Disabled{UI.RST}"
-            table.add_row("Auto Model Shift", Text.from_ansi(shift_tag))
-            sudo_badge = f"{UI.GREEN}Active (~{int(SudoManager.time_remaining() // 60)}m cached){UI.RST}" if SudoManager.is_authenticated() else f"{UI.GRAY}Inactive (Prompt on demand){UI.RST}"
-            table.add_row("Sudo Privileges", Text.from_ansi(sudo_badge))
-            console.print()
-            console.print(table)
-            console.print()
-            return
-
-        print()
-        print(f"{UI.GRAY}╭─── {UI.WHITE}MULTI-GPU HYBRID AGENT STATUS{UI.RST}{UI.GRAY} ──────────────────────────────────────╮{UI.RST}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Active Target{UI.RST}       : {active_label}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Permissions{UI.RST}         : {perm_desc}")
-        sudo_badge_text = f"{UI.GREEN}Active (~{int(SudoManager.time_remaining() // 60)}m cached){UI.RST}" if SudoManager.is_authenticated() else f"{UI.GRAY}Inactive (Prompt on demand){UI.RST}"
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Sudo Privileges{UI.RST}     : {sudo_badge_text}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Laya Decision Engine{UI.RST}: {UI.LAYA}ModernBERT-large (~421M, ~33ms){UI.RST} [/v1/systemone]")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Primary (ROCm :9000){UI.RST} : {m0_str}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Compactor (CUDA :9001){UI.RST}: {m1_str}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Continuous Curation{UI.RST} : {curation_badge}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Codebase AST Map{UI.RST}    : {repomap_tag}")
         _, instr_files = ProjectInstructions.load_instructions(".")
-        instr_desc = f"{UI.GREEN}Loaded ({', '.join(instr_files)}){UI.RST}" if instr_files else (f"{UI.GREEN}Active (Scanning root){UI.RST}" if self.auto_instructions else f"{UI.GRAY}Disabled{UI.RST}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Project Guidelines{UI.RST}  : {instr_desc}")
+        instr_desc = f"{UI.GREEN}Loaded ({', '.join(instr_files)}){UI.RST}" if instr_files else _on_off(self.auto_instructions, "Active (Scanning root)")
         hook_entries, hook_files = ExternalHooksManager.load_hook_configs(".")
-        hook_tag = f"{UI.GREEN}Active ({len(hook_entries)} hooks loaded from {', '.join(hook_files)}){UI.RST}" if hook_entries else (f"{UI.GREEN}Active (Scanning hooks.json){UI.RST}" if self.enable_hooks else f"{UI.GRAY}Disabled{UI.RST}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Lifecycle Hooks{UI.RST}     : {hook_tag}")
+        hook_tag = f"{UI.GREEN}Active ({len(hook_entries)} hooks loaded from {', '.join(hook_files)}){UI.RST}" if hook_entries else _on_off(self.enable_hooks, "Active (Scanning hooks.json)")
+
         if self.enable_kontexta:
             k_stat = KontextaManager.get_status(".")
             if k_stat["available"]:
@@ -1583,15 +1628,34 @@ class MultiGpuHybridSession:
                 k_str = f"{UI.AMBER}Offline (Node script missing){UI.RST}"
         else:
             k_str = f"{UI.GRAY}Disabled{UI.RST}"
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Kontexta Engine{UI.RST}     : {k_str}")
-        shift_tag_text = f"{UI.GREEN}Active (Git ➔ Gemma 4 A4B │ Deep ➔ Qwen 27B){UI.RST}" if self.auto_git_shift else f"{UI.GRAY}Disabled{UI.RST}"
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Auto Model Shift{UI.RST}    : {shift_tag_text}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Cloud Model{UI.RST}         : {UI.CLOUD}{self.cloud_model}{UI.RST}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Cloud Auth{UI.RST}          : {auth_status}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Multi-line Input{UI.RST}    : {ml_status}")
-        print(f"{UI.GRAY}│{UI.RST}  {UI.WHITE}Conversation Turns{UI.RST}  : {UI.CYAN}{len(self.history) // 2}{UI.RST}")
-        print(f"{UI.GRAY}╰───────────────────────────────────────────────────────────────────╯{UI.RST}")
-        print()
+
+        sudo_badge = f"{UI.GREEN}Active (~{int(SudoManager.time_remaining() // 60)}m cached){UI.RST}" if SudoManager.is_authenticated() else f"{UI.GRAY}Inactive (Prompt on demand){UI.RST}"
+        return [
+            ("Active Target", active_label),
+            ("Permissions", perm_desc),
+            ("Laya Decision Engine", f"{UI.LAYA}ModernBERT-large (~421M, ~33ms){UI.RST} {UI.GRAY}[/v1/systemone]{UI.RST}"),
+            ("Primary Agent (ROCm :9000)", _fmt_model(self.endpoints['9000'], UI.ROCM)),
+            ("Compactor (NVIDIA :9001)", _fmt_model(self.endpoints['9001'], UI.CUDA)),
+            ("Continuous Curation", _on_off(self.continuous_curation, "Active (Auto-distills in background)")),
+            ("Codebase AST Map", _on_off(self.auto_repomap, "Active (Auto-injected into context)")),
+            ("Project Guidelines", instr_desc),
+            ("Lifecycle Hooks", hook_tag),
+            ("Kontexta Engine", k_str),
+            ("Cloud Model", f"{UI.CLOUD}{self.cloud_model}{UI.RST}"),
+            ("Cloud Auth", auth_status),
+            ("Multi-line Input", ml_status),
+            ("Conversation Turns", f"{UI.CYAN}{len(self.history) // 2}{UI.RST}"),
+            ("Auto Model Shift", _on_off(self.auto_git_shift, "Active (Git ➔ Gemma 4 A4B │ Deep ➔ Qwen 27B)")),
+            ("Sudo Privileges", sudo_badge),
+            ("Kontexta Journal Sync", _on_off(self.kontexta_sync, "On (brainstorm results and commits)")),
+            ("Theme", f"{UI.CYAN}{UI.theme_name}{UI.RST}"),
+        ]
+
+    def print_status(self):
+        self.refresh_endpoints()
+        rows = self._status_rows()
+        say.group("Status")
+        say.table("", ["Setting", "Value"], [[label, value] for label, value in rows])
 
     def get_catalog(self) -> List[Dict[str, Any]]:
         self.refresh_endpoints()
@@ -1667,72 +1731,41 @@ class MultiGpuHybridSession:
 
     def print_models(self):
         catalog = self.get_catalog()
-        if RICH_AVAILABLE and not self.json_output:
-            table = Table(
-                title=Text.from_ansi(f"{UI.WHITE}MODEL CATALOG & HARDWARE ENDPOINTS{UI.RST} {UI.GRAY}(Select with '/model <# or id>'){UI.RST}"),
-                box=box.ROUNDED,
-                header_style="bold cyan",
-                border_style="bright_black"
-            )
-            table.add_column("#", justify="center", style="bold dim", no_wrap=True)
-            table.add_column("ID / Alias", style="bold cyan", no_wrap=True)
-            table.add_column("Status", justify="left", no_wrap=True)
-            table.add_column("Target Device & Port", style="white", no_wrap=True)
-            table.add_column("Model (Size)", style="none")
-            table.add_column("Specialty / Capability", style="dim")
-
-            for idx, item in enumerate(catalog, 1):
-                st = item["status"].upper()
-                if st in ("RUNNING", "ONLINE"):
-                    st_str = f"{UI.GREEN}● {st}{UI.RST}"
-                else:
-                    st_str = f"{UI.GRAY}○ {st}{UI.RST}"
-
-                if item["is_active"]:
-                    st_str += f" {UI.AMBER_BOLD}★ ACTIVE{UI.RST}"
-
-                gpu_text = item["gpu_desc"]
-                if "9000" in gpu_text or "ROCm" in gpu_text:
-                    dev_styled = f"{UI.ROCM}{gpu_text}{UI.RST}"
-                elif "9001" in gpu_text or "CUDA" in gpu_text:
-                    dev_styled = f"{UI.CUDA}{gpu_text}{UI.RST}"
-                elif "Cloud" in gpu_text:
-                    dev_styled = f"{UI.CLOUD}{gpu_text}{UI.RST}"
-                else:
-                    dev_styled = f"{UI.LAYA}{gpu_text}{UI.RST}"
-
-                size_tag = f" ({item['size']})" if item.get("size") else ""
-                model_str = f"{UI.WHITE}{item['name']}{UI.RST}{UI.GRAY}{size_tag}{UI.RST}"
-
-                table.add_row(
-                    str(idx),
-                    item["id"],
-                    Text.from_ansi(st_str),
-                    Text.from_ansi(dev_styled),
-                    Text.from_ansi(model_str),
-                    item.get("desc") or ""
-                )
-
-            console.print()
-            console.print(table)
-            tip_msg = (
-                f"{UI.GRAY}💡 Select: {UI.CYAN}/model <# or id>{UI.RST}{UI.GRAY} (e.g. {UI.CYAN}/model 4{UI.RST}{UI.GRAY} or {UI.CYAN}/model gemma4{UI.RST}{UI.GRAY})\n"
-                f"   One-shot query: {UI.CYAN}@<id> <prompt>{UI.RST}{UI.GRAY} (auto hot-swaps if inactive){UI.RST}\n"
-            )
-            print(tip_msg)
-            return
-
-        print()
-        print(f"{UI.GRAY}╭─── {UI.WHITE}MODEL CATALOG & HARDWARE ENDPOINTS{UI.RST}{UI.GRAY} ─────────────────────────────╮{UI.RST}")
+        rows = []
         for idx, item in enumerate(catalog, 1):
             st = item["status"].upper()
-            st_color = UI.GREEN if st in ("RUNNING", "ONLINE") else UI.GRAY
-            active_mark = f" {UI.AMBER_BOLD}★ ACTIVE{UI.RST}" if item["is_active"] else ""
+            st_str = f"{UI.GREEN}● {st}{UI.RST}" if st in ("RUNNING", "ONLINE") else f"{UI.GRAY}○ {st}{UI.RST}"
+            if item["is_active"]:
+                st_str += f" {UI.AMBER_BOLD}★ ACTIVE{UI.RST}"
+            gpu_text = item["gpu_desc"]
+            if "9000" in gpu_text or "ROCm" in gpu_text:
+                dev_styled = f"{UI.ROCM}{gpu_text}{UI.RST}"
+            elif "9001" in gpu_text or "CUDA" in gpu_text:
+                dev_styled = f"{UI.CUDA}{gpu_text}{UI.RST}"
+            elif "Cloud" in gpu_text:
+                dev_styled = f"{UI.CLOUD}{gpu_text}{UI.RST}"
+            else:
+                dev_styled = f"{UI.LAYA}{gpu_text}{UI.RST}"
             size_tag = f" ({item['size']})" if item.get("size") else ""
-            print(f"{UI.GRAY}│{UI.RST} [{idx}] {UI.CYAN}{item['id']:13s}{UI.RST} {st_color}[{st:7s}]{UI.RST}{active_mark} ➔ {UI.WHITE}{item['name']}{size_tag}{UI.RST}")
-            print(f"{UI.GRAY}│{UI.RST}     Target: {item['gpu_desc']} | {item.get('desc') or ''}")
-        print(f"{UI.GRAY}╰──────────────────────────────────────────────────────────────────╯{UI.RST}")
-        print(f"{UI.GRAY}Type /model <# or id> to select. Inactive models hot-swap automatically.{UI.RST}\n")
+            rows.append([str(idx), item["id"], st_str, dev_styled, f"{UI.WHITE}{item['name']}{UI.RST}{UI.GRAY}{size_tag}{UI.RST}", item.get("desc") or ""])
+        say.group("Models and endpoints")
+        say.table("", ["#", "ID", "Status", "Device and port", "Model", "Specialty"], rows)
+        say.dim("Select with /model <# or id>, or send a one-shot with @<id> <prompt>. Inactive models hot-swap automatically.")
+
+    async def _swap_ready(self, port: int, model_id: str) -> bool:
+        """Port answers /health and LlamaShift agrees the new model is the one running (the old one may still answer)."""
+        if not await asyncio.to_thread(self._port_healthy, port):
+            return False
+        return await asyncio.to_thread(model_is_running, model_id) is not False
+
+    @staticmethod
+    def _port_healthy(port: int) -> bool:
+        try:
+            req = urllib.request.Request(f"http://localhost:{port}/health", headers={"User-Agent": "Antigravity/1.0"})
+            with urllib.request.urlopen(req, timeout=0.8) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
 
     async def switch_model(self, query: str) -> bool:
         """
@@ -1744,7 +1777,7 @@ class MultiGpuHybridSession:
             self.print_models()
             return False
 
-        catalog = self.get_catalog()
+        catalog = await asyncio.to_thread(self.get_catalog)
         selected = None
 
         if query_str.isdigit():
@@ -1752,7 +1785,7 @@ class MultiGpuHybridSession:
             if 1 <= idx <= len(catalog):
                 selected = catalog[idx - 1]
             else:
-                print(UI.warn(f"Model number {idx} out of range (1-{len(catalog)}). Type /models to view list."))
+                say.warn(f"Model number {idx} out of range (1-{len(catalog)}). Type /models to view list.")
                 return False
 
         if not selected:
@@ -1808,11 +1841,11 @@ class MultiGpuHybridSession:
                     selected = id_prefix[0]
                 else:
                     names = ", ".join(f"'{m['id']}'" for m in matches)
-                    print(UI.warn(f"Multiple models matched '{query_str}': {names}. Please use /model <#> to specify."))
+                    say.warn(f"Multiple models matched '{query_str}': {names}. Please use /model <#> to specify.")
                     return False
 
         if not selected:
-            print(UI.warn(f"Model '{query_str}' not found. Type /models to view available models."))
+            say.warn(f"Model '{query_str}' not found. Type /models to view available models.")
             return False
 
         mid = selected["id"]
@@ -1820,12 +1853,12 @@ class MultiGpuHybridSession:
 
         if mtype == "cloud":
             self.active_target = "cloud"
-            print(UI.ok(f"Active target set to Google Cloud Gemini ({self.cloud_model}) via OAuth"))
+            say.ok(f"Active target set to Google Cloud Gemini ({self.cloud_model}) via OAuth")
             return True
 
         if mtype == "system" or mid == "auto":
             self.active_target = "auto"
-            print(UI.ok("Active target set to Laya System 1 Auto-Routing (~33ms)"))
+            say.ok("Active target set to Laya System 1 Auto-Routing (~33ms)")
             return True
 
         # Local model
@@ -1838,19 +1871,21 @@ class MultiGpuHybridSession:
 
         if is_running:
             self.active_target = str(port)
-            self.refresh_endpoints()
-            print(UI.ok(f"Target set to {gpu_name} [{dev_str}] (Port {port}): {model_name} (already running)"))
+            await asyncio.to_thread(self.refresh_endpoints)
+            say.ok(f"Target set to {gpu_name} [{dev_str}] (Port {port}): {model_name} (already running)")
             return True
 
         # Inactive model: trigger hot-swap
-        print(f"\n{UI.AMBER}[⚡ Llama-Shift]{UI.RST} Hot-swapping {UI.WHITE}{model_name}{UI.RST} ({model_size}) onto {UI.CYAN}{gpu_name} [{dev_str}]{UI.RST} (Port {port})...")
+        say.step(f"hot-swapping {model_name} ({model_size}) onto {gpu_name} [{dev_str}] (port {port})")
         res = await asyncio.to_thread(trigger_llamashift_switch, mid)
-        if "error" in res:
-            print(UI.err(f"Llama-Shift switch request failed: {res['error']}"))
+        for warning in res.get("warnings", []):
+            say.warn(str(warning))
+        if "error" in res and not res.get("timeout"):
+            say.err(f"Llama-Shift switch request failed: {res['error']}")
             return False
 
         start_time = time.time()
-        timeout = 45.0
+        timeout = 45.0 + (60.0 if res.get("timeout") else 0.0)
         success = False
         target_port_int = int(port) if str(port).isdigit() else 9000
 
@@ -1860,132 +1895,154 @@ class MultiGpuHybridSession:
                     elapsed = time.time() - start_time
                     spin.update(f"[bold cyan]Loading {model_name} into {gpu_name} [{dev_str}] VRAM... [bold yellow]{elapsed:.1f}s[/bold yellow]")
                     await asyncio.sleep(0.5)
-                    try:
-                        req = urllib.request.Request(f"http://localhost:{target_port_int}/health", headers={"User-Agent": "Antigravity/1.0"})
-                        with urllib.request.urlopen(req, timeout=0.8) as resp:
-                            if resp.status == 200:
-                                success = True
-                                break
-                    except Exception:
-                        pass
+                    if await self._swap_ready(target_port_int, mid):
+                        success = True
+                        break
         else:
-            print(f"{UI.GRAY}[*] Loading weights into VRAM...{UI.RST}", end="", flush=True)
+            say.step("loading weights into VRAM")
             while time.time() - start_time < timeout:
                 await asyncio.sleep(1.0)
-                print(".", end="", flush=True)
-                try:
-                    req = urllib.request.Request(f"http://localhost:{target_port_int}/health", headers={"User-Agent": "Antigravity/1.0"})
-                    with urllib.request.urlopen(req, timeout=0.8) as resp:
-                        if resp.status == 200:
-                            success = True
-                            print()
-                            break
-                except Exception:
-                    pass
+                if await self._swap_ready(target_port_int, mid):
+                    success = True
+                    break
 
         if not success:
-            print(UI.err(f"\nTimed out after {timeout:.0f}s waiting for {model_name} on port {target_port_int}."))
+            say.err(f"Timed out after {timeout:.0f}s waiting for {model_name} on port {target_port_int}.")
+            tail = await asyncio.to_thread(get_logs_tail, mid)
+            if tail:
+                say.detail(tail)
             return False
 
         elapsed = time.time() - start_time
-        if self._active_local_agent:
-            try:
-                await self._active_local_agent.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._active_local_agent = None
+        await self.reset_local_agent()
 
-        self.refresh_endpoints()
+        await asyncio.to_thread(self.refresh_endpoints)
         self.active_target = str(port)
-        print(UI.ok(f"Hot-swap complete in {elapsed:.1f}s! Active target set to {gpu_name} (Port {port}) ➔ {model_name}\n"))
+        say.ok(f"Hot-swap complete in {elapsed:.1f}s. Active target set to {gpu_name} (port {port}): {model_name}")
         return True
 
-    def print_help(self):
-        w = UI.WHITE
-        g = UI.GRAY
-        c = UI.CYAN
-        r = UI.RST
-        print(f"\n{UI.GRAY}╭─── {UI.WHITE}COMMAND PALETTE & KEYBOARD CONTROLS{UI.RST}{UI.GRAY} ────────────────────────╮{UI.RST}")
-        print(f"{g}│{r} {UI.BOLD}Target & Model Switching:{r}")
-        print(f"{g}│{r}   {c}/models{r}              : List all models (running & stopped) in catalog")
-        print(f"{g}│{r}   {c}/model <# or id>{r}     : Switch model (auto hot-swaps inactive via llama-shift)")
-        print(f"{g}│{r}   {c}/auto{r}               : Laya System 1 auto-routing (routes in ~33ms)")
-        print(f"{g}│{r}   {c}/9000{r} or {c}/rocm{r}       : AMD ROCm GPU (Port 9000)")
-        print(f"{g}│{r}   {c}/9001{r} or {c}/cuda{r}       : NVIDIA CUDA RTX 4060 (Port 9001)")
-        print(f"{g}│{r}   {c}/cloud{r}              : Google Gemini (uses your OAuth token)")
-        print(f"{g}│{r}   {c}/mode <target>{r}      : Switch target by alias, model ID, or number")
-        print(f"{g}│{r}   {c}/git-shift [on|off]{r} : Auto-swap to Gemma 4 A4B for git actions & Qwen 27B for deep code")
-        print(f"{g}│{r}")
-        print(f"{g}│{r} {UI.BOLD}One-Shot Prefixes:{r}")
-        print(f"{g}│{r}   {c}@<model_id> <prompt>{r} : Route prompt to any model (auto hot-swaps if inactive)")
-        print(f"{g}│{r}   {c}@rocm <prompt>{r}      : Route single prompt to ROCm (Port 9000)")
-        print(f"{g}│{r}   {c}@cuda <prompt>{r}      : Route single prompt to CUDA (Port 9001)")
-        print(f"{g}│{r}   {c}@cloud <prompt>{r}     : Route single prompt to Cloud Gemini")
-        print(f"{g}│{r}")
-        print(f"{g}│{r} {UI.BOLD}Multi-line Input & Controls:{r}")
-        print(f"{g}│{r}   {c}<Esc>{r}                  : Instantly stop model generation and regain prompt control")
-        print(f"{g}│{r}   {c}<Ctrl+C>{r}               : Cancel current generation (press twice at prompt to exit)")
-        print(f"{g}│{r}   {c}<Enter on empty line>{r}: Submit multi-line prompt (or press Ctrl+D)")
-        print(f"{g}│{r}   {c}/multiline [on|off]{r}  : Toggle multi-line input mode (default: ON)")
-        print(f"{g}│{r}   {c}/singleline{r}          : Switch to single-line prompt mode")
-        print(f"{g}│{r}   {c}/paste{r}               : Enter dedicated paste mode")
-        print(f"{g}│{r}")
-        print(f"{g}│{r} {UI.BOLD}Session Management & Persistence:{r}")
-        print(f"{g}│{r}   {c}/save [name]{r}         : Save conversation session to disk")
-        print(f"{g}│{r}   {c}/load <name>{r}         : Restore a saved session")
-        print(f"{g}│{r}   {c}/sessions{r}            : List all saved sessions")
-        print(f"{g}│{r}   {c}/export [path.md]{r}    : Export transcript as Markdown")
-        print(f"{g}│{r}   {c}/summarize{r}           : View condensed summary of context")
-        print(f"{g}│{r}   {c}/context{r} or {c}/ctx{r}       : Show live context size, headroom & usage bar")
-        print(f"{g}│{r}   {c}/compact [keep]{r}        : Compress history into summary (preserves context)")
-        print(f"{g}│{r}   {c}/autocompact [on|off]{r}  : Auto-compress context before hitting window limit")
-        print(f"{g}│{r}   {c}/curation [on|off]{r}    : Toggle continuous RTX 4060 background hippocampus")
-        print(f"{g}│{r}   {c}/compactor [start]{r}    : Start/check dedicated RTX 4060 context engine")
-        print(f"{g}│{r}   {c}/reload{r}               : Hot-reload agent code in-place (preserves context)")
-        print(f"{g}│{r}   {c}/metrics [on|off]{r}    : Toggle generation speed (tok/s, TTFT) badge")
-        print(f"{g}│{r}")
-        print(f"{g}│{r} {UI.BOLD}Subagent Delegation & Codebase Map:{r}")
-        print(f"{g}│{r}   {c}/spawn <task>{r}         : Delegate background task to NVIDIA RTX 4060 (compactor yields)")
-        print(f"{g}│{r}   {c}/build [cmd]{r}          : Push project build & test verification to NVIDIA RTX 4060 Subagent (:9001)")
-        print(f"{g}│{r}   {c}/tasks{r}                : List active and completed background subagents")
-        print(f"{g}│{r}   {c}/subagent view <#>{r}    : View full output and tool steps of subagent #")
-        print(f"{g}│{r}   {c}/subagent inject <#>{r}  : Inject subagent findings into current conversation context")
-        print(f"{g}│{r}   {c}/subagent cancel <#>{r}  : Cancel a running subagent task")
-        print(f"{g}│{r}   {c}/cuda{r}                 : Show NVIDIA CUDA:9001 resource arbitrator state")
-        print(f"{g}│{r}   {c}/repomap [path]{r}       : Generate AST symbol map of codebase classes & functions")
-        print(f"{g}│{r}   {c}/instructions [view]{r}   : Inspect or toggle auto-injected GEMINI.md / antigravity.md")
-        print(f"{g}│{r}   {c}/hooks [view|refresh]{r}  : Inspect, reload or toggle lifecycle hooks (hooks.json)")
-        print(f"{g}│{r}   {c}/kontexta [on|off|reg]{r} : Inbuilt Kontexta MCP knowledge engine & project linking")
-        print(f"{g}│{r} {UI.BOLD}Autonomous Spec-Driven Workflow:{r}")
-        print(f"{g}│{r}   {c}/brainstorm <idea>{r}    : Full Cloud Spec ➔ Approval ➔ ROCm Code ➔ NVIDIA Build Subagent ➔ Dual Review ➔ Commit")
-        print(f"{g}│{r}")
-        print(f"{g}│{r} {UI.BOLD}Web Search & Live Documentation:{r}")
-        print(f"{g}│{r}   {c}/search <query>{r}       : Live web search (DuckDuckGo + GitHub) with clean snippets")
-        print(f"{g}│{r}   {c}/fetch <url>{r}          : Fetch webpage & convert HTML to clean markdown text")
-        print(f"{g}│{r}")
-        print(f"{g}│{r} {UI.BOLD}Review, Undo & Usage:{r}")
-        print(f"{g}│{r}   {c}/diff [n]{r}            : Show file changes from the nth latest turn (default 1)")
-        print(f"{g}│{r}   {c}/undo{r}                : Revert the latest turn's file changes (asks first)")
-        print(f"{g}│{r}   {c}/stats [reset]{r}       : Per-target tokens, tok/s, TTFT, escalations, errors")
-        print(f"{g}│{r}   {c}/markdown [on|off]{r}   : Toggle rendered Markdown for responses")
-        print(f"{g}│{r}   {c}/prefs [reset]{r}       : Show or reset saved preferences (~/.myagy/config.json)")
-        print(f"{g}│{r}")
-        print(f"{g}│{r} {UI.BOLD}Scripting & Output Formatting:{r}")
-        print(f"{g}│{r}   {c}/json{r}                : Toggle structured JSON output mode")
-        print(f"{g}│{r}   {c}/format json|text{r}    : Switch format between JSON and streaming text")
-        print(f"{g}│{r}")
-        print(f"{g}│{r} {UI.BOLD}Permissions & Decision Control:{r}")
-        print(f"{g}│{r}   {c}/permissions auto{r}    : Enable Laya Bayesian dynamic gating ('noul')")
-        print(f"{g}│{r}   {c}/permissions skip{r}    : Auto-approve all tool execution requests")
-        print(f"{g}│{r}   {c}/permissions safe{r}    : Prompt before running any command")
-        print(f"{g}│{r}   {c}/sudo [status|clear|<cmd>]{r}: Sudo credentials management & elevated execution")
-        print(f"{g}│{r}   {c}!<command>{r}                 : Directly execute a shell command in host terminal")
-        print(f"{g}│{r}   {c}/steps off|<#>{r}        : Disable or set max tool steps per turn (default: off)")
-        print(f"{g}│{r}   {c}/verbose [on|off]{r}     : Toggle full tool arguments & output traces")
-        print(f"{g}│{r}   {c}/laya{r}                 : Display Laya System 1 Decision Model details")
-        print(f"{g}│{r}   {c}/status{r}               : Show active GPU/endpoint status & OAuth")
-        print(f"{g}│{r}   {c}/models{r}               : List endpoints and active GGUF models")
-        print(f"{g}│{r}   {c}/history{r}              : Show cross-GPU conversation history")
-        print(f"{g}│{r}   {c}/clear{r}                : Clear conversation memory")
-        print(f"{g}│{r}   {c}/exit{r}, {c}exit{r}, or {c}quit{r}   : Exit session")
-        print(f"{UI.GRAY}╰──────────────────────────────────────────────────────────────────╯{UI.RST}\n")
+    # ── Prompt chrome: toolbar and startup header ─────────────────────
+
+    def _toolbar_ctx(self) -> Optional[Dict[str, Any]]:
+        """Context metrics cached briefly; computing them can touch the network."""
+        stamp, cached = self._ctx_cache
+        if cached is not None and time.time() - stamp < 10:
+            return cached
+        try:
+            cached = self.get_context_metrics(self.active_target)
+        except Exception:
+            cached = None
+        self._ctx_cache = (time.time(), cached)
+        return cached
+
+    def _target_label_and_model(self, target: str) -> tuple:
+        if target == "auto":
+            return "AUTO", "laya"
+        if target == "cloud":
+            return "CLOUD", self.cloud_model
+        ep = self.endpoints.get(target)
+        if not ep:
+            return str(target), "unknown"
+        label = {"9000": "ROCm:9000", "9001": "CUDA:9001"}.get(target, ep["name"])
+        if ep.get("status") != "online":
+            return label, "offline"
+        return label, ep.get("name_friendly") or ep.get("filename") or "no model"
+
+    def _permission_mode(self) -> tuple:
+        if self.use_laya_adaptive_permissions:
+            return "laya", UI.LAYA
+        if self._dangerously_skip_permissions:
+            return "auto-approve", UI.AMBER
+        return "safe", UI.GREEN
+
+    def _vram_segments(self) -> List[tuple]:
+        """VRAM used/total for the GPU behind the active target (both under auto); empty when unknown."""
+        snap = vram_snapshot()
+        wanted = {"auto": ["amd", "nvidia"], "9000": ["amd"], "9001": ["nvidia"]}.get(self.active_target)
+        if not snap or not wanted:
+            return []
+        labels = {"amd": "rocm", "nvidia": "cuda"}
+        out = []
+        for gpu in sorted((g for g in snap if g["vendor"] in wanted), key=lambda g: wanted.index(g["vendor"])):
+            pct = gpu["used_mib"] / gpu["total_mib"] * 100
+            col = UI.RED_BOLD if pct >= 90 else UI.AMBER if pct >= 75 else UI.CYAN
+            total = gpu["total_mib"] / 1024
+            label = "vram" if len(wanted) == 1 else labels[gpu["vendor"]]
+            out.append((_pt_style(col), f"{label} {gpu['used_mib'] / 1024:.1f}/{total:.0f}G" if total >= 10 else f"{label} {gpu['used_mib'] / 1024:.1f}/{total:.1f}G"))
+        return out
+
+    def toolbar_fragments(self) -> List[tuple]:
+        """Bottom-toolbar segments as (prompt_toolkit style, text) pairs, themed from the active palette."""
+        label, model = self._target_label_and_model(self.active_target)
+        perm, perm_color = self._permission_mode()
+        segments: List[tuple] = [
+            (_pt_style(UI.target_color(self.active_target), bold=True), label),
+            (_pt_style(UI.WHITE), model),
+        ]
+        ctx = self._toolbar_ctx()
+        if ctx:
+            col = UI.RED_BOLD if ctx["percentage"] >= 85 else UI.AMBER if ctx["percentage"] >= 65 else UI.CYAN
+            segments.append((_pt_style(col), f"{_short_count(ctx['tokens'])}/{_short_count(ctx['max_ctx'])} ctx"))
+        segments.extend(self._vram_segments())
+        segments.append((_pt_style(perm_color), perm))
+        try:
+            qs = SubagentManager.get_queue_status()
+            active = int(qs.get("running", 0)) + int(qs.get("queued", 0))
+        except Exception:
+            active = 0
+        if active:
+            segments.append((_pt_style(UI.AMBER), f"{active} subagent{'s' if active != 1 else ''}"))
+        if self.kontexta_sync:
+            segments.append((_pt_style(UI.GREEN), "memory on"))
+
+        sep_style = _pt_style(UI.DARK_GRAY)
+        frags: List[tuple] = [("", " ")]
+        for i, seg in enumerate(segments):
+            if i:
+                frags.append((sep_style, " · "))
+            frags.append(seg)
+        frags.append(("", " "))
+        return frags
+
+    def print_header(self):
+        """Compact startup header: endpoints, target, permissions, repo and memory state."""
+        if self.json_output:
+            return
+        dots = []
+        for key, name in (("9000", "ROCm:9000"), ("9001", "CUDA:9001")):
+            ep = self.endpoints[key]
+            online = ep["status"] == "online"
+            dot = f"{UI.GREEN}●{UI.RST}" if online else f"{UI.RED}○{UI.RST}"
+            model = (ep.get("name_friendly") or ep.get("filename") or "no model") if online else "offline"
+            dots.append(f"{dot} {UI.target_color(key)}{name}{UI.RST} {UI.GRAY}{model}{UI.RST}")
+        cloud_ok = self.has_oauth or bool(self.api_key)
+        dots.append(f"{UI.GREEN + '●' if cloud_ok else UI.AMBER + '○'}{UI.RST} {UI.CLOUD}Cloud{UI.RST} {UI.GRAY}{self.cloud_model if cloud_ok else 'no credentials'}{UI.RST}")
+
+        label, model = self._target_label_and_model(self.active_target)
+        perm, perm_color = self._permission_mode()
+        try:
+            res = subprocess.run(["git", "rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=2)
+            top, _, branch = res.stdout.strip().partition("\n")
+            repo = f"{os.path.basename(top)} ({branch})" if res.returncode == 0 and top else "no git repo"
+        except Exception:
+            repo = "no git repo"
+        project = None
+        if self.enable_kontexta:
+            try:
+                project = KontextaManager.find_project_for_dir(".")
+            except Exception:
+                project = None
+        if not self.kontexta_sync:
+            memory = f"{UI.GRAY}off{UI.RST}"
+        elif kontexta_sync.enabled(self, "."):
+            memory = f"{UI.GREEN}on{UI.RST} {UI.GRAY}({project['name'] if project and project.get('name') else 'project'}){UI.RST}"
+        else:
+            memory = f"{UI.GRAY}on, inactive here{UI.RST}"
+
+        g, r = UI.GRAY, UI.RST
+        say.plain(say.rule_line("myagy", UI.DARK_GRAY))
+        say.plain("  " + "   ".join(dots))
+        say.plain(f"  {g}target{r} {UI.target_color(self.active_target)}{label}{r} {g}{model}{r}  {g}·{r}  {g}permissions{r} {perm_color}{perm}{r}  {g}·{r}  {g}theme{r} {UI.theme_name}")
+        say.plain(f"  {g}repo{r} {repo}  {g}·{r}  {g}memory{r} {memory}")
+        say.plain(f"  {g}/help for commands · Esc stops generation · /theme dark|light|mono{r}")
+        say.plain(say.rule_line("", UI.DARK_GRAY))

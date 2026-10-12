@@ -34,7 +34,19 @@ class ProjectInstructions:
 
     _cached_content: Optional[str] = None
     _cached_files: List[str] = []
+    _cached_paths: List[str] = []
     _cached_mtime: float = 0.0
+
+    @staticmethod
+    def _already_found(path: str, found: List[str]) -> bool:
+        """True if path is the same file as one already in found (handles case-insensitive filesystems)."""
+        for other in found:
+            try:
+                if os.path.samefile(path, other):
+                    return True
+            except OSError:
+                continue
+        return False
 
     @classmethod
     def find_instruction_files(cls, repo_root: str = ".") -> List[str]:
@@ -46,9 +58,7 @@ class ProjectInstructions:
         for rel_path in INSTRUCTION_CANDIDATE_NAMES:
             full_path = os.path.join(repo_root, rel_path)
             if os.path.isfile(full_path):
-                # Avoid duplicates if case-insensitive filesystem
-                real = os.path.realpath(full_path)
-                if real not in [os.path.realpath(p) for p in found]:
+                if not cls._already_found(full_path, found):
                     found.append(full_path)
 
         # Also check .agents/rules/ and .gemini/rules/ if they exist
@@ -60,8 +70,7 @@ class ProjectInstructions:
                 for fn in sorted(os.listdir(rules_dir)):
                     if fn.endswith(".md"):
                         p = os.path.join(rules_dir, fn)
-                        real = os.path.realpath(p)
-                        if real not in [os.path.realpath(x) for x in found]:
+                        if not cls._already_found(p, found):
                             found.append(p)
 
         return found
@@ -77,6 +86,7 @@ class ProjectInstructions:
         if not files:
             cls._cached_content = ""
             cls._cached_files = []
+            cls._cached_paths = []
             return "", []
 
         # Check latest mtime
@@ -89,7 +99,7 @@ class ProjectInstructions:
             not force_refresh
             and cls._cached_content is not None
             and latest_mtime <= cls._cached_mtime
-            and cls._cached_files == files
+            and cls._cached_paths == files
         ):
             return cls._cached_content, cls._cached_files
 
@@ -109,6 +119,7 @@ class ProjectInstructions:
         combined = "\n\n".join(blocks)
         cls._cached_content = combined
         cls._cached_files = loaded_files
+        cls._cached_paths = files
         cls._cached_mtime = latest_mtime
 
         return combined, loaded_files

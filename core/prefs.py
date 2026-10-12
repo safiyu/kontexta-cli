@@ -22,8 +22,10 @@ PREF_DEFAULTS: Dict[str, Any] = {
     "enable_hooks": True,
     "enable_mcp": True,
     "enable_kontexta": True,
+    "kontexta_sync": True,
     "max_tool_steps_per_turn": 0,
     "render_markdown": True,
+    "theme": "dark",
 }
 
 
@@ -36,10 +38,16 @@ def load_prefs(path: str = PREFS_PATH) -> Dict[str, Any]:
         return {}
     if not isinstance(raw, dict):
         return {}
-    return {
-        k: v for k, v in raw.items()
-        if k in PREF_DEFAULTS and isinstance(v, type(PREF_DEFAULTS[k]))
-    }
+    return {k: v for k, v in raw.items() if k in PREF_DEFAULTS and _type_matches(v, PREF_DEFAULTS[k])}
+
+
+def _type_matches(value: Any, default: Any) -> bool:
+    # bool is an int subclass, so a stored true must not pass for an int pref
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, type(default))
 
 
 def save_prefs(values: Dict[str, Any], path: str = PREFS_PATH) -> bool:

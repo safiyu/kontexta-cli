@@ -42,38 +42,38 @@ def load_mcp_servers(enable_kontexta: bool = True) -> List[McpStdioServer | McpS
             )
         return None
 
+    def _add(name: str, cfg) -> None:
+        # First definition wins: "mcpServers" entries take precedence over VS Code "servers"
+        safe_name = str(name).replace(" ", "_")[:64]
+        if not safe_name or safe_name in names_seen:
+            return
+        try:
+            srv = _parse_entry(safe_name, cfg)
+        except Exception as e:
+            print(UI.warn(f"MCP: skipping invalid server '{safe_name}': {e}"))
+            return
+        if srv:
+            servers.append(srv)
+            names_seen.add(safe_name)
+
     if os.path.exists(MCP_CONFIG_PATH) and os.path.getsize(MCP_CONFIG_PATH) > 0:
         try:
             with open(MCP_CONFIG_PATH) as f:
                 raw_text = f.read().strip()
                 data = json.loads(raw_text) if raw_text else {}
-            # Antigravity native / Claude format: dict or list under "mcpServers"
             mcp_servers_raw = data.get("mcpServers")
             if isinstance(mcp_servers_raw, dict):
                 for name, cfg in mcp_servers_raw.items():
-                    safe_name = name.replace(" ", "_")[:64]
-                    if safe_name not in names_seen:
-                        srv = _parse_entry(safe_name, cfg)
-                        if srv:
-                            servers.append(srv)
-                            names_seen.add(safe_name)
+                    _add(name, cfg)
             elif isinstance(mcp_servers_raw, list):
                 for entry in mcp_servers_raw:
-                    name = entry.get("name", "")
-                    if name and name not in names_seen:
-                        srv = _parse_entry(name, entry)
-                        if srv:
-                            servers.append(srv)
-                            names_seen.add(name)
+                    if isinstance(entry, dict):
+                        _add(entry.get("name", ""), entry)
 
-            # VS Code-compatible format: dict under "servers"
-            for name, cfg in data.get("servers", {}).items():
-                safe_name = name.replace(" ", "_")[:64]
-                if safe_name not in names_seen:
-                    srv = _parse_entry(safe_name, cfg)
-                    if srv:
-                        servers.append(srv)
-                        names_seen.add(safe_name)
+            vscode_servers = data.get("servers", {})
+            if isinstance(vscode_servers, dict):
+                for name, cfg in vscode_servers.items():
+                    _add(name, cfg)
         except Exception as e:
             print(UI.warn(f"MCP: could not load {MCP_CONFIG_PATH}: {e}"))
 

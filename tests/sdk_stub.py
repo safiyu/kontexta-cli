@@ -53,11 +53,6 @@ class Agent:
 def install():
     if "google.antigravity" in sys.modules and getattr(sys.modules["google.antigravity"], "_is_stub", False):
         return
-    try:
-        import google.antigravity  # noqa: F401  (real SDK present)
-        return
-    except Exception:
-        pass
 
     google = sys.modules.get("google") or pytypes.ModuleType("google")
     ag = pytypes.ModuleType("google.antigravity")

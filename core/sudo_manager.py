@@ -5,17 +5,24 @@ subagents, and direct terminal executions with interactive password entry and se
 """
 
 import os
-import sys
-import re
 import time
 import atexit
 import shutil
 import getpass
 import tempfile
+import threading
 import subprocess
 from typing import Optional, Tuple
 
 from ..terminal.ui import UI
+from ..terminal import say
+from . import shellparse
+
+try:
+    import termios
+    _TTY_ERRORS = (OSError, termios.error)
+except ImportError:
+    _TTY_ERRORS = (OSError,)
 
 
 class SudoManager:
@@ -32,6 +39,9 @@ class SudoManager:
     _askpass_file: Optional[str] = None
     _shim_file: Optional[str] = None
     _initialized: bool = False
+    _atexit_registered: bool = False
+    _expiry_timer: Optional[threading.Timer] = None
+    _EXPIRY_GRACE: float = 1.0
 
     @classmethod
     def _ensure_initialized(cls):
@@ -80,12 +90,15 @@ class SudoManager:
             os.environ["PATH"] = f"{runtime_dir}:{cur_path}"
         os.environ["SUDO_ASKPASS"] = cls._askpass_file
 
-        atexit.register(cls.cleanup)
+        if not cls._atexit_registered:
+            atexit.register(cls.cleanup)
+            cls._atexit_registered = True
         cls._initialized = True
 
     @classmethod
     def cleanup(cls):
         """Wipes the cached password file and resets system sudo credentials."""
+        cls._cancel_expiry_timer()
         try:
             if cls._pass_file and os.path.exists(cls._pass_file):
                 with open(cls._pass_file, "w", encoding="utf-8") as f:
@@ -142,24 +155,33 @@ class SudoManager:
                 f.write(cleaned_pass + "\n")
             os.chmod(cls._pass_file, 0o600)
 
-        # Refresh sudo timestamp cache
-        try:
-            subprocess.run(
-                ["/usr/bin/sudo", "-S", "-v"],
-                input=(cleaned_pass + "\n").encode("utf-8"),
-                capture_output=True,
-                timeout=5,
-            )
-        except Exception:
-            pass
+        cls._start_expiry_timer()
+
+    @classmethod
+    def _cancel_expiry_timer(cls):
+        timer, cls._expiry_timer = cls._expiry_timer, None
+        if timer is not None:
+            timer.cancel()
+
+    @classmethod
+    def _start_expiry_timer(cls):
+        cls._cancel_expiry_timer()
+        # is_authenticated wipes the secret on expiry, so the file does not outlive the timeout
+        timer = threading.Timer(cls._timeout_seconds + cls._EXPIRY_GRACE, cls.is_authenticated)
+        timer.daemon = True
+        cls._expiry_timer = timer
+        timer.start()
 
     @classmethod
     def clear_credentials(cls):
         """Clears cached credentials and resets sudo state."""
+        cls._cancel_expiry_timer()
         cls._password = None
         cls._authenticated_at = None
         if cls._pass_file and os.path.exists(cls._pass_file):
             try:
+                with open(cls._pass_file, "w", encoding="utf-8") as f:
+                    f.write("\x00" * 64)
                 with open(cls._pass_file, "w", encoding="utf-8") as f:
                     f.write("")
             except Exception:
@@ -201,17 +223,17 @@ class SudoManager:
         and clean visual feedback.
         """
         user = os.environ.get("USER", "root")
-        print(f"\n{UI.AMBER_BOLD}╭──────────────── 🛡️  SUDO PRIVILEGE AUTHENTICATION ────────────────╮{UI.RST}")
-        print(f"{UI.AMBER_BOLD}│{UI.RST}  User        : {UI.WHITE}{user}{UI.RST}")
+        rows = [("user", user)]
         if reason:
             short_reason = reason.strip().replace("\r\n", " ").replace("\n", " ")
             term_cols = shutil.get_terminal_size((100, 24)).columns
             max_reason = max(80, term_cols - 25)
             if len(short_reason) > max_reason:
                 short_reason = short_reason[:max_reason - 3] + "..."
-            print(f"{UI.AMBER_BOLD}│{UI.RST}  Requested   : {UI.CYAN}{short_reason}{UI.RST}")
-        print(f"{UI.AMBER_BOLD}│{UI.RST}  Duration    : 15 minutes session cache (revoke via /sudo clear)")
-        print(f"{UI.AMBER_BOLD}╰────────────────────────────────────────────────────────────────────╯{UI.RST}")
+            rows.append(("command", short_reason))
+        rows.append(("reason", "this command needs root privileges"))
+        rows.append(("cache", "15 minutes (revoke with /sudo clear)"))
+        say.card("sudo required", rows, actions="password prompt follows", style="danger")
 
         for attempt in range(max_attempts):
             try:
@@ -219,34 +241,31 @@ class SudoManager:
                 # Attempt getpass for secure hidden entry
                 try:
                     pw = getpass.getpass(prompt_label)
-                except (termios_error if "termios_error" in globals() else Exception):
-                    from .esc_listener import prompt_input
+                except _TTY_ERRORS:
+                    from ..terminal.esc_listener import prompt_input
                     pw = prompt_input(prompt_label)
             except (KeyboardInterrupt, EOFError):
-                print(f"\n{UI.RED}[x] Password entry cancelled.{UI.RST}\n")
+                say.err("Password entry cancelled.")
                 return False
 
             if not pw or not pw.strip():
-                print(f"{UI.RED}[x] Empty password provided. Entry aborted.{UI.RST}\n")
+                say.err("Empty password provided. Entry aborted.")
                 return False
 
             ok, msg = cls.verify_and_authenticate(pw)
             if ok:
-                print(f"{UI.GREEN_BOLD}[✓] Sudo access authenticated and unlocked for 15 minutes.{UI.RST}\n")
+                say.ok("Sudo access authenticated and unlocked for 15 minutes.")
                 return True
             else:
                 rem = max_attempts - attempt - 1
                 if rem > 0:
-                    print(f"{UI.RED_BOLD}[x] {msg} ({rem} attempt(s) remaining){UI.RST}")
+                    say.err(f"{msg} ({rem} attempt(s) remaining)")
                 else:
-                    print(f"{UI.RED_BOLD}[x] Sudo authentication failed: maximum attempts exceeded.{UI.RST}\n")
+                    say.err("Sudo authentication failed: maximum attempts exceeded.")
 
         return False
 
     @classmethod
     def is_sudo_command(cls, cmd: str) -> bool:
         """Determines if a command line string requires root / sudo elevation."""
-        if not cmd or not isinstance(cmd, str):
-            return False
-        pattern = r'(^|[;&|]|\bdo\b|\bthen\b)\s*(?:/usr/bin/)?sudo\b'
-        return bool(re.search(pattern, cmd.strip()))
+        return shellparse.elevates(cmd)

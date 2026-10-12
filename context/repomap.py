@@ -1,7 +1,8 @@
 """Repository AST Symbol Map: Generates dense structural outlines of codebase symbols and signatures."""
 
-import os
 import ast
+import hashlib
+import os
 from typing import List, Dict, Any, Optional
 
 from ..terminal.ui import UI, RICH_AVAILABLE, console
@@ -33,36 +34,43 @@ class RepoMap:
         "root": None,
         "max_mtime": 0.0,
         "file_count": 0,
+        "paths_hash": "",
         "markdown": "",
         "cached_at": 0.0,
     }
 
     @classmethod
-    def get_fast_mtime_signature(cls, root_dir: str = ".") -> tuple[float, int]:
-        """Calculates highest modification time and file count across python files in <2ms."""
+    def _signature(cls, root_dir: str = ".") -> tuple[float, int, str]:
+        """Highest mtime, file count and a hash of the sorted relative paths (detects renames)."""
         max_m = 0.0
-        count = 0
+        paths = []
         try:
             for dirpath, dirnames, filenames in os.walk(root_dir):
                 dirnames[:] = [d for d in dirnames if d not in cls.EXCLUDE_DIRS and not d.startswith(".")]
                 for fn in filenames:
                     if fn.endswith(".py"):
-                        count += 1
+                        full = os.path.join(dirpath, fn)
+                        paths.append(os.path.relpath(full, root_dir))
                         try:
-                            m = os.path.getmtime(os.path.join(dirpath, fn))
-                            if m > max_m:
-                                max_m = m
-                        except Exception:
+                            max_m = max(max_m, os.path.getmtime(full))
+                        except OSError:
                             pass
-        except Exception:
+        except OSError:
             pass
+        digest = hashlib.sha1("\n".join(sorted(paths)).encode("utf-8", errors="replace")).hexdigest()
+        return max_m, len(paths), digest
+
+    @classmethod
+    def get_fast_mtime_signature(cls, root_dir: str = ".") -> tuple[float, int]:
+        """Calculates highest modification time and file count across python files."""
+        max_m, count, _ = cls._signature(root_dir)
         return max_m, count
 
     @classmethod
     def get_cached_map(cls, root_dir: str = ".", max_chars: int = 14000) -> str:
         """Returns cached markdown AST symbol map, auto-refreshing only if files changed."""
         root_abs = os.path.abspath(root_dir)
-        cur_mtime, cur_count = cls.get_fast_mtime_signature(root_abs)
+        cur_mtime, cur_count, cur_hash = cls._signature(root_abs)
 
         if cur_count == 0:
             return ""
@@ -71,6 +79,7 @@ class RepoMap:
             cls._cache["root"] == root_abs
             and cls._cache["max_mtime"] == cur_mtime
             and cls._cache["file_count"] == cur_count
+            and cls._cache.get("paths_hash") == cur_hash
             and cls._cache["markdown"]
         ):
             return cls._cache["markdown"]
@@ -83,6 +92,7 @@ class RepoMap:
             "root": root_abs,
             "max_mtime": cur_mtime,
             "file_count": cur_count,
+            "paths_hash": cur_hash,
             "markdown": md,
             "cached_at": cur_mtime,
         }
