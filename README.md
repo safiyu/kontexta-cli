@@ -25,6 +25,8 @@ An asynchronous, dual-accelerator pairing framework and terminal copilot built o
   * Hybrid pipeline: Cloud Gemini (architecture & spec) ➔ User Approval ➔ AMD ROCm (implementation) ➔ NVIDIA Subagent (build & test verification) ➔ Local & Cloud Dual Review ➔ User Approval ➔ Git Commit.
 * **Live Web Search & Documentation Scraper (`web_search.py` / `/search`, `/fetch`)**:
   * Zero external pip dependencies: multi-source live web search (DuckDuckGo + GitHub) and HTML-to-clean-Markdown webpage extractor.
+* **Kontexta Journal Sync (`/memory`)**: brainstorm results and commits are journaled to the project's Kontexta journal (redacted, background, opt-out with `/memory off`) so future sessions can pick up context.
+* **Answer Theme and Turn Receipt**: styled Markdown answers plus a compact footer of files changed (+/-), commands run, time and tok/s.
 * **Per-Turn Checkpoints (`/diff`, `/undo`)**:
   * Every turn that changes files is snapshotted as git tree objects (real index untouched), so you can review or revert exactly what the agent did, including changes made by shell commands.
 * **Usage Ledger (`/stats`)**: per-target tokens, tok/s, TTFT, time, escalations and errors for the session.
@@ -90,12 +92,20 @@ pip install -r requirements.txt   # google-antigravity, rich, prompt_toolkit (hi
 pip install -r requirements-dev.txt  # adds pytest
 ```
 
-Run the tests (no SDK, GPUs or network needed):
+Run the tests (the SDK is stubbed, no GPUs or network needed):
 ```bash
 python3 -m pytest
 ```
 
-### 2. Configure Bash Alias
+### 2. Environment Overrides (optional)
+| Variable | Default | Purpose |
+|---|---|---|
+| `MYAGY_MODEL_DIR` | `/home/safiyu/models` | GGUF model directory (also used by `launch_cuda_compactor.sh`) |
+| `MYAGY_KONTEXTA_MCP` | `~/Projects/kontexta/apps/mcp/dist/index.js` | Kontexta MCP entrypoint |
+| `MYAGY_KONTEXTA_DATA` | `~/.local/share/kontexta` | Kontexta data directory |
+| `LLAMA_SERVER_BIN` | `/home/safiyu/llama.cpp-cuda/build/bin/llama-server` | llama-server binary for the compactor script |
+
+### 3. Configure Bash Alias
 To launch `myagy` from anywhere in your terminal, add the alias to your `~/.bashrc`:
 
 ```bash

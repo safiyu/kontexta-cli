@@ -27,6 +27,8 @@ from ..terminal.ui import UI, RICH_AVAILABLE, console
 from ..terminal.esc_listener import prompt_input
 from ..config import PLANS_DIR
 from ..context.repomap import RepoMap
+from ..context import kontexta_sync
+from ..terminal import say
 from ..context.instructions import ProjectInstructions
 
 
@@ -37,6 +39,18 @@ class BrainstormWorkflow:
     def _slugify(cls, text: str) -> str:
         s = re.sub(r"[^\w\s-]", "", text).strip().lower()
         return re.sub(r"[-\s]+", "_", s)[:40] or "task_plan"
+
+    _CLEAN_PHRASES = re.compile(r"\b(?:NO|0|ZERO|WITHOUT(?: ANY)?)\s+(?:TEST\s+)?(?:FAIL(?:ED|URES?|S)?|ERRORS?)\b|\b0\s+FAIL(?:ED|URES?)?\b")
+    _PROBLEM_WORDS = re.compile(r"\b(?:FAIL|FAILED|FAILING|FAILURES?|ERRORS?)\b")
+
+    @classmethod
+    def _build_failed(cls, task: Any) -> bool:
+        """Prefers the real exit code; falls back to scanning the diagnosis text for unnegated failure words."""
+        exit_code = getattr(task, "exit_code", None)
+        if exit_code is not None:
+            return exit_code != 0
+        text = cls._CLEAN_PHRASES.sub(" ", (task.result or "").upper())
+        return bool(cls._PROBLEM_WORDS.search(text))
 
     @classmethod
     def _detect_test_command(cls, repo_root: str = ".") -> Optional[str]:
@@ -102,11 +116,19 @@ class BrainstormWorkflow:
         except Exception:
             return set()
 
+    @staticmethod
+    def _show_markdown(session: Any, text: str, title: str, style: str = "cyan"):
+        """Renders spec or review text as a titled Markdown panel, or plain text without Rich or in json mode."""
+        if RICH_AVAILABLE and not session.json_output and not say.is_json():
+            console.print(Panel(Markdown(text or ""), title=f"[bold {style}]{title}[/bold {style}]", border_style=style))
+        else:
+            say.plain(f"\n{text}\n")
+
     @classmethod
     async def execute_workflow(cls, idea: str, session: Any, repo_root: str = "."):
         """Executes the full spec-driven brainstorm-to-commit lifecycle."""
         if not idea.strip():
-            print(UI.warn("Usage: /brainstorm <feature, refactor, or bugfix idea>"))
+            say.warn("Usage: /brainstorm <feature, refactor, or bugfix idea>")
             return
 
         slug = cls._slugify(idea)
@@ -116,15 +138,15 @@ class BrainstormWorkflow:
         # Files already dirty before the run are excluded from the final commit
         dirty_before = cls._git_paths(repo_root)
         if dirty_before:
-            print(UI.warn(f"{len(dirty_before)} file(s) already modified before this run will be left out of the commit."))
+            say.warn(f"{len(dirty_before)} file(s) already modified before this run will be left out of the commit.")
 
-        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}SPEC-DRIVEN WORKFLOW INITIALIZED{UI.RST}{UI.DARK_GRAY} ─────────────────────────────╮{UI.RST}")
-        print(f"{UI.DARK_GRAY}│{UI.RST}  Idea   : {UI.CYAN}{idea}{UI.RST}")
-        print(f"{UI.DARK_GRAY}│{UI.RST}  Phases : Cloud Plan ➔ Approval ➔ ROCm Code ➔ NVIDIA Build Subagent ➔ Dual Review ➔ Commit")
-        print(f"{UI.DARK_GRAY}╰────────────────────────────────────────────────────────────────────────╯\n")
+        say.card("Spec-driven workflow", [
+            ("idea", idea),
+            ("phases", "cloud plan, approval, ROCm code, NVIDIA build, dual review, commit"),
+        ], style="info")
 
         # ── PHASE 1: Cloud Brainstorming & Spec Drafting ──────────────────
-        print(f"{UI.CLOUD_BOLD}[Phase 1/5: Cloud Brainstorming & Plan Drafting via Gemini]{UI.RST}")
+        say.group("Phase 1/5: cloud brainstorming and plan drafting (Gemini)")
         ast_summary = RepoMap.get_cached_map(repo_root) or "No AST map available."
         guidelines, loaded_guides = ProjectInstructions.load_instructions(repo_root)
         guide_context = f"\n\nProject Guidelines ({', '.join(loaded_guides)}):\n{guidelines}" if guidelines else ""
@@ -144,37 +166,35 @@ class BrainstormWorkflow:
 
         plan_content = await session.chat_cloud_oauth(brainstorm_prompt, with_project_context=False)
         if not plan_content.strip():
-            print(UI.err("Failed to generate plan from Cloud Gemini."))
+            say.err("Failed to generate plan from Cloud Gemini.")
             return
 
         with open(plan_path, "w", encoding="utf-8") as f:
             f.write(plan_content)
 
-        print(f"\n{UI.GREEN_BOLD}✓ Plan generated and saved to {plan_path}{UI.RST}\n")
+        say.ok(f"Plan generated and saved to {plan_path}")
 
         # ── GATE 1: Human Approval of Plan ───────────────────────────────
-        if RICH_AVAILABLE and not session.json_output:
-            console.print(Panel(Markdown(plan_content), title="[bold cyan]Implementation Spec & Milestone Plan[/bold cyan]", border_style="cyan"))
-        else:
-            print(f"\n{plan_content}\n")
+        cls._show_markdown(session, plan_content, "Implementation Spec & Milestone Plan")
 
-        print(f"{UI.AMBER_BOLD}╭─── GATE 1: SPEC APPROVAL ──────────────────────────────────────────╮{UI.RST}")
-        print(f"{UI.AMBER_BOLD}│{UI.RST}  [y] Proceed to local implementation on AMD ROCm (:9000)")
-        print(f"{UI.AMBER_BOLD}│{UI.RST}  [n] Abort workflow")
-        print(f"{UI.AMBER_BOLD}╰────────────────────────────────────────────────────────────────────╯{UI.RST}")
+        say.card("Gate 1: spec approval", [
+            ("plan", plan_path),
+            ("on yes", "implement locally on AMD ROCm (:9000)"),
+            ("on no", "abort the workflow"),
+        ], actions="[y]es / [n]o", style="warn")
 
         try:
             choice = (await asyncio.to_thread(prompt_input, f"{UI.AMBER_BOLD}Approve plan for implementation? [y/N]: {UI.RST}")).strip().lower()
         except (KeyboardInterrupt, EOFError):
-            print(UI.warn("\nWorkflow aborted by user."))
+            say.warn("Workflow aborted by user.")
             return
 
         if choice not in ("y", "yes"):
-            print(UI.warn("Plan not approved. Workflow cancelled. You can review or edit the plan in: " + plan_path))
+            say.warn("Plan not approved. Workflow cancelled. You can review or edit the plan in: " + plan_path)
             return
 
         # ── PHASE 2: Local Implementation on AMD ROCm (:9000) ─────────────
-        print(f"\n{UI.ROCM_BOLD}[Phase 2/5: Local Implementation on AMD ROCm (:9000)]{UI.RST}")
+        say.group("Phase 2/5: local implementation (AMD ROCm :9000)")
         session.active_target = "9000"
         implement_prompt = (
             f"Here is the approved implementation plan:\n\n{plan_content}\n\n"
@@ -185,10 +205,10 @@ class BrainstormWorkflow:
         await session.chat_turn(implement_prompt, target="9000")
 
         # ── PHASE 3: Autonomous Build & Test Verification on NVIDIA Subagent (:9001) ──
-        print(f"\n{UI.CUDA_BOLD}[Phase 3/5: Verification & Automated Self-Healing Tests on NVIDIA Subagent (:9001)]{UI.RST}")
+        say.group("Phase 3/5: verification and self-healing tests (NVIDIA subagent :9001)")
         test_cmd = cls._detect_test_command(repo_root)
         if test_cmd:
-            print(f"{UI.CUDA}⚡ Pushing build & test suite to NVIDIA RTX 4060 Subagent: {UI.WHITE}{test_cmd}{UI.RST}")
+            say.step(f"running tests on the NVIDIA subagent: {test_cmd}")
             build_subagent = session.run_build_subagent(custom_cmd=test_cmd, repo_root=repo_root)
 
             # Await subagent completion
@@ -196,23 +216,15 @@ class BrainstormWorkflow:
                 await asyncio.sleep(0.4)
 
             if build_subagent.status == "completed":
-                print(f"\n{UI.CUDA_BOLD}⚡ NVIDIA Subagent Build & Test Report:{UI.RST}")
-                if RICH_AVAILABLE and not session.json_output:
-                    console.print(Panel(Markdown(build_subagent.result or ""), title="[bold green]NVIDIA Subagent Diagnostics[/bold green]", border_style="green"))
-                else:
-                    print(build_subagent.result)
+                cls._show_markdown(session, build_subagent.result or "", "NVIDIA Subagent Diagnostics", "green")
 
                 # Check if failure was diagnosed or exit code != 0
-                is_failed = False
-                res_upper = (build_subagent.result or "").upper()
-                if "FAIL" in res_upper or "ERROR" in res_upper or build_subagent.error:
-                    if not ("PASS" in res_upper and "0 FAIL" in res_upper and "NO ERROR" in res_upper):
-                        is_failed = True
+                is_failed = cls._build_failed(build_subagent)
 
                 if not is_failed:
-                    print(f"\n{UI.GREEN_BOLD}✓ Automated tests PASSED cleanly via NVIDIA Subagent.{UI.RST}")
+                    say.ok("Automated tests passed cleanly via the NVIDIA subagent.")
                 else:
-                    print(f"\n{UI.AMBER_BOLD}⚠ Test failures identified by NVIDIA Subagent. Engaging ROCm to apply diagnosed fixes...{UI.RST}")
+                    say.warn("Test failures identified by the NVIDIA subagent. Engaging ROCm to apply the diagnosed fixes.")
                     fix_prompt = (
                         f"The NVIDIA RTX 4060 Subagent executed the test/build command '{test_cmd}' and diagnosed the following failures:\n\n"
                         f"--- [SUBAGENT DIAGNOSIS] ---\n{build_subagent.result}\n--- [END DIAGNOSIS] ---\n\n"
@@ -220,19 +232,19 @@ class BrainstormWorkflow:
                     )
                     await session.chat_turn(fix_prompt, target="9000")
             else:
-                print(f"{UI.RED_BOLD}✗ NVIDIA Subagent build execution failed: {build_subagent.error}{UI.RST}")
+                say.err(f"NVIDIA subagent build execution failed: {build_subagent.error}")
         else:
-            print(f"{UI.GRAY}No automated test script detected. Skipping Phase 3 test run.{UI.RST}")
+            say.dim("No automated test script detected. Skipping Phase 3 test run.")
 
         # ── PHASE 4: Local Code Review ────────────────────────────────────
         diff_text = cls._get_git_diff(repo_root)
         if not diff_text:
-            print(UI.warn("No git changes detected after implementation phase."))
+            say.warn("No git changes detected after implementation phase.")
             return
 
         review_target = "9001" if session.endpoints.get("9001", {}).get("status") == "online" else "9000"
         target_name = session.endpoints.get(review_target, {}).get("name", review_target)
-        print(f"\n{UI.CUDA_BOLD}[Phase 4/5: Local Functional Code Review on {target_name}]{UI.RST}")
+        say.group(f"Phase 4/5: local functional code review ({target_name})")
         local_review_prompt = (
             f"Perform a concise functional code review of this git diff:\n\n```diff\n{diff_text[:6000]}\n```\n\n"
             f"Check for:\n"
@@ -244,7 +256,7 @@ class BrainstormWorkflow:
         await session.chat_turn(local_review_prompt, target=review_target)
 
         # ── PHASE 5: Cloud Adversarial Second-Opinion Code Review ─────────
-        print(f"\n{UI.CLOUD_BOLD}[Phase 5/5: Cloud Adversarial Second-Opinion Review via Gemini]{UI.RST}")
+        say.group("Phase 5/5: cloud adversarial second-opinion review (Gemini)")
         cloud_review_prompt = (
             f"You are the Principal Security & Architecture Reviewer. Scrutinize the following git diff for a feature titled '{idea}':\n\n"
             f"```diff\n{diff_text[:7000]}\n```\n\n"
@@ -257,12 +269,12 @@ class BrainstormWorkflow:
         cloud_review = await session.chat_cloud_oauth(cloud_review_prompt, with_project_context=False)
 
         if "VERIFIED_CLEAN" not in cloud_review.upper() and len(cloud_review.strip()) > 30:
-            print(f"\n{UI.AMBER_BOLD}Cloud Reviewer identified potential improvements or edge cases:{UI.RST}\n")
-            print(cloud_review)
+            say.warn("Cloud reviewer identified potential improvements or edge cases.")
+            cls._show_markdown(session, cloud_review, "Cloud Review", "yellow")
             try:
                 apply_fixes = (await asyncio.to_thread(prompt_input, f"\n{UI.AMBER_BOLD}Apply Cloud Reviewer fixes locally on ROCm? [y/N]: {UI.RST}")).strip().lower()
                 if apply_fixes in ("y", "yes"):
-                    print(f"{UI.ROCM_BOLD}Applying reviewer recommendations...{UI.RST}")
+                    say.step("applying reviewer recommendations on ROCm")
                     fix_cloud_prompt = (
                         f"The Cloud Reviewer provided these recommendations on our changes:\n\n{cloud_review}\n\n"
                         f"Use tools to apply these fixes to the files."
@@ -271,27 +283,38 @@ class BrainstormWorkflow:
             except (KeyboardInterrupt, EOFError):
                 pass
         else:
-            print(f"{UI.GREEN_BOLD}✓ Cloud Reviewer confirmed changes are sound.{UI.RST}")
+            say.ok("Cloud reviewer confirmed the changes are sound.")
 
         # ── GATE 2: Git Commit Approval ───────────────────────────────────
         final_diff = cls._get_git_diff(repo_root)
         diff_lines = len(final_diff.splitlines())
-        print(f"\n{UI.GREEN_BOLD}╭─── WORKFLOW COMPLETE: READY TO COMMIT ({diff_lines} lines changed) ─────────╮{UI.RST}")
         commit_msg = f"feat({slug[:20]}): {idea}"
-        print(f"{UI.DARK_GRAY}│{UI.RST}  Proposed Commit Message: {UI.WHITE}{commit_msg}{UI.RST}")
-        print(f"{UI.DARK_GRAY}╰────────────────────────────────────────────────────────────────────────╯{UI.RST}")
+        say.card("Workflow complete: ready to commit", [
+            ("idea", idea),
+            ("files changed", str(len(cls._git_paths(repo_root) - dirty_before))),
+            ("lines changed", str(diff_lines)),
+            ("commit message", commit_msg),
+        ], actions="[y]es / [n]o", style="info")
 
         try:
             do_commit = (await asyncio.to_thread(prompt_input, f"{UI.GREEN_BOLD}Commit these changes to git? [y/N]: {UI.RST}")).strip().lower()
             if do_commit in ("y", "yes"):
                 to_add = sorted(cls._git_paths(repo_root) - dirty_before)
                 if not to_add:
-                    print(UI.warn("No new changes to commit."))
+                    say.warn("No new changes to commit.")
                     return
                 subprocess.run(["git", "add", "-A", "--", *to_add], cwd=repo_root, check=True)
                 subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_root, check=True)
-                print(UI.ok(f"Changes successfully committed: '{commit_msg}'"))
+                say.ok(f"Changes successfully committed: '{commit_msg}'")
+                kontexta_sync.sync_event(
+                    session, "brainstorm", idea, repo_root, commit=kontexta_sync.commit_info(repo_root),
+                    outcome="implemented, reviewed and committed", spec_path=plan_path,
+                )
             else:
-                print(UI.warn("Changes left in working directory uncommitted."))
+                say.warn("Changes left in working directory uncommitted.")
+                kontexta_sync.sync_event(
+                    session, "brainstorm", idea, repo_root,
+                    outcome="implemented and reviewed, left uncommitted", spec_path=plan_path,
+                )
         except Exception as e:
-            print(UI.err(f"Commit operation failed or skipped: {e}"))
+            say.err(f"Commit operation failed or skipped: {e}")

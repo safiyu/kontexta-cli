@@ -3,27 +3,24 @@ Subagent delegation engine: Asynchronously queues and executes on-demand backgro
 strictly 1-at-a-time on the NVIDIA RTX 4060 accelerator to honor VRAM and compute constraints.
 """
 
+import os
 import time
 import json
 import re
 import shutil
+import signal
 import asyncio
 import urllib.request
 from typing import Optional, List, Dict, Any
 
-try:
-    from rich.table import Table
-    from rich.text import Text
-    from rich import box
-except ImportError:
-    pass
-
 from google.antigravity import Agent, LocalOpenAIAgentConfig, CapabilitiesConfig, hooks, types
 from google.antigravity.hooks import policy
 
-from ..terminal.ui import UI, RICH_AVAILABLE, console
+from ..terminal.ui import UI
+from ..terminal import say
 from ..core.coordinator import CudaCoordinator
 from ..core.llamashift import trigger_llamashift_switch
+from ..core import shellparse
 
 
 class SubagentTask:
@@ -44,6 +41,7 @@ class SubagentTask:
         self.result: Optional[str] = None
         self.tool_calls: List[Dict[str, Any]] = []
         self.error: Optional[str] = None
+        self.exit_code: Optional[int] = None
         self.injected: bool = False
         self.mode: str = "pending"  # tools | no-tools (fallback)
         self._async_task: Optional[asyncio.Task] = None
@@ -122,11 +120,11 @@ class SubagentManager:
         queued_ahead = sum(1 for t in cls._tasks if t.status == "queued") - 1
         if not session.json_output:
             if queued_ahead > 0:
-                print(f"\n{UI.CUDA_BOLD}⚡ [Subagent #{task.id} Queued (Position #{queued_ahead + 1})]{UI.RST} {UI.WHITE}{description}{UI.RST}")
-                print(f"{UI.DARK_GRAY}   Enqueued behind active task. Strict 1-at-a-time execution on NVIDIA RTX 4060. Type {UI.CYAN}/tasks{UI.DARK_GRAY} to view queue.{UI.RST}\n", flush=True)
+                say.step(f"subagent #{task.id} queued (position {queued_ahead + 1}): {description}")
+                say.detail("  one task at a time on :9001; /tasks shows the queue")
             else:
-                print(f"\n{UI.CUDA_BOLD}⚡ [Subagent #{task.id} Launched]{UI.RST} {UI.WHITE}{description}{UI.RST}")
-                print(f"{UI.DARK_GRAY}   Target: NVIDIA RTX 4060 (:9001) │ Background Compactor paused. Type {UI.CYAN}/tasks{UI.DARK_GRAY} to check status.{UI.RST}\n", flush=True)
+                say.step(f"subagent #{task.id} launched: {description}")
+                say.detail("  :9001 compactor paused while it runs; /tasks shows status")
 
         return task
 
@@ -218,7 +216,7 @@ class SubagentManager:
                 # Synchronously acquire lock so compactor yields
                 CudaCoordinator.reserve_for_subagent()
                 if cls._session and not getattr(cls._session, "json_output", False):
-                    print(f"\n{UI.CUDA_BOLD}⚡ [Subagent #{task.id} Executing]{UI.RST} {UI.WHITE}{task.description}{UI.RST} {UI.GRAY}(executing on NVIDIA RTX 4060...){UI.RST}\n", flush=True)
+                    say.detail(f"subagent #{task.id} executing on :9001")
 
                 task._async_task = asyncio.create_task(cls._run_worker(task, cls._session))
                 try:
@@ -235,6 +233,40 @@ class SubagentManager:
                 await asyncio.sleep(1.0)
 
     TOOL_RUN_TIMEOUT = 300
+    SHELL_TIMEOUT = 600
+
+    @staticmethod
+    def _kill_process_group(proc: "asyncio.subprocess.Process"):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, AttributeError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+    @classmethod
+    async def _run_shell(cls, shell_cmd: str) -> "tuple[int, str]":
+        """Runs a shell command in its own process group, killing it on timeout or cancellation."""
+        proc = await asyncio.create_subprocess_shell(
+            shell_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=cls.SHELL_TIMEOUT)
+        except BaseException as exc:
+            cls._kill_process_group(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            if isinstance(exc, asyncio.TimeoutError):
+                raise TimeoutError(f"Command timed out after {cls.SHELL_TIMEOUT}s and was killed")
+            raise
+        output = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
+        return proc.returncode, output
 
     @classmethod
     async def _run_with_tools(cls, task: SubagentTask, session: Any, ep: Dict[str, Any]) -> str:
@@ -248,9 +280,18 @@ class SubagentManager:
         def background_permission(tool: Any, args: Dict[str, Any]) -> bool:
             # Background agents can't prompt the user: only Laya-approved safe actions run
             name = getattr(tool, "name", str(tool))
+            cmd_line = args.get("CommandLine", "") if isinstance(args, dict) else ""
+            quiet = getattr(session, "json_output", False)
+            if shellparse.elevates(cmd_line):
+                task.tool_calls.append({"name": f"{name} (denied: sudo is not allowed in background tasks)", "args": args, "timestamp": time.time()})
+                if not quiet:
+                    say.warn(f"Subagent #{task.id}: denied {name} (sudo is not allowed in background tasks)")
+                return False
             safe, _ = session.laya.evaluate_action_safety(f"Tool: {name} Args: {json.dumps(args, default=str)}")
             if not safe:
                 task.tool_calls.append({"name": f"{name} (denied: not auto-approved as safe)", "args": args, "timestamp": time.time()})
+                if not quiet:
+                    say.warn(f"Subagent #{task.id}: denied {name} (not auto-approved as safe)")
             return safe
 
         instructions = (
@@ -359,18 +400,14 @@ class SubagentManager:
                     "args": {"CommandLine": shell_cmd},
                     "timestamp": time.time(),
                 })
+                if shellparse.elevates(shell_cmd):
+                    raise RuntimeError("sudo is not allowed in background subagent tasks")
                 try:
-                    proc = await asyncio.create_subprocess_shell(
-                        shell_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    stdout, stderr = await proc.communicate()
-                    return_code = proc.returncode
-                    cmd_output = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
+                    return_code, cmd_output = await cls._run_shell(shell_cmd)
                 except Exception as ex:
-                    return_code = 1
+                    return_code = 124 if isinstance(ex, TimeoutError) else 1
                     cmd_output = f"Execution error: {ex}"
+                task.exit_code = return_code
 
                 subagent_instructions = (
                     "You are an expert autonomous sub-agent running on the NVIDIA RTX 4060 accelerator.\n"
@@ -446,124 +483,65 @@ class SubagentManager:
             # Terminal notification
             if not session.json_output:
                 queued_left = sum(1 for t in cls._tasks if t.status == "queued")
-                queue_suffix = f" {UI.AMBER}({queued_left} next in queue){UI.RST}" if queued_left > 0 else ""
+                queue_suffix = f" ({queued_left} next in queue)" if queued_left > 0 else ""
+                elapsed = say.fmt_elapsed(task.duration or 0.0)
                 term_cols = shutil.get_terminal_size((120, 24)).columns
                 max_desc = max(80, term_cols - 40)
                 desc_str = task.description if len(task.description) <= max_desc else (task.description[:max_desc - 3] + "...")
                 if task.status == "completed":
-                    print(
-                        f"\n{UI.GREEN_BOLD}✓ [Subagent #{task.id} Completed]{UI.RST} "
-                        f"{UI.WHITE}{desc_str}{UI.RST} "
-                        f"{UI.GRAY}(in {task.duration:.1f}s via RTX 4060){UI.RST}{queue_suffix}\n"
-                        f"{UI.DARK_GRAY}   ➔ Type {UI.CYAN}/subagent view {task.id}{UI.DARK_GRAY} to inspect result or {UI.CYAN}/subagent inject {task.id}{UI.DARK_GRAY} to add to session history.{UI.RST}\n",
-                        flush=True,
-                    )
+                    say.ok(f"Subagent #{task.id} done in {elapsed}: {desc_str}{queue_suffix}")
+                    say.dim(f"  /subagent view {task.id} to inspect, /subagent inject {task.id} to add to history")
                 elif task.status == "failed":
-                    print(
-                        f"\n{UI.RED_BOLD}✗ [Subagent #{task.id} Failed]{UI.RST} "
-                        f"{UI.WHITE}{desc_str}{UI.RST}: {UI.RED}{task.error}{UI.RST}{queue_suffix}\n",
-                        flush=True,
-                    )
+                    say.err(f"Subagent #{task.id} failed after {elapsed}: {desc_str}: {task.error}{queue_suffix}")
+                elif task.status == "cancelled":
+                    say.step(f"subagent #{task.id} cancelled after {elapsed}: {desc_str}")
 
     @classmethod
     def print_tasks(cls, session: Any):
         """Renders an interactive status table of all background subagents with FIFO queue ordering."""
         if not cls._tasks:
-            print(f"\n{UI.GRAY}(no background subagents spawned. Use /spawn <task> to delegate){UI.RST}\n")
+            say.dim("(no background subagents spawned. Use /spawn <task> to delegate)")
             return
 
         coord_status = CudaCoordinator.status_summary()
         c_state = coord_status["state"].upper()
-        if c_state == "IDLE":
-            c_badge = f"{UI.GREEN}IDLE{UI.RST}"
-        elif c_state == "SUBAGENT":
-            c_badge = f"{UI.CUDA_BOLD}SUBAGENT RUNNING{UI.RST}"
-        else:
-            c_badge = f"{UI.AMBER}COMPACTING{UI.RST}"
-
+        c_label = {"IDLE": "idle", "SUBAGENT": "subagent running"}.get(c_state, "compacting")
         queued_tasks = sum(1 for t in cls._tasks if t.status == "queued")
-        queue_tag = f" │ Queue: {UI.AMBER}{queued_tasks} waiting{UI.RST}" if queued_tasks > 0 else f" │ Queue: {UI.GREEN}Empty{UI.RST}"
+        queue_tag = f"{queued_tasks} waiting" if queued_tasks else "empty"
 
-        if RICH_AVAILABLE and not session.json_output:
-            table = Table(
-                title=Text.from_ansi(f"{UI.WHITE}BACKGROUND SUBAGENTS ON NVIDIA RTX 4060{UI.RST} │ Port 9001: {c_badge}{queue_tag}"),
-                box=box.ROUNDED,
-                header_style="bold cyan",
-                border_style="bright_black",
-            )
-            table.add_column("#", justify="center", style="bold dim", width=5)
-            table.add_column("Status", style="bold", width=14)
-            table.add_column("Duration", justify="right", width=9)
-            table.add_column("Task Description", style="white", ratio=3, overflow="fold")
-            table.add_column("Result / Preview", style="dim", ratio=3, overflow="fold")
-            table.add_column("Injected", justify="center", width=8)
+        marks = {"completed": f"{UI.GREEN}done{UI.RST}", "running": f"{UI.CUDA_BOLD}running{UI.RST}",
+                 "cancelled": f"{UI.GRAY}cancelled{UI.RST}", "failed": f"{UI.RED}failed{UI.RST}"}
+        rows = []
+        for t in cls._tasks:
+            dur_str = f"{t.duration:.1f}s" if t.duration is not None else (f"{time.time() - t.started_at:.1f}s" if t.started_at else "-")
+            preview = (t.result or t.error or "").replace("\n", " ").strip()
+            if len(preview) > 100:
+                preview = preview[:97] + "..."
+            rows.append([str(t.id), marks.get(t.status, f"{UI.AMBER}queued{UI.RST}"), dur_str, t.description, preview, "yes" if t.injected else "no"])
 
-            for t in cls._tasks:
-                if t.status == "completed":
-                    st = f"{UI.GREEN}● DONE{UI.RST}"
-                elif t.status == "running":
-                    st = f"{UI.CUDA_BOLD}⚡ RUNNING{UI.RST}"
-                elif t.status == "cancelled":
-                    st = f"{UI.GRAY}○ CANCELLED{UI.RST}"
-                elif t.status == "failed":
-                    st = f"{UI.RED}✗ FAILED{UI.RST}"
-                else:
-                    st = f"{UI.AMBER}⏳ QUEUED{UI.RST}"
-
-                dur_str = f"{t.duration:.1f}s" if t.duration is not None else (f"{time.time() - t.started_at:.1f}s" if t.started_at else "-")
-                preview = (t.result or t.error or "").replace("\n", " ").strip()
-                if len(preview) > 150:
-                    preview = preview[:147] + "..."
-
-                inj_tag = f"{UI.GREEN}YES{UI.RST}" if t.injected else f"{UI.GRAY}NO{UI.RST}"
-
-                table.add_row(
-                    str(t.id),
-                    Text.from_ansi(st),
-                    dur_str,
-                    t.description,
-                    Text.from_ansi(preview),
-                    Text.from_ansi(inj_tag),
-                )
-
-            console.print()
-            console.print(table)
-            console.print(f"{UI.GRAY}Commands: {UI.CYAN}/subagent view <#>{UI.GRAY} │ {UI.CYAN}/subagent inject <#|all>{UI.GRAY} │ {UI.CYAN}/subagent cancel <#>{UI.RST}\n")
-        else:
-            term_cols = shutil.get_terminal_size((120, 24)).columns
-            max_desc = max(60, term_cols - 40)
-            print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}BACKGROUND SUBAGENTS (NVIDIA CUDA:9001 [{c_badge}]){UI.RST}{UI.DARK_GRAY} ─────────────╮{UI.RST}")
-            for t in cls._tasks:
-                dur_str = f"{t.duration:.1f}s" if t.duration is not None else "-"
-                inj_str = " [Injected]" if t.injected else ""
-                desc_str = t.description if len(t.description) <= max_desc else (t.description[:max_desc - 3] + "...")
-                print(f"{UI.DARK_GRAY}│{UI.RST}  #{t.id:2d} [{t.status.upper():9s}] ({dur_str:5s}) {UI.WHITE}{desc_str}{UI.RST}{inj_str}")
-            print(f"{UI.DARK_GRAY}╰──────────────────────────────────────────────────────────────────╯{UI.RST}\n")
+        say.table(f"Background subagents on :9001 ({c_label}, queue {queue_tag})", ["#", "status", "time", "task", "result", "injected"], rows)
+        say.dim("/subagent view <#> | inject <#|all> | cancel <#>")
 
     @classmethod
     def print_detail(cls, task_id: int):
         task = cls.get(task_id)
         if not task:
-            print(UI.warn(f"Subagent #{task_id} not found. Type /tasks to view active tasks."))
+            say.warn(f"Subagent #{task_id} not found. Type /tasks to view active tasks.")
             return
 
         dur_str = f"{task.duration:.1f}s" if task.duration is not None else (f"{time.time() - task.started_at:.1f}s" if task.started_at else "-")
-        print(f"\n{UI.DARK_GRAY}╭─── {UI.WHITE}SUBAGENT #{task.id} DETAILS{UI.RST}{UI.DARK_GRAY} ───────────────────────────────────────────────╮{UI.RST}")
-        print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Task{UI.RST}       : {task.description}")
-        print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Status{UI.RST}     : {task.status.upper()} ({dur_str})")
         mode_tag = {"tools": "with tools", "no-tools": "plain completion, no tools"}.get(task.mode, task.mode)
-        print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Engine{UI.RST}     : NVIDIA RTX 4060 (Port 9001 - IBM Granite 8B, {mode_tag})")
-        print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Injected{UI.RST}   : {'YES' if task.injected else 'NO'}")
+        rows = [
+            ("task", task.description),
+            ("status", f"{task.status} ({dur_str})"),
+            ("engine", f"port 9001, {mode_tag}"),
+            ("injected", "yes" if task.injected else "no"),
+        ]
         if task.tool_calls:
-            print(f"{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Tool Calls{UI.RST} : {len(task.tool_calls)} executed")
-            for c in task.tool_calls:
-                print(f"{UI.DARK_GRAY}│{UI.RST}    • {UI.AMBER}{c['name']}{UI.RST}({json.dumps(c.get('args', {}))[:80]})")
-        print(f"{UI.DARK_GRAY}│{UI.RST}\n{UI.DARK_GRAY}│{UI.RST}  {UI.WHITE}Result Content:{UI.RST}")
+            calls = [f"{c['name']}({json.dumps(c.get('args', {}))[:80]})" for c in task.tool_calls]
+            rows.append(("tool calls", "\n".join(calls)))
+        say.card(f"Subagent #{task.id}", rows, style="info")
         res_text = task.result or task.error or ("(waiting in queue...)" if task.status == "queued" else "(running...)")
-        for line in res_text.splitlines():
-            print(f"{UI.DARK_GRAY}│{UI.RST}    {line}")
-        print(f"{UI.DARK_GRAY}╰────────────────────────────────────────────────────────────────────────╯")
+        say.plain(res_text)
         if task.status == "completed" and not task.injected:
-            print(f"{UI.GRAY}Tip: Use '/subagent inject {task.id}' to add this result to conversation context.{UI.RST}\n")
-        else:
-            print()
+            say.dim(f"/subagent inject {task.id} adds this result to the conversation context.")
