@@ -50,6 +50,7 @@ from .llamashift import (
     get_logs_tail,
     model_is_running,
     shift_state,
+    vram_snapshot,
 )
 from ..context.mcp_loader import load_mcp_servers, check_oauth_available
 from ..context.kontexta import KontextaManager
@@ -1954,6 +1955,22 @@ class MultiGpuHybridSession:
             return "auto-approve", UI.AMBER
         return "safe", UI.GREEN
 
+    def _vram_segments(self) -> List[tuple]:
+        """VRAM used/total for the GPU behind the active target (both under auto); empty when unknown."""
+        snap = vram_snapshot()
+        wanted = {"auto": ["amd", "nvidia"], "9000": ["amd"], "9001": ["nvidia"]}.get(self.active_target)
+        if not snap or not wanted:
+            return []
+        labels = {"amd": "rocm", "nvidia": "cuda"}
+        out = []
+        for gpu in sorted((g for g in snap if g["vendor"] in wanted), key=lambda g: wanted.index(g["vendor"])):
+            pct = gpu["used_mib"] / gpu["total_mib"] * 100
+            col = UI.RED_BOLD if pct >= 90 else UI.AMBER if pct >= 75 else UI.CYAN
+            total = gpu["total_mib"] / 1024
+            label = "vram" if len(wanted) == 1 else labels[gpu["vendor"]]
+            out.append((_pt_style(col), f"{label} {gpu['used_mib'] / 1024:.1f}/{total:.0f}G" if total >= 10 else f"{label} {gpu['used_mib'] / 1024:.1f}/{total:.1f}G"))
+        return out
+
     def toolbar_fragments(self) -> List[tuple]:
         """Bottom-toolbar segments as (prompt_toolkit style, text) pairs, themed from the active palette."""
         label, model = self._target_label_and_model(self.active_target)
@@ -1966,6 +1983,7 @@ class MultiGpuHybridSession:
         if ctx:
             col = UI.RED_BOLD if ctx["percentage"] >= 85 else UI.AMBER if ctx["percentage"] >= 65 else UI.CYAN
             segments.append((_pt_style(col), f"{_short_count(ctx['tokens'])}/{_short_count(ctx['max_ctx'])} ctx"))
+        segments.extend(self._vram_segments())
         segments.append((_pt_style(perm_color), perm))
         try:
             qs = SubagentManager.get_queue_status()

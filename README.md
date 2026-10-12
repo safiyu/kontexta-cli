@@ -26,6 +26,7 @@ An asynchronous, dual-accelerator pairing framework and terminal copilot built o
 * **Live Web Search & Documentation Scraper (`web_search.py` / `/search`, `/fetch`)**:
   * Zero external pip dependencies: multi-source live web search (DuckDuckGo + GitHub) and HTML-to-clean-Markdown webpage extractor.
 * **Kontexta Journal Sync (`/memory`)**: brainstorm results and commits are journaled to the project's Kontexta journal (redacted, background, opt-out with `/memory off`) so future sessions can pick up context.
+* **Live Status Toolbar**: bottom bar with target, model, context, permissions, subagents, memory state and VRAM used/total for the active GPU (from LlamaShift `/api/gpu`, refreshed in the background, hidden when LlamaShift is unreachable).
 * **Answer Theme and Turn Receipt**: styled Markdown answers plus a compact footer of files changed (+/-), commands run, time and tok/s.
 * **Per-Turn Checkpoints (`/diff`, `/undo`)**:
   * Every turn that changes files is snapshotted as git tree objects (real index untouched), so you can review or revert exactly what the agent did, including changes made by shell commands.

@@ -29,10 +29,16 @@ class FakeShift:
     """Serves LlamaShift's /api/* plus a llama-server style /health on the same port."""
 
     def __init__(self, status, health_503_first=0, health_ok=True, master_port=9000, logs=None,
-                 api_key=None, start_delay=0.0, start_warnings=None, start_code=200, running_after=0.0):
+                 api_key=None, start_delay=0.0, start_warnings=None, start_code=200, running_after=0.0,
+                 gpu="default", gpu_delay=0.0):
         self.status, self.paths = status, []
         self.api_key, self.start_delay = api_key, start_delay
         self.running_after, self.started = running_after, {}
+        self.gpu_delay = gpu_delay
+        self.gpu = {
+            "nvidia": {"name": "RTX 4060", "temp": 50.0, "util": 10.0, "mem_used": 2970.0, "mem_total": 8188.0, "power": 30.0},
+            "amd": {"name": "R9700", "temp": 60.0, "util": 20.0, "mem_used": 14540.0, "mem_total": 24560.0, "power": 90.0},
+        } if gpu == "default" else gpu
         self.start_warnings, self.start_code = start_warnings or [], start_code
         self.config = {"mode": status.get("mode", "single_port"), "masterPort": master_port}
         self.logs = ["line one", "line two"] if logs is None else logs
@@ -72,6 +78,10 @@ class FakeShift:
                     self._send(200, outer.status)
                 elif self.path.startswith("/api/config"):
                     self._send(200, outer.config)
+                elif self.path.startswith("/api/gpu"):
+                    if outer.gpu_delay:
+                        time.sleep(outer.gpu_delay)
+                    self._send(200, outer.gpu)
                 elif self.path.startswith("/api/logs"):
                     self._send(200, {"model": "x", "logs": outer.logs})
                 elif self.path == "/health":
@@ -388,3 +398,91 @@ def test_real_crash_is_still_detected(shift):
     fake = shift(_status(running=("qwen27",)), health_ok=False, running_after=999)
     res = ls.ensure_ready("granite_8b_q4", fake.port, timeout=8)
     assert not res["ok"] and "exited" in res["reason"]
+
+
+def _wait_for(cond, timeout=3.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        value = cond()
+        if value:
+            return value
+        time.sleep(0.05)
+    return None
+
+
+def test_gpu_vram_parses_both_vendors(shift):
+    shift()
+    gpus = ls.get_gpu_vram()
+    assert [(g["vendor"], g["used_mib"], g["total_mib"]) for g in gpus] == [("nvidia", 2970.0, 8188.0), ("amd", 14540.0, 24560.0)]
+
+
+def test_gpu_vram_skips_missing_and_zero_total(shift):
+    shift(gpu={"nvidia": None, "amd": {"name": "x", "mem_used": 1, "mem_total": 0}})
+    assert ls.get_gpu_vram() is None
+
+
+def test_vram_snapshot_never_blocks_and_fills_in_the_background(shift):
+    shift(gpu_delay=0.6)
+    t0 = time.monotonic()
+    assert ls.vram_snapshot() is None
+    assert time.monotonic() - t0 < 0.3
+    data = _wait_for(ls.vram_snapshot)
+    assert data and {g["vendor"] for g in data} == {"nvidia", "amd"}
+
+
+def test_vram_snapshot_is_cached_between_calls(shift):
+    fake = shift()
+    _wait_for(ls.vram_snapshot)
+    for _ in range(5):
+        ls.vram_snapshot()
+    assert sum(1 for p in fake.paths if p.startswith("/api/gpu")) == 1
+
+
+def test_vram_snapshot_is_none_when_llamashift_is_down(monkeypatch):
+    ls.invalidate_cache()
+    monkeypatch.setattr(ls, "DEFAULT_LLAMASHIFT_URL", "http://127.0.0.1:9")
+    ls.vram_snapshot()
+    time.sleep(0.4)
+    assert ls.vram_snapshot() is None
+    ls.invalidate_cache()
+
+
+def test_vram_snapshot_drops_data_that_is_too_old(shift, monkeypatch):
+    shift()
+    assert _wait_for(ls.vram_snapshot)
+    monkeypatch.setattr(ls, "GPU_MAX_AGE", 0.0)
+    monkeypatch.setitem(ls._gpu_cache, "refreshing", True)
+    assert ls.vram_snapshot() is None
+
+
+GPUS = [
+    {"vendor": "nvidia", "name": "RTX 4060", "used_mib": 2970.0, "total_mib": 8188.0},
+    {"vendor": "amd", "name": "R9700", "used_mib": 14540.0, "total_mib": 24560.0},
+]
+
+
+def _toolbar_text(session, monkeypatch, target, gpus=GPUS):
+    from myagy.core import session as sess_mod
+    monkeypatch.setattr(sess_mod, "vram_snapshot", lambda: gpus)
+    session.active_target = target
+    return "".join(t for _, t in session.toolbar_fragments())
+
+
+def test_toolbar_shows_rocm_vram_for_9000(session, monkeypatch):
+    text = _toolbar_text(session, monkeypatch, "9000")
+    assert "vram 14.2/24G" in text and "2.9" not in text
+
+
+def test_toolbar_shows_cuda_vram_for_9001(session, monkeypatch):
+    assert "vram 2.9/8.0G" in _toolbar_text(session, monkeypatch, "9001")
+
+
+def test_toolbar_shows_both_gpus_under_auto(session, monkeypatch):
+    text = _toolbar_text(session, monkeypatch, "auto")
+    assert "rocm 14.2/24G" in text and "cuda 2.9/8.0G" in text
+    assert text.index("rocm") < text.index("cuda")
+
+
+def test_toolbar_has_no_vram_for_cloud_or_when_unknown(session, monkeypatch):
+    assert "vram" not in _toolbar_text(session, monkeypatch, "cloud")
+    assert "vram" not in _toolbar_text(session, monkeypatch, "9000", gpus=None)

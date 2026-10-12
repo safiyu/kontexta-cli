@@ -15,11 +15,15 @@ _BASE_HEADERS = {"User-Agent": "Antigravity/1.0"}
 STATUS_TTL = 2.0
 CONFIG_TTL = 30.0
 DOWN_TTL = 3.0
+GPU_TTL = 5.0
+GPU_FAIL_TTL = 15.0
+GPU_MAX_AGE = 30.0
 START_TIMEOUT = 130.0  # a swap can wait out the 60s drain plus ~20s for the port to free
 
 _lock = threading.Lock()
 _cache: Dict[str, Any] = {"at": 0.0, "data": None, "down_until": 0.0, "state": "down"}
 _cfg_cache: Dict[str, Any] = {"at": 0.0, "master_port": None}
+_gpu_cache: Dict[str, Any] = {"at": 0.0, "data": None, "ttl": GPU_TTL, "refreshing": False}
 
 
 def _headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -43,6 +47,7 @@ def invalidate_cache():
     with _lock:
         _cache.update(at=0.0, data=None, down_until=0.0)
         _cfg_cache.update(at=0.0, master_port=None)
+        _gpu_cache.update(at=0.0, data=None, ttl=GPU_TTL)
 
 
 def _probe_failure_state() -> str:
@@ -83,6 +88,47 @@ def get_status(max_age: float = STATUS_TTL) -> Optional[Dict[str, Any]]:
 def shift_state() -> str:
     """'up', 'starting', 'unauthorized' (API key missing or wrong) or 'down'."""
     return "up" if get_status() is not None else _cache["state"]
+
+
+def get_gpu_vram() -> Optional[List[Dict[str, Any]]]:
+    """GET /api/gpu as [{vendor, name, used_mib, total_mib}]; None when unavailable."""
+    try:
+        raw = _get_json(f"{DEFAULT_LLAMASHIFT_URL}/api/gpu", 1.5)
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    out = []
+    for vendor in ("nvidia", "amd"):
+        gpu = raw.get(vendor)
+        if not isinstance(gpu, dict):
+            continue
+        try:
+            total, used = float(gpu.get("mem_total") or 0), float(gpu.get("mem_used") or 0)
+        except (TypeError, ValueError):
+            continue
+        if total > 0:
+            out.append({"vendor": vendor, "name": str(gpu.get("name", "")), "used_mib": used, "total_mib": total})
+    return out or None
+
+
+def _refresh_gpu():
+    data = get_gpu_vram()
+    with _lock:
+        _gpu_cache.update(at=time.monotonic(), data=data, ttl=GPU_TTL if data else GPU_FAIL_TTL, refreshing=False)
+
+
+def vram_snapshot() -> Optional[List[Dict[str, Any]]]:
+    """Cached VRAM for UI chrome: never blocks, a stale value starts a background refresh, old data is dropped."""
+    now = time.monotonic()
+    with _lock:
+        start = now - _gpu_cache["at"] >= _gpu_cache["ttl"] and not _gpu_cache["refreshing"]
+        if start:
+            _gpu_cache["refreshing"] = True
+        data = _gpu_cache["data"] if now - _gpu_cache["at"] < GPU_MAX_AGE else None
+    if start:
+        threading.Thread(target=_refresh_gpu, daemon=True, name="vram-refresh").start()
+    return data
 
 
 def get_mode() -> Optional[str]:
