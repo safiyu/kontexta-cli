@@ -6,11 +6,14 @@ aborts the active turn without needing Ctrl+C or triggering OS SIGINT signals.
 """
 
 import os
+import re
 import sys
 import select
 import threading
 import contextlib
 from typing import Callable, Optional
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 try:
     import termios
@@ -192,5 +195,17 @@ class EscListener:
 
 def prompt_input(prompt: str = "") -> str:
     """input() that is safe to call while an ESC listener is active."""
+    try:
+        from .ui import stop_status
+        stop_status()
+    except Exception:
+        pass
+
     with EscListener.suspended():
-        return input(prompt)
+        if prompt:
+            if not sys.stdout.isatty():
+                prompt = _ANSI_RE.sub("", prompt)
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            return input()
+        return input()

@@ -1,6 +1,6 @@
 """Terminal UI styling, interactive REPL loop, and keyboard interrupt listeners."""
 
-from .ui import UI, RICH_AVAILABLE, console
+from .ui import UI, RICH_AVAILABLE, console, start_status, stop_status
 from .esc_listener import EscListener
 
 
@@ -16,6 +16,8 @@ __all__ = [
     "UI",
     "RICH_AVAILABLE",
     "console",
+    "start_status",
+    "stop_status",
     "EscListener",
     "read_input_prompt",
     "interactive_loop",

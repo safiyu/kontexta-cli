@@ -144,6 +144,10 @@ def _plain_lines(rows: List[Tuple[str, str]]) -> List[str]:
 
 def card(title: str, rows: List[Tuple[str, str]], actions: str = "", style: str = "info"):
     """A bordered panel of label/value rows with an optional action footer."""
+    try:
+        _ui.stop_status()
+    except Exception:
+        pass
     style = style if style in ("info", "warn", "danger") else "info"
     if _rich_ok():
         console = _ui.console

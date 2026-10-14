@@ -254,6 +254,11 @@ def test_start_error_body_is_reported(shift):
 
 def test_context_metrics_use_llamashift_ctx_size(session, monkeypatch):
     monkeypatch.setattr(compactor, "ctx_size_for_port", lambda port: 26384)
+    # Force the live /slots query to fail so the ctx_size_for_port fallback is exercised
+    # regardless of whether a real llama-server is running on the port.
+    def _no_slots(*a, **k):
+        raise OSError("slots query disabled in test")
+    monkeypatch.setattr(compactor.urllib.request, "urlopen", _no_slots)
     metrics = ContextCurator.get_context_metrics(session, "9000")
     assert metrics["max_ctx"] == 26384
 

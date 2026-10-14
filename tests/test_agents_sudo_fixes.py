@@ -31,7 +31,7 @@ BYPASSES = [
     "FOO=1 sudo id",
     "\\sudo id",
     "'sudo' id",
-    "find . -exec sudo rm {} \;",
+    r"find . -exec sudo rm {} \;",
     "if true; then sudo id; fi",
     "su -c id",
     "doas id",

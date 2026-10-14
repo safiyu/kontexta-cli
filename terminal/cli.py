@@ -94,6 +94,141 @@ def _toolbar_fragments():
         return []
 
 
+COMMAND_USAGES = {
+    "/auto": "/auto",
+    "/9000": "/9000",
+    "/rocm": "/rocm",
+    "/amd": "/amd",
+    "/9001": "/9001",
+    "/cuda": "/cuda",
+    "/nvidia": "/nvidia",
+    "/cloud": "/cloud [<model-id>]",
+    "/gemini": "/gemini [<model-id>]",
+    "/oauth": "/oauth [<model-id>]",
+    "/model": "/model [<id|port>]",
+    "/switch": "/switch [<id|port>]",
+    "/shift": "/shift [<id|port>]",
+    "/use": "/use [<id|port>]",
+    "/models": "/models",
+    "/mode": "/mode <num|id>",
+    "/laya": "/laya",
+    "/git-shift": "/git-shift [on|off]",
+    "/gitshift": "/gitshift [on|off]",
+    "/autoshift": "/autoshift [on|off]",
+    "/skip-permissions": "/skip-permissions [on|off]",
+    "/dangerously-skip-permissions": "/dangerously-skip-permissions [on|off]",
+    "/permissions": "/permissions [auto|skip|safe]",
+    "/sudo": "/sudo [<cmd>|clear|status]",
+    "/theme": "/theme [dark|light|mono]",
+    "/mcp": "/mcp [status|on|off|reload]",
+    "/kontexta": "/kontexta [status|on|off|reload|register]",
+    "/kxta": "/kxta [status|on|off|reload|register]",
+    "/memory": "/memory [on|off]",
+    "/journal": "/journal [on|off]",
+    "/autocompact": "/autocompact [on|off|<turns>]",
+    "/auto-compact": "/auto-compact [on|off|<turns>]",
+    "/curation": "/curation [on|off]",
+    "/continuous": "/continuous [on|off]",
+    "/repomap": "/repomap [view|on|off|refresh|stats]",
+    "/ast": "/ast [view|on|off|refresh|stats]",
+    "/instructions": "/instructions [view|on|off|refresh]",
+    "/rules": "/rules [view|on|off|refresh]",
+    "/guidelines": "/guidelines [view|on|off|refresh]",
+    "/hooks": "/hooks [view|on|off|refresh]",
+    "/hook": "/hook [view|on|off|refresh]",
+    "/markdown": "/markdown [on|off]",
+    "/md": "/md [on|off]",
+    "/multiline": "/multiline",
+    "/multi": "/multi",
+    "/singleline": "/singleline",
+    "/single": "/single",
+    "/format": "/format [text|json]",
+    "/prefs": "/prefs [reset]",
+    "/preferences": "/preferences [reset]",
+    "/metrics": "/metrics [on|off]",
+    "/steps": "/steps [<n>|off]",
+    "/maxsteps": "/maxsteps [<n>|off]",
+    "/max-steps": "/max-steps [<n>|off]",
+    "/verbose": "/verbose [on|off]",
+    "/v": "/v [on|off]",
+    "/json": "/json [on|off]",
+    "/stats": "/stats [reset]",
+    "/coordinator": "/coordinator",
+    "/status": "/status",
+    "/history": "/history",
+    "/clear": "/clear",
+    "/save": "/save [<name>]",
+    "/load": "/load <name|file>",
+    "/sessions": "/sessions",
+    "/export": "/export [<file>]",
+    "/summarize": "/summarize",
+    "/context": "/context",
+    "/ctx": "/ctx",
+    "/compact": "/compact [<turns>]",
+    "/last": "/last",
+    "/reload": "/reload",
+    "/restart": "/restart",
+    "/help": "/help [<group>]",
+    "/exit": "/exit",
+    "/quit": "/quit",
+    "/compactor": "/compactor [status|start]",
+    "/curator": "/curator [status|start]",
+    "/spawn": "/spawn <prompt>",
+    "/subagent": "/subagent <prompt>",
+    "/task": "/task <prompt>",
+    "/build": "/build [<cmd>]",
+    "/test": "/test [<cmd>]",
+    "/tasks": "/tasks",
+    "/subagents": "/subagents",
+    "/brainstorm": "/brainstorm <goal>",
+    "/spec": "/spec <goal>",
+    "/plan": "/plan <goal>",
+    "/search": "/search <query>",
+    "/web": "/web <query>",
+    "/google": "/google <query>",
+    "/ddg": "/ddg <query>",
+    "/fetch": "/fetch <url>",
+    "/browse": "/browse <url>",
+    "/readurl": "/readurl <url>",
+    "/diff": "/diff [<n>]",
+    "/undo": "/undo",
+    "/paste": "/paste",
+}
+
+AT_TARGET_DOCS = {
+    "@rocm": "@rocm — AMD ROCm model on port 9000",
+    "@9000": "@9000 — AMD ROCm model on port 9000",
+    "@amd": "@amd — AMD ROCm model on port 9000",
+    "@cuda": "@cuda — NVIDIA CUDA model on port 9001",
+    "@9001": "@9001 — NVIDIA CUDA model on port 9001",
+    "@nvidia": "@nvidia — NVIDIA CUDA model on port 9001",
+    "@cloud": "@cloud — Google Cloud model via OAuth",
+    "@gemini": "@gemini — Google Cloud Gemini via OAuth",
+    "@oauth": "@oauth — Google Cloud OAuth target",
+    "@auto": "@auto — Automatic routing with Laya",
+    "@laya": "@laya — Automatic routing with Laya",
+    "@local": "@local — Active local model",
+}
+
+
+def command_doc(name: str) -> str:
+    """Returns formatted 'usage — description' meta for slash command completion."""
+    desc = ""
+    for m in COMMAND_META:
+        if name in m.get("names", ()):
+            desc = m.get("help", "")
+            break
+    if not desc:
+        for names, _, text in _EXTRA_HELP:
+            if name in names:
+                desc = text
+                break
+    usage = COMMAND_USAGES.get(name, name)
+    if usage and desc:
+        return f"{usage} — {desc}"
+    return desc or usage
+
+
 def _get_pt_session():
     """Lazily builds a prompt_toolkit session (history + completion); None if unavailable."""
     global _pt_session
@@ -105,24 +240,41 @@ def _get_pt_session():
         from prompt_toolkit.completion import Completer, Completion
         from prompt_toolkit.styles import Style
 
+        from prompt_toolkit.shortcuts import CompleteStyle
+
         class _InputCompleter(Completer):
             def get_completions(self, document, complete_event):
                 text = document.text_before_cursor
                 if " " in text or "\n" in text:
                     return
                 if text.startswith("/"):
-                    pool = SLASH_COMMANDS
+                    for cand in SLASH_COMMANDS:
+                        if cand.lower().startswith(text.lower()):
+                            meta = command_doc(cand)
+                            yield Completion(cand, start_position=-len(text), display_meta=meta)
                 elif text.startswith("@"):
-                    pool = AT_TARGETS + _dynamic_targets
-                else:
-                    return
-                for cand in pool:
-                    if cand.lower().startswith(text.lower()):
-                        yield Completion(cand, start_position=-len(text))
+                    for cand in AT_TARGETS + _dynamic_targets:
+                        if cand.lower().startswith(text.lower()):
+                            meta = AT_TARGET_DOCS.get(cand, f"{cand} — Local model")
+                            yield Completion(cand, start_position=-len(text), display_meta=meta)
 
         os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
-        style = Style.from_dict({"bottom-toolbar": "noreverse", "bottom-toolbar.text": "noreverse"})
-        _pt_session = PromptSession(history=FileHistory(HISTORY_PATH), completer=_InputCompleter(), style=style)
+        style = Style.from_dict({
+            "bottom-toolbar": "noreverse",
+            "bottom-toolbar.text": "noreverse",
+            "completion-menu.completion": "bg:#2b2b2b #ffffff",
+            "completion-menu.completion.current": "bg:#005f87 #ffffff bold",
+            "completion-menu.meta": "bg:#222222 #9e9e9e",
+            "completion-menu.meta.current": "bg:#005f87 #e0e0e0",
+        })
+        _pt_session = PromptSession(
+            history=FileHistory(HISTORY_PATH),
+            completer=_InputCompleter(),
+            style=style,
+            complete_while_typing=True,
+            complete_style=CompleteStyle.COLUMN,
+            reserve_space_for_menu=8,
+        )
     except Exception:
         _pt_session = False
     return _pt_session or None
@@ -364,16 +516,20 @@ async def _cmd_skip_permissions(session, arg, ctx):
 async def _cmd_permissions(session, arg, ctx):
     arg_low = arg.lower()
     if arg_low in ("auto", "laya", "dynamic", "smart"):
+        session.set_dangerously_skip_permissions(False)
         session.use_laya_adaptive_permissions = True
+        session.save_preferences()
         await session.reset_local_agent()
         say.ok("Permissions: LAYA ADAPTIVE")
-    elif arg_low in ("on", "skip", "true", "1"):
+    elif arg_low in ("on", "skip", "true", "1", "yolo"):
         session.use_laya_adaptive_permissions = False
         session.set_dangerously_skip_permissions(True)
+        session.save_preferences()
         say.ok("Dangerously skip permissions: ENABLED")
     elif arg_low in ("off", "safe", "prompt", "false", "0"):
         session.use_laya_adaptive_permissions = False
         session.set_dangerously_skip_permissions(False)
+        session.save_preferences()
         say.ok("Permissions: SAFE MODE")
     else:
         say.warn("Usage: /permissions auto | skip | safe")

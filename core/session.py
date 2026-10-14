@@ -338,9 +338,15 @@ class MultiGpuHybridSession:
         if self._dangerously_skip_permissions != enable:
             self._dangerously_skip_permissions = enable
             self._invalidate_local_agent()
+        self.save_preferences()
 
     @staticmethod
     def _ask(prompt: str) -> str:
+        try:
+            from ..terminal.ui import stop_status
+            stop_status()
+        except Exception:
+            pass
         return prompt_input(f"{UI.AMBER_BOLD}{prompt}{UI.RST} ").strip().lower()
 
     @staticmethod
@@ -362,6 +368,7 @@ class MultiGpuHybridSession:
         return rows
 
     def _sudo_gate(self, tool_name: str, cmd_line: str) -> bool:
+        self._stop_status()
         user = os.environ.get("USER", "root")
         authed = SudoManager.is_authenticated()
         rows = [("Tool", f"{tool_name} (root elevation)"), ("Command", cmd_line), ("Target", f"host system ({user})")]
@@ -372,7 +379,9 @@ class MultiGpuHybridSession:
             actions="[Y]es / [n]o / [c]hange password" if authed else "[y]es / [N]o", style="danger",
         )
         try:
-            choice = self._ask("Authorize root execution?" if authed else "Authorize execution with sudo?")
+            choice = self._ask(
+                "Authorize root execution? [Y/n/c]:" if authed else "Authorize execution with sudo? [y/N]:"
+            )
         except (KeyboardInterrupt, EOFError):
             say.warn("Execution denied")
             return False
@@ -404,7 +413,7 @@ class MultiGpuHybridSession:
         if tool_name == "run_command" and SudoManager.is_sudo_command(cmd_line):
             return self._sudo_gate(tool_name, cmd_line)
 
-        if self._dangerously_skip_permissions and not self.use_laya_adaptive_permissions:
+        if self._dangerously_skip_permissions:
             say.step(f"auto-approved {tool_name} (skip-permissions mode)")
             return True
 
@@ -425,13 +434,14 @@ class MultiGpuHybridSession:
             say.step(f"approved {tool_name} (same call allowed earlier this session)")
             return True
 
+        self._stop_status()
         rows = [("Tool", tool_name), *self._arg_rows(args)]
         if risk:
             rows.append(("Risk", risk))
         rows.append(("Reason", reason))
         say.card("Permission required", rows, actions="[y]es / [n]o / [a]lways", style="warn")
         try:
-            choice = self._ask("Authorize?")
+            choice = self._ask("Authorize? [y/n/a]:")
         except (KeyboardInterrupt, EOFError):
             say.warn("Execution denied")
             return False
@@ -612,10 +622,12 @@ class MultiGpuHybridSession:
                 "id": getattr(call, "id", None), "name": str(getattr(c_name, "value", c_name)), "summary": summary_clean,
                 "t0": time.perf_counter(), "step": self._current_turn_tool_count,
             })
+            self._start_status(f"[bold yellow]⚙ {c_name}[/bold yellow] [dim]{summary_clean[:60]}[/dim]")
             return types.HookResult(allow=True)
 
         @hooks.post_tool_call
         def on_tool_result(res: types.ToolResult):
+            self._stop_status()
             pending = self._pop_pending_tool(res)
             if self.json_output:
                 return
@@ -626,6 +638,7 @@ class MultiGpuHybridSession:
                 err_msg = " ".join(str(res.error).split())
                 say.tool_row(pending["name"], pending["summary"], ok=False, elapsed=elapsed, extra=err_msg[:40])
                 say.detail(f"    error: {err_msg[:400]}")
+                self._start_status("Thinking & generating response...")
                 return
 
             out_str = ""
@@ -647,6 +660,8 @@ class MultiGpuHybridSession:
                     say.detail("    " + (l if len(l) <= max_line else l[:max_line - 3] + "..."))
                 if hidden:
                     say.detail(f"    +{hidden} lines")
+
+            self._start_status("Thinking & generating response...")
 
         all_hooks = [loop_guard, on_tool_result]
 
@@ -866,14 +881,28 @@ class MultiGpuHybridSession:
         self._active_local_model = live_model
         return self._active_local_agent
 
+    def _start_status(self, msg: str = "Thinking & generating response..."):
+        if self.json_output:
+            return None
+        try:
+            from ..terminal.ui import start_status
+            return start_status(msg)
+        except Exception:
+            return None
+
+    def _stop_status(self):
+        try:
+            from ..terminal.ui import stop_status
+            stop_status()
+        except Exception:
+            pass
+
     async def _consume_token_stream(self, token_stream, status_msg: str = "Thinking & generating response...") -> tuple[str, int, Optional[float]]:
         """Consumes an async token stream, rendering Markdown live when rich is available."""
         full_response: List[str] = []
         token_count = 0
         t_first = None
-        status = console.status(f"[bold cyan]{status_msg}[/bold cyan]", spinner="dots") if (RICH_AVAILABLE and not self.json_output) else None
-        if status:
-            status.start()
+        self._start_status(status_msg)
         renderer = StreamRenderer(markdown=self.render_markdown, enabled=not self.json_output)
 
         # Local SDK streams expose typed chunks; iterating them once lets thoughts show on the spinner line
@@ -896,15 +925,12 @@ class MultiGpuHybridSession:
                     continue
                 if t_first is None:
                     t_first = time.perf_counter()
-                    if status:
-                        status.stop()
-                        status = None
+                    self._stop_status()
                 full_response.append(token)
                 token_count += 1
                 renderer.feed(token)
         finally:
-            if status:
-                status.stop()
+            self._stop_status()
             renderer.stop()
 
         return "".join(full_response).strip(), token_count, t_first

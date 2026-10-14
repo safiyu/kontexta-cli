@@ -122,3 +122,35 @@ def test_interactive_loop_exits_on_slash_exit(monkeypatch):
     session = DummySession()
     monkeypatch.setattr(cli, "read_input_prompt", lambda prompt, multiline: "/exit")
     asyncio.run(cli.interactive_loop(session))
+
+
+def test_slash_command_completions_have_description_and_usage(monkeypatch, tmp_path):
+    pytest.importorskip("prompt_toolkit")
+    from prompt_toolkit.document import Document
+    pt = _pt_with_pipe(monkeypatch, tmp_path)
+    completer = pt.completer
+    assert completer is not None
+    doc = Document(text="/", cursor_position=1)
+    completions = list(completer.get_completions(doc, None))
+    assert len(completions) > 20
+    # Every completion has text starting with / and non-empty display_meta with usage and description
+    for c in completions:
+        assert c.text.startswith("/")
+        meta_str = c.display_meta_text
+        assert meta_str, f"Missing display_meta for {c.text}"
+        assert "—" in meta_str or "Usage" in meta_str or "/" in meta_str
+
+    # Test typing /diff specifically
+    doc_diff = Document(text="/diff", cursor_position=5)
+    diff_completions = list(completer.get_completions(doc_diff, None))
+    assert len(diff_completions) == 1
+    assert diff_completions[0].text == "/diff"
+    assert "/diff" in diff_completions[0].display_meta_text
+    assert "file changes" in diff_completions[0].display_meta_text.lower()
+
+
+def test_command_doc_covers_all_registered_slash_commands():
+    for cmd in cli.SLASH_COMMANDS:
+        doc = cli.command_doc(cmd)
+        assert doc, f"Empty doc for {cmd}"
+        assert cmd in doc, f"Command {cmd} not in usage of doc: {doc}"

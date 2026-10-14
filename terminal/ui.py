@@ -359,3 +359,37 @@ class StreamRenderer:
             sys.stdout.write("\n")
             sys.stdout.flush()
         self.started = False
+
+
+_active_status = None
+
+
+def start_status(msg: str = "Thinking & generating response..."):
+    """Starts or updates a Rich animated dots spinner, thread-safely."""
+    global _active_status
+    if not RICH_AVAILABLE or not console:
+        return None
+    if _active_status is not None:
+        try:
+            _active_status.update(f"[bold cyan]{msg}[/bold cyan]")
+            return _active_status
+        except Exception:
+            stop_status()
+    try:
+        _active_status = console.status(f"[bold cyan]{msg}[/bold cyan]", spinner="dots")
+        _active_status.start()
+    except Exception:
+        _active_status = None
+    return _active_status
+
+
+def stop_status():
+    """Stops and clears any active Rich status spinner from the terminal."""
+    global _active_status
+    if _active_status is not None:
+        try:
+            _active_status.stop()
+        except Exception:
+            pass
+        _active_status = None
+

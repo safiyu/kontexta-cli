@@ -86,3 +86,25 @@ def test_arrow_key_sequences_do_not_interrupt(tmp_path):
             pass
         os.waitpid(pid, 0)
     assert "interrupted=False" in out.decode(errors="replace")
+
+
+def test_prompt_input_strips_ansi_on_non_tty(monkeypatch, capsys):
+    from myagy.terminal.esc_listener import prompt_input
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda: "ok")
+    res = prompt_input("\033[1;38;5;214mAuthorize?\033[0m ")
+    captured = capsys.readouterr()
+    assert res == "ok"
+    assert captured.out == "Authorize? "
+    assert "\033" not in captured.out
+    assert "[1;38;5;214m" not in captured.out
+
+
+def test_prompt_input_preserves_ansi_on_tty(monkeypatch, capsys):
+    from myagy.terminal.esc_listener import prompt_input
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda: "yes")
+    res = prompt_input("\033[1;38;5;214mAuthorize?\033[0m ")
+    captured = capsys.readouterr()
+    assert res == "yes"
+    assert captured.out == "\033[1;38;5;214mAuthorize?\033[0m "
