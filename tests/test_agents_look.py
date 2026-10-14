@@ -64,7 +64,6 @@ class FakeSession:
 
 
 def _run_workflow(git_repo, monkeypatch, answers):
-    monkeypatch.setattr(bs, "PLANS_DIR", str(git_repo.parent / (git_repo.name + "_plans")))
     monkeypatch.setattr(bs.kontexta_sync, "sync_event", lambda *a, **k: True)
     it = iter(answers)
     monkeypatch.setattr(bs, "prompt_input", lambda prompt="": next(it))

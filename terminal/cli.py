@@ -9,6 +9,7 @@ import asyncio
 import threading
 import argparse
 import subprocess
+import traceback
 
 from ..config import (
     MCP_CONFIG_PATH,
@@ -1028,16 +1029,10 @@ async def _cmd_tasks(session, arg, ctx):
 async def _cmd_brainstorm(session, arg, ctx):
     from ..agents.brainstorm import BrainstormWorkflow
     ctx.task = asyncio.create_task(BrainstormWorkflow.execute_workflow(arg, session, repo_root="."))
-    esc_listener = EscListener(
-        on_escape=lambda: ctx.loop.call_soon_threadsafe(
-            lambda: ctx.task.cancel() if ctx.task and not ctx.task.done() else None
-        )
-    )
     try:
-        with esc_listener:
-            await ctx.task
+        await ctx.task
     except asyncio.CancelledError:
-        say.warn("[Esc] Brainstorm workflow stopped by user.")
+        say.warn("[^C] Brainstorm workflow stopped. Run /brainstorm with the same idea to resume.")
     finally:
         ctx.task = None
 
@@ -1232,7 +1227,12 @@ async def interactive_loop(session: MultiGpuHybridSession):
                 if handler is None:
                     say.warn(f"Unknown command '{cmd}'. Type /help for available commands.")
                 else:
-                    result = await handler(session, arg, ctx)
+                    try:
+                        result = await handler(session, arg, ctx)
+                    except Exception as exc:
+                        say.err(f"{cmd} failed: {type(exc).__name__}: {exc}")
+                        say.dim(traceback.format_exc())
+                        continue
                     if result is _EXIT:
                         break
                     if result is _NO_SAVE:
