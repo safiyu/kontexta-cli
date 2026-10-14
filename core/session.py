@@ -876,8 +876,24 @@ class MultiGpuHybridSession:
             status.start()
         renderer = StreamRenderer(markdown=self.render_markdown, enabled=not self.json_output)
 
+        # Local SDK streams expose typed chunks; iterating them once lets thoughts show on the spinner line
+        chunks = getattr(token_stream, "chunks", None)
+        thought_tail = ""
+        width = max(20, (console.width if console else 80) - 16)
         try:
-            async for token in token_stream:
+            async for item in (chunks if chunks is not None else token_stream):
+                kind = type(item).__name__ if chunks is not None else "Text"
+                token = getattr(item, "text", "") if chunks is not None else item
+                if kind == "Thought":
+                    if status and token:
+                        from rich.markup import escape
+                        thought_tail = (thought_tail + token)[-400:]
+                        line = " ".join(thought_tail.split())[-width:]
+                        if line:
+                            status.update(f"[dim]thinking: {escape(line)}[/dim]")
+                    continue
+                if kind != "Text":
+                    continue
                 if t_first is None:
                     t_first = time.perf_counter()
                     if status:
