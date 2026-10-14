@@ -8,6 +8,8 @@ import pytest
 
 pty = pytest.importorskip("pty")
 
+from myagy.terminal.esc_listener import EscListener  # noqa: E402
+
 CHILD = r'''
 import sys, time, importlib.util
 spec = importlib.util.spec_from_file_location("esc", sys.argv[1])
@@ -108,3 +110,106 @@ def test_prompt_input_preserves_ansi_on_tty(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert res == "yes"
     assert captured.out == "\033[1;38;5;214mAuthorize?\033[0m "
+
+
+# --- queue-ahead typing (buffer bytes typed during a turn) ---
+
+def test_apply_buffer_byte_appends_printable():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray()
+    submit = _apply_buffer_byte(buf, False, ord('a'))
+    assert buf == bytearray(b'a')
+    assert submit is False
+
+
+def test_apply_buffer_byte_backspace_del_pops():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray(b'abc')
+    submit = _apply_buffer_byte(buf, False, 0x7F)
+    assert buf == bytearray(b'ab')
+    assert submit is False
+
+
+def test_apply_buffer_byte_backspace_bs_pops():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray(b'abc')
+    _apply_buffer_byte(buf, False, 0x08)
+    assert buf == bytearray(b'ab')
+
+
+def test_apply_buffer_byte_backspace_on_empty_is_noop():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray()
+    submit = _apply_buffer_byte(buf, False, 0x7F)
+    assert buf == bytearray()
+    assert submit is False
+
+
+def test_apply_buffer_byte_ctrl_u_clears():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray(b'hello')
+    _apply_buffer_byte(buf, False, 0x15)
+    assert buf == bytearray()
+
+
+def test_apply_buffer_byte_enter_lf_sets_submit():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray(b'hi')
+    submit = _apply_buffer_byte(buf, False, 0x0A)
+    assert buf == bytearray(b'hi')  # buffer content preserved
+    assert submit is True
+
+
+def test_apply_buffer_byte_enter_cr_sets_submit():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray()
+    submit = _apply_buffer_byte(buf, False, 0x0D)
+    assert submit is True
+
+
+def test_apply_buffer_byte_ignores_input_after_submit():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray(b'queued')
+    submit = _apply_buffer_byte(buf, True, ord('x'))
+    assert buf == bytearray(b'queued')  # unchanged
+    assert submit is True
+
+
+def test_apply_buffer_byte_appends_utf8_multibyte():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray()
+    # é = 0xC3 0xA9
+    _apply_buffer_byte(buf, False, 0xC3)
+    _apply_buffer_byte(buf, False, 0xA9)
+    assert buf.decode('utf-8') == 'é'
+
+
+def test_apply_buffer_byte_ignores_other_control_chars():
+    from myagy.terminal.esc_listener import _apply_buffer_byte
+    buf = bytearray()
+    _apply_buffer_byte(buf, False, 0x09)  # Tab
+    _apply_buffer_byte(buf, False, 0x01)  # Ctrl-A
+    assert buf == bytearray()
+
+
+def test_listener_init_has_empty_buffer():
+    assert EscListener().buffered_text == bytearray()
+    assert EscListener().submit_pending is False
+
+
+def test_drain_returns_text_and_submit_then_clears():
+    listener = EscListener()
+    listener.buffered_text = bytearray(b'queued')
+    listener.submit_pending = True
+    text, submit = listener.drain()
+    assert text == 'queued'
+    assert submit is True
+    assert listener.buffered_text == bytearray()
+    assert listener.submit_pending is False
+
+
+def test_drain_decodes_utf8_with_replace_on_invalid_bytes():
+    listener = EscListener()
+    listener.buffered_text = bytearray(b'ok \xff tail')
+    text, _ = listener.drain()
+    assert text.startswith('ok ') and text.endswith(' tail')
