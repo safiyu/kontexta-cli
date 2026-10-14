@@ -45,6 +45,9 @@ class EscListener:
         self._fd: Optional[int] = None
         self._io_lock = threading.Lock()
         self._paused = False
+        # Queue-ahead typing: typed chars accumulate; drained after the turn ends.
+        self.buffered_text: bytearray = bytearray()
+        self.submit_pending: bool = False
 
     # Active listener, so prompts can pause it without a reference
     _current: Optional["EscListener"] = None
@@ -52,6 +55,8 @@ class EscListener:
     def __enter__(self):
         self.interrupted = False
         self._stop_event.clear()
+        self.buffered_text = bytearray()
+        self.submit_pending = False
         EscListener._current = self
 
         # Check if stdin is an interactive terminal and termios is available
@@ -113,7 +118,9 @@ class EscListener:
                             pass
                         continue
 
-                    # Standalone ESC key pressed!
+                    # Standalone ESC: clear queued input so a stale buffer can't fire after an abort.
+                    self.buffered_text = bytearray()
+                    self.submit_pending = False
                     self.interrupted = True
                     self._stop_event.set()
                     if self.on_escape:
@@ -125,6 +132,8 @@ class EscListener:
 
                 elif b == b"\x03":
                     # In case Ctrl+C is passed through unhandled
+                    self.buffered_text = bytearray()
+                    self.submit_pending = False
                     self.interrupted = True
                     self._stop_event.set()
                     if self.on_escape:
@@ -133,6 +142,12 @@ class EscListener:
                         except Exception:
                             pass
                     break
+
+                else:
+                    # Queue-ahead typing: buffer bytes typed during the turn.
+                    self.submit_pending = _apply_buffer_byte(
+                        self.buffered_text, self.submit_pending, b[0]
+                    )
 
             except Exception:
                 break
@@ -182,6 +197,14 @@ class EscListener:
                 pass
             self._old_settings = None
 
+    def drain(self) -> tuple:
+        """Returns (text, submit_pending) and clears the queued-input buffer."""
+        text = bytes(self.buffered_text).decode("utf-8", errors="replace")
+        submit = self.submit_pending
+        self.buffered_text = bytearray()
+        self.submit_pending = False
+        return text, submit
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._stop_event.set()
         if EscListener._current is self:
@@ -191,6 +214,29 @@ class EscListener:
         if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
             self._thread.join(timeout=0.5)
         self._cleanup_terminal()
+
+
+def _apply_buffer_byte(buffer: bytearray, submit_pending: bool, b: int) -> bool:
+    """Processes one input byte seen during a turn and returns the new submit flag.
+
+    Mutates `buffer` in place. Once submit_pending is True, further input is ignored
+    until the turn ends and the buffer is drained.
+    """
+    if submit_pending:
+        return True
+    if b in (0x0A, 0x0D):  # Enter (LF or CR)
+        return True
+    if b in (0x7F, 0x08):  # Backspace (DEL or BS)
+        if buffer:
+            buffer.pop()
+        return False
+    if b == 0x15:  # Ctrl-U clears the line
+        buffer.clear()
+        return False
+    if 0x20 <= b <= 0x7E or b >= 0x80:  # printable ASCII + any high byte (UTF-8)
+        buffer.append(b)
+        return False
+    return False  # ignore other control chars (Tab, Ctrl-A, etc.)
 
 
 def prompt_input(prompt: str = "") -> str:

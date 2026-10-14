@@ -285,19 +285,23 @@ def _toolbar_active() -> bool:
     return bool(_toolbar_provider and sys.stdin.isatty() and sys.stdout.isatty() and _get_pt_session() is not None)
 
 
-def _read_line(prompt: str) -> str:
-    """One line of input with history/completion on a TTY, plain input() otherwise."""
+def _read_line(prompt: str, default: str = "") -> str:
+    """One line of input with history/completion on a TTY, plain input() otherwise.
+
+    `default` prefills the editable line (prompt_toolkit only); plain input() ignores it.
+    """
     if sys.stdin.isatty() and sys.stdout.isatty():
         pt = _get_pt_session()
         if pt is not None:
             from prompt_toolkit.formatted_text import ANSI, FormattedText
+            kw = {"default": default} if default else {}
             if _toolbar_provider:
-                return pt.prompt(ANSI(prompt), bottom_toolbar=lambda: FormattedText(_toolbar_fragments()), refresh_interval=1.0)
-            return pt.prompt(ANSI(prompt))
+                return pt.prompt(ANSI(prompt), bottom_toolbar=lambda: FormattedText(_toolbar_fragments()), refresh_interval=1.0, **kw)
+            return pt.prompt(ANSI(prompt), **kw)
     return input(prompt)
 
 
-def read_input_prompt(first_prompt: str, multiline: bool = True) -> str:
+def read_input_prompt(first_prompt: str, multiline: bool = True, prefill: str = "") -> str:
     """
     Reads user input with multi-line support enabled by default.
     - Ctrl+C on the first line raises PromptInterrupted; Ctrl+D returns "".
@@ -307,7 +311,7 @@ def read_input_prompt(first_prompt: str, multiline: bool = True) -> str:
     - Pasted text with internal blank lines is preserved without prematurely submitting.
     """
     try:
-        first_line = _read_line(first_prompt)
+        first_line = _read_line(first_prompt, default=prefill) if prefill else _read_line(first_prompt)
     except EOFError:
         return ""
     except KeyboardInterrupt:
@@ -390,6 +394,9 @@ class _LoopCtx:
         self.task = None
         self.read_fut = None
         self.sigint = 0
+        # Queue-ahead typing: text captured during a turn, awaiting next iteration
+        self.queued_input: str = ""
+        self.queued_submit: bool = False
 
 
 def _prompt_string(session) -> str:
@@ -1283,22 +1290,36 @@ async def interactive_loop(session: MultiGpuHybridSession):
 
     try:
         while True:
-            try:
-                if not session.json_output and not _toolbar_active():
-                    say.dim(_plain_pill(session))
-                ctx.read_fut = _spawn_reader(loop, read_input_prompt, _prompt_string(session), session.multiline_input)
-                user_input = await ctx.read_fut
-            except PromptInterrupted:
-                ctx.sigint += 1
-                if ctx.sigint >= 2:
-                    say.dim("Exiting session.")
+            # Queue-ahead typing: if the user hit Enter during the previous turn, auto-send it
+            if ctx.queued_submit and ctx.queued_input:
+                user_input = ctx.queued_input
+                ctx.queued_input = ""
+                ctx.queued_submit = False
+                if not session.json_output:
+                    say.dim(f"» (sending queued input: {user_input!r})")
+            else:
+                try:
+                    if not session.json_output and not _toolbar_active():
+                        say.dim(_plain_pill(session))
+                    prefill = ctx.queued_input
+                    ctx.queued_input = ""
+                    ctx.queued_submit = False
+                    if prefill:
+                        ctx.read_fut = _spawn_reader(loop, read_input_prompt, _prompt_string(session), session.multiline_input, prefill)
+                    else:
+                        ctx.read_fut = _spawn_reader(loop, read_input_prompt, _prompt_string(session), session.multiline_input)
+                    user_input = await ctx.read_fut
+                except PromptInterrupted:
+                    ctx.sigint += 1
+                    if ctx.sigint >= 2:
+                        say.dim("Exiting session.")
+                        break
+                    say.dim("[^C] Press Ctrl+C again to exit.")
+                    continue
+                except (EOFError, SystemExit, _ExitSession):
                     break
-                say.dim("[^C] Press Ctrl+C again to exit.")
-                continue
-            except (EOFError, SystemExit, _ExitSession):
-                break
-            finally:
-                ctx.read_fut = None
+                finally:
+                    ctx.read_fut = None
             ctx.sigint = 0
             user_input = user_input.strip()
             if not user_input:
@@ -1452,9 +1473,11 @@ async def interactive_loop(session: MultiGpuHybridSession):
                     lambda: ctx.task.cancel() if ctx.task and not ctx.task.done() else None
                 )
             )
+            turn_ok = False
             try:
                 with esc_listener:
                     await ctx.task
+                turn_ok = True
             except asyncio.CancelledError:
                 if session.json_output:
                     print(json.dumps({"status": "cancelled", "interrupted_by": "esc" if esc_listener.interrupted else "sigint", "prompt": prompt}, indent=2))
@@ -1479,6 +1502,11 @@ async def interactive_loop(session: MultiGpuHybridSession):
                     say.err(f"Error during turn: {e}")
             finally:
                 ctx.task = None
+                # Pick up anything typed during the turn; discard on abort/error
+                queued_text, queued_submit = esc_listener.drain()
+                if turn_ok and queued_text:
+                    ctx.queued_input = queued_text
+                    ctx.queued_submit = queued_submit
 
     finally:
         try:
