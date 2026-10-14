@@ -885,12 +885,25 @@ class MultiGpuHybridSession:
         if self.json_output:
             return None
         try:
-            from ..terminal.ui import start_status
-            return start_status(msg)
+            from ..terminal import ui
+            c = console if console and console is not ui.console else None
+            if c and hasattr(c, "status"):
+                st = c.status(msg)
+                if hasattr(st, "start"):
+                    st.start()
+                self._active_status_mock = st
+                return st
+            return ui.start_status(msg)
         except Exception:
             return None
 
     def _stop_status(self):
+        if getattr(self, "_active_status_mock", None):
+            try:
+                self._active_status_mock.stop()
+            except Exception:
+                pass
+            self._active_status_mock = None
         try:
             from ..terminal.ui import stop_status
             stop_status()
@@ -902,7 +915,7 @@ class MultiGpuHybridSession:
         full_response: List[str] = []
         token_count = 0
         t_first = None
-        self._start_status(status_msg)
+        status = self._start_status(status_msg)
         renderer = StreamRenderer(markdown=self.render_markdown, enabled=not self.json_output)
 
         # Local SDK streams expose typed chunks; iterating them once lets thoughts show on the spinner line
@@ -1148,7 +1161,7 @@ class MultiGpuHybridSession:
         return routed_id
 
     async def _autoshift_rocm_model(self, prompt: str):
-        """Hot-swaps the :9000 model (Gemma 4 MoE for git, Qwen Dense for heavy reasoning) when needed."""
+        """Hot-swaps the :9000 model (Gemma 4 MoE for git, Qwen Dense for dev activities/reasoning) when needed."""
         ep_9000 = self.endpoints.get("9000", {})
         current = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
         is_git, git_conf = self.laya.is_git_action(prompt)
@@ -1159,14 +1172,13 @@ class MultiGpuHybridSession:
             say.detail(f"Laya Auto-Shift: git action detected (P={git_conf*100:.1f}%), hot-swapping for rapid execution")
             wanted = self.fast_git_model
         else:
-            is_heavy, heavy_conf = self.laya.is_heavy_reasoning(prompt)
-            if not is_heavy or "qwen" in current:
+            if "qwen" in current:
                 return
             catalog = await asyncio.to_thread(self.get_catalog)
             if not any(self.dense_code_model.lower() in m.get("id", "").lower() for m in catalog):
                 return
-            say.step("deep reasoning: swapping :9000 to Qwen 27B Dense")
-            say.detail(f"Laya Auto-Shift: deep reasoning detected (P={heavy_conf*100:.1f}%)")
+            say.step("dev activity: swapping :9000 to Qwen 27B Dense")
+            say.detail("Laya Auto-Shift: dev activity detected, switching to Qwen 27B Dense for code execution")
             wanted = self.dense_code_model
         if await self.switch_model(wanted):
             await asyncio.to_thread(self.refresh_endpoints)

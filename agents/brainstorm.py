@@ -471,6 +471,13 @@ class BrainstormWorkflow:
         # ── PHASE 2: Local Implementation, one milestone at a time ────────
         say.group("Phase 2/5: implementation (milestone by milestone)")
         session.active_target = "9000"
+        if getattr(session, "auto_git_shift", False) and session.active_target == "9000":
+            ep_9000 = session.endpoints.get("9000", {})
+            curr = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
+            if "qwen" not in curr:
+                say.step("dev activity: switching :9000 to Qwen 27B Dense for implementation")
+                if await session.switch_model(session.dense_code_model):
+                    await asyncio.to_thread(session.refresh_endpoints)
         while True:
             with open(plan_path, "r", encoding="utf-8") as f:
                 plan_text = cls._strip_meta(f.read())
@@ -607,14 +614,22 @@ class BrainstormWorkflow:
                 to_add = sorted(cls._git_paths(repo_root) - dirty_before)
                 if not to_add:
                     say.warn("No new changes to commit.")
-                    return
-                subprocess.run(["git", "add", "-A", "--", *to_add], cwd=repo_root, check=True)
-                subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_root, check=True)
-                say.ok(f"Changes successfully committed: '{commit_msg}'")
-                kontexta_sync.sync_event(
-                    session, "brainstorm", idea, repo_root, commit=kontexta_sync.commit_info(repo_root),
-                    outcome="implemented, reviewed and committed", spec_path=plan_path,
-                )
+                else:
+                    if getattr(session, "auto_git_shift", False):
+                        ep_9000 = session.endpoints.get("9000", {})
+                        curr = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
+                        if "gemma" not in curr:
+                            say.step("git action: swapping :9000 to Gemma 4 A4B for commit")
+                            if await session.switch_model(session.fast_git_model):
+                                await asyncio.to_thread(session.refresh_endpoints)
+
+                    subprocess.run(["git", "add", "-A", "--", *to_add], cwd=repo_root, check=True)
+                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_root, check=True)
+                    say.ok(f"Changes successfully committed: '{commit_msg}'")
+                    kontexta_sync.sync_event(
+                        session, "brainstorm", idea, repo_root, commit=kontexta_sync.commit_info(repo_root),
+                        outcome="implemented, reviewed and committed", spec_path=plan_path,
+                    )
             else:
                 say.warn("Changes left in working directory uncommitted.")
                 kontexta_sync.sync_event(
@@ -623,3 +638,11 @@ class BrainstormWorkflow:
                 )
         except Exception as e:
             say.err(f"Commit operation failed or skipped: {e}")
+        finally:
+            if getattr(session, "auto_git_shift", False) and session.active_target == "9000":
+                ep_9000 = session.endpoints.get("9000", {})
+                curr = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
+                if "qwen" not in curr:
+                    say.step("dev activity: switching :9000 back to Qwen 27B Dense")
+                    if await session.switch_model(session.dense_code_model):
+                        await asyncio.to_thread(session.refresh_endpoints)

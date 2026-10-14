@@ -191,6 +191,14 @@ class LayaDecisionEngine:
         """
         lower = prompt.lower().strip()
 
+        # Implementation tasks and code directives are dev activities, not git actions
+        dev_indicators = [
+            "task: implement", "implement only", "use tools (view_file", "edit_file", "write_to_file",
+            "diagnosed root causes", "recommendations on our changes", "implement the required changes"
+        ]
+        if any(ind in lower for ind in dev_indicators):
+            return False, 0.05
+
         # Instant check for explicit git commands or workflows
         git_exact_triggers = [
             "git status", "git diff", "git add", "git commit", "git push", "git pull",
