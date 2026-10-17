@@ -400,7 +400,7 @@ def ensure_ready(model_id: str, port: int | str, timeout: float = 45.0,
         time.sleep(0.5)
 
 
-def wake_compactor(port: int | str = 9001, timeout: float = 45.0,
+def wake_compactor(port: int | str = 9002, timeout: float = 45.0,
                    on_progress: Optional[Callable[[float], None]] = None) -> Dict[str, Any]:
     """Brings the compactor model up on its own port, refusing when that would disturb the main model."""
     from ..config import COMPACTOR_MODEL_ID

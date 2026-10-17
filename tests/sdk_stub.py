@@ -37,6 +37,7 @@ class McpStreamableHttpServer(McpStdioServer):
 class _Cfg:
     def __init__(self, *a, **kw):
         self.args, self.kwargs = a, kw
+        self.__dict__.update(kw)
 
 
 class Agent:
@@ -64,13 +65,16 @@ def install():
     hooks_mod = pytypes.ModuleType("google.antigravity.hooks")
     hooks_mod.pre_tool_call_decide = lambda f: f
     hooks_mod.post_tool_call = lambda f: f
+    hooks_mod.on_compaction = lambda f: f
     policy_mod = pytypes.SimpleNamespace(
         allow_all=lambda: "allow_all",
         confirm_run_command=lambda handler: ["confirm", handler],
     )
     hooks_mod.policy = policy_mod
 
-    ag.Agent, ag.LocalAgentConfig, ag.LocalOpenAIAgentConfig, ag.CapabilitiesConfig = Agent, _Cfg, _Cfg, _Cfg
+    types_mod.CompactionConfig = _Cfg
+    types_mod.UsageMetadata = _Cfg
+    ag.Agent, ag.LocalAgentConfig, ag.LocalOpenAIAgentConfig, ag.CapabilitiesConfig, ag.CompactionConfig = Agent, _Cfg, _Cfg, _Cfg, _Cfg
     ag.types, ag.hooks = types_mod, hooks_mod
     sys.modules.update({
         "google": google,

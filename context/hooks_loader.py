@@ -84,6 +84,17 @@ class ExternalHooksManager:
     _cached_configs: Optional[List[Dict[str, Any]]] = None
     _cached_sources: List[str] = []
     _cached_mtime: float = 0.0
+    _in_process_hooks: List[Any] = []
+
+    @classmethod
+    def register_in_process_hook(cls, hook_obj: Any):
+        """Registers an in-process native SDK hook (Inspect, Decide, or Transform)."""
+        cls._in_process_hooks.append(hook_obj)
+
+    @classmethod
+    def clear_in_process_hooks(cls):
+        """Clears registered in-process hooks."""
+        cls._in_process_hooks.clear()
 
     @classmethod
     def discover_hook_files(cls, repo_root: str = ".") -> List[str]:
@@ -256,7 +267,7 @@ class ExternalHooksManager:
         """
         hook_entries, source_files = cls.load_hook_configs(repo_root)
         if not hook_entries:
-            return []
+            return list(cls._in_process_hooks)
 
         active_hooks = []
 
@@ -382,5 +393,8 @@ class ExternalHooksManager:
                         print(f"{UI.DARK_GRAY}  │ [Hook Completed: {handler['name']} (PostToolUse)]{UI.RST}")
 
             active_hooks.append(external_post_tool)
+
+        if cls._in_process_hooks:
+            active_hooks.extend(cls._in_process_hooks)
 
         return active_hooks

@@ -34,7 +34,17 @@ def _emit(text: str):
     if _state["json"]:
         print(_strip(text), file=sys.stderr, flush=True)
     else:
-        print(text, flush=True)
+        try:
+            from .esc_listener import EscListener
+            had_box = bool(EscListener._current and getattr(EscListener._current, "_box_drawn", False))
+            if had_box:
+                EscListener.clear_box()
+            print(text, flush=True)
+            cur = EscListener._current
+            if cur and (cur.buffered_text or cur.submit_pending):
+                cur._render_live_input()
+        except Exception:
+            print(text, flush=True)
 
 
 def _width(cap: int = 0) -> int:
@@ -85,6 +95,24 @@ def dim(msg):
 
 def plain(msg):
     _emit(str(msg))
+
+
+def markdown(text: str):
+    if _state["json"]:
+        _emit(text)
+        return
+    if _rich_ok():
+        try:
+            from rich.markdown import Markdown
+            _ui.console.push_theme(_ui.MD_THEME)
+            try:
+                _ui.console.print(Markdown(str(text)))
+            finally:
+                _ui.console.pop_theme()
+            return
+        except Exception:
+            pass
+    plain(text)
 
 
 def step(msg):

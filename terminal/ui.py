@@ -3,9 +3,10 @@
 import os
 import re
 import sys
+from typing import Any
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.markdown import Markdown
     from rich.table import Table
     from rich.live import Live
@@ -27,6 +28,8 @@ except ImportError:
     box = None
     Text = None
     Theme = None
+    Panel = None
+    Group = None
 
 
 # 256-color codes per theme; targets identify models only, amber=warn, red=error, gray=chrome
@@ -94,7 +97,7 @@ class UI:
         t = str(target).lower().strip()
         if t in ("9000", "rocm", "amd", "gpu0"):
             return cls.ROCM
-        if t in ("9001", "cuda", "nvidia", "gpu1"):
+        if t in ("9001", "9002", "cuda", "nvidia", "gpu1"):
             return cls.CUDA
         if t in ("cloud", "gemini", "oauth"):
             return cls.CLOUD
@@ -270,11 +273,27 @@ class StreamRenderer:
         b = block.strip()
         if not b or not console:
             return
+        had_box = False
+        try:
+            from .esc_listener import EscListener
+            had_box = bool(EscListener._current and getattr(EscListener._current, "_box_drawn", False))
+            if had_box:
+                EscListener.clear_box()
+        except Exception:
+            pass
         console.push_theme(MD_THEME)
         try:
             console.print(StyledMarkdown(b))
         finally:
             console.pop_theme()
+        if had_box:
+            try:
+                from .esc_listener import EscListener
+                cur = EscListener._current
+                if cur and (cur.buffered_text or cur.submit_pending):
+                    cur._render_live_input()
+            except Exception:
+                pass
 
     def _flush_pending(self):
         if self._pending:
@@ -392,4 +411,241 @@ def stop_status():
         except Exception:
             pass
         _active_status = None
+
+
+async def render_turn_live(session, prompt: str, cancel_event=None) -> Any:
+    """Connects native triple-stream callbacks into a single rich.live.Live layout."""
+    if not RICH_AVAILABLE or not console or getattr(session, "json_output", False):
+        if hasattr(session, "run_turn"):
+            return await session.run_turn(prompt, cancel_event=cancel_event)
+        return await session.chat(prompt)
+
+    thought_buf: list[str] = []
+    answer_buf: list[str] = []
+    active_tools: list[str] = []
+
+    def _build_renderable():
+        blocks = []
+        if thought_buf and not answer_buf:
+            snippet = "".join(thought_buf)[-400:]
+            blocks.append(
+                Panel(Text(snippet, style="dim italic"), title="🧠 Reasoning", border_style="dim")
+            )
+        if active_tools:
+            blocks.append(Text(f"⚙ Running: {active_tools[-1]}", style="bold cyan"))
+        if answer_buf:
+            blocks.append(Markdown("".join(answer_buf)))
+        return Group(*blocks) if blocks else Text("")
+
+    with Live(_build_renderable(), console=console, refresh_per_second=20) as live:
+        receipt = await session.run_turn(
+            prompt=prompt,
+            on_thought=lambda t: (thought_buf.append(t), live.update(_build_renderable())),
+            on_tool_start=lambda name, _: (active_tools.append(name), live.update(_build_renderable())),
+            on_token=lambda tok: (answer_buf.append(tok), live.update(_build_renderable())),
+            cancel_event=cancel_event,
+        )
+
+    # Render compact Turn Receipt footer
+    console.print(
+        f"[dim]── {receipt.target.upper()} ({receipt.model_id}) │ "
+        f"Δfiles: {receipt.files_changed} │ cmds: {receipt.commands_run} │ "
+        f"TTFT: {receipt.ttft_ms:.0f}ms │ {receipt.tok_per_sec:.1f} tok/s "
+        f"({receipt.elapsed_s:.1f}s)[/dim]"
+    )
+    return receipt
+
+
+# ── 3-Zone Prefix-Preserving Memory Telemetry ──────────────────────────
+
+try:
+    from ..core.session import ContextZoneTelemetry
+except Exception:
+    try:
+        from myagy.core.session import ContextZoneTelemetry
+    except Exception:
+        ContextZoneTelemetry = Any
+
+
+def _build_stacked_context_bar(ctx: ContextZoneTelemetry, width: int = 56) -> Any:
+    """
+    Renders a single-line multi-zone proportional bar with a watermark tick (`│`):
+      [cyan]█[/cyan] Zone 1 (System/AST)
+      [magenta]█[/magenta] Zone 2 (Frozen Epochs)
+      [yellow]█[/yellow] Zone 3 (Active Window)
+      [dim]░[/dim] Headroom
+    """
+    if not RICH_AVAILABLE or Text is None:
+        return ""
+    total_max = max(1, ctx.n_ctx_max)
+    z1_cells = round((ctx.zone1_tokens / total_max) * width)
+    z2_cells = round((ctx.zone2_tokens / total_max) * width)
+    z3_cells = round((ctx.zone3_tokens / total_max) * width)
+
+    # Guarantee non-zero zones show at least 1 cell for visibility
+    if ctx.zone1_tokens > 0 and z1_cells == 0:
+        z1_cells = 1
+    if ctx.zone2_tokens > 0 and z2_cells == 0:
+        z2_cells = 1
+    if ctx.zone3_tokens > 0 and z3_cells == 0:
+        z3_cells = 1
+
+    used_cells = min(width, z1_cells + z2_cells + z3_cells)
+    watermark_pos = min(width - 1, round(ctx.compaction_watermark_ratio * width))
+
+    bar = Text()
+    for i in range(width):
+        if i == watermark_pos:
+            bar.append("┃", style="bold red")
+            continue
+        if i < z1_cells:
+            bar.append("█", style="bold cyan")
+        elif i < z1_cells + z2_cells:
+            bar.append("█", style="bold magenta")
+        elif i < used_cells:
+            bar.append("█", style="bold yellow")
+        else:
+            bar.append("░", style="dim bright_black")
+
+    return bar
+
+
+def render_context_telemetry(ctx: ContextZoneTelemetry) -> None:
+    """Renders the `/context` (`/ctx`) panel with Zone 1-3 breakdown & KV cache state."""
+    if not RICH_AVAILABLE or not console or Text is None or Table is None or Panel is None or Group is None:
+        pct = ctx.utilization_pct
+        print(f"--- Context Window Telemetry [{ctx.target.upper()} ({ctx.model_id})] ---")
+        print(f"Window: {ctx.total_used_tokens:,} / {ctx.n_ctx_max:,} tok ({pct:.1f}%)")
+        print(f"  Zone 1: {ctx.zone1_tokens:,} tok")
+        print(f"  Zone 2: {ctx.zone2_tokens:,} tok ({ctx.frozen_epoch_count} blocks)")
+        print(f"  Zone 3: {ctx.zone3_tokens:,} tok")
+        print(f"  Headroom: {ctx.headroom_tokens:,} tok")
+        print(f"  KV Reuse: {ctx.kv_prefix_hit_pct:.0f}% ({ctx.kv_cached_tokens:,} tok)")
+        return
+
+    bar = _build_stacked_context_bar(ctx, width=58)
+
+    # Color-code overall utilization severity
+    pct = ctx.utilization_pct
+    pct_style = "bold green" if pct < 60 else ("bold yellow" if pct < 80 else "bold red")
+
+    header_line = Text.assemble(
+        ("  Window: ", "dim"),
+        bar,
+        (f"  {pct:5.1f}% ", pct_style),
+        (f"({ctx.total_used_tokens:,} / {ctx.n_ctx_max:,} tok)", "dim"),
+    )
+
+    legend_line = Text.assemble(
+        ("  Legend: ", "dim"),
+        ("█ Zone 1: System/AST ", "bold cyan"),
+        ("█ Zone 2: Frozen Epochs ", "bold magenta"),
+        ("█ Zone 3: Active Turns ", "bold yellow"),
+        ("┃ Compaction Trigger (75%)", "bold red"),
+    )
+
+    # Zone 1-3 Breakdown Table
+    table = Table(
+        box=box.SIMPLE_HEAVY if box else None,
+        expand=True,
+        show_edge=False,
+        pad_edge=False,
+        header_style="bold white",
+    )
+    table.add_column("Memory Zone", style="white", ratio=3)
+    table.add_column("Sub-Component", style="dim", ratio=4)
+    table.add_column("Tokens", justify="right", ratio=2)
+    table.add_column("% of Max", justify="right", ratio=1)
+    table.add_column("KV Cache Policy", justify="left", ratio=3)
+
+    def _pct_str(tokens: int) -> str:
+        return f"{(tokens / ctx.n_ctx_max * 100.0):.1f}%" if ctx.n_ctx_max else "0.0%"
+
+    # Zone 1 Rows
+    table.add_row(
+        "[bold cyan]Zone 1: Static Prefix[/bold cyan]",
+        "GEMINI.md / instructions.py",
+        f"{ctx.instructions_tokens:,}",
+        _pct_str(ctx.instructions_tokens),
+        "[green]Pinned (100% KV Hit)[/green]",
+    )
+    table.add_row(
+        "",
+        "RepoMap AST Outline (repomap.py)",
+        f"{ctx.repomap_tokens:,}",
+        _pct_str(ctx.repomap_tokens),
+        "[green]mtime-cached (<1.5ms)[/green]",
+    )
+    table.add_row(
+        "",
+        "MCP Tool Schemas (kxta + native)",
+        f"{ctx.mcp_schema_tokens:,}",
+        _pct_str(ctx.mcp_schema_tokens),
+        "[green]Pinned Prefix[/green]",
+        end_section=True,
+    )
+
+    # Zone 2 Row
+    table.add_row(
+        "[bold magenta]Zone 2: Working Memory[/bold magenta]",
+        f"Frozen Epochs ({ctx.frozen_epoch_count} blocks)",
+        f"{ctx.frozen_epoch_tokens:,}",
+        _pct_str(ctx.frozen_epoch_tokens),
+        "[magenta]Append-Only (KV Safe)[/magenta]",
+        end_section=True,
+    )
+
+    # Zone 3 Rows
+    table.add_row(
+        "[bold yellow]Zone 3: Active Window[/bold yellow]",
+        f"Tier-0 Pruned Turns (-{ctx.tier0_saved_tokens:,} tok saved)",
+        f"{ctx.pruned_turn_tokens:,}",
+        _pct_str(ctx.pruned_turn_tokens),
+        "[yellow]Tool stdout elided[/yellow]",
+    )
+    table.add_row(
+        "",
+        "Verbatim Recent Turns",
+        f"{ctx.verbatim_turn_tokens:,}",
+        _pct_str(ctx.verbatim_turn_tokens),
+        "[yellow]Dynamic Tail[/yellow]",
+        end_section=True,
+    )
+
+    # Summary / Headroom Row
+    watermark_tok = int(ctx.n_ctx_max * ctx.compaction_watermark_ratio)
+    tokens_until_compact = max(0, watermark_tok - ctx.total_used_tokens)
+    table.add_row(
+        "[bold green]Available Headroom[/bold green]",
+        f"{tokens_until_compact:,} tok until next CUDA:9002 epoch compaction",
+        f"[bold green]{ctx.headroom_tokens:,}[/bold green]",
+        f"[bold green]{100.0 - pct:.1f}%[/bold green]",
+        f"[cyan]KV Reuse: {ctx.kv_prefix_hit_pct:.0f}% ({ctx.kv_cached_tokens:,} tok)[/cyan]",
+    )
+
+    panel = Panel(
+        Group(header_line, legend_line, Text(""), table),
+        title=(
+            f"[bold cyan]🧠 Context Window Telemetry[/bold cyan] "
+            f"[dim]── Target: {ctx.target.upper()} ({ctx.model_id})[/dim]"
+        ),
+        border_style="cyan",
+        padding=(1, 2),
+    )
+    console.print(panel)
+
+
+def format_toolbar_context_segment(ctx: ContextZoneTelemetry) -> str:
+    """
+    Returns an ANSI/prompt_toolkit compact status string for the bottom bar:
+    e.g., 'CTX: 6.4k/32k (20%) [Epochs:2 | KV:94%]'
+    """
+    used_k = ctx.total_used_tokens / 1000.0
+    max_k = ctx.n_ctx_max / 1000.0
+    return (
+        f"CTX: {used_k:.1f}k/{max_k:.0f}k ({ctx.utilization_pct:.0f}%) "
+        f"[Epochs:{ctx.frozen_epoch_count} | KV:{ctx.kv_prefix_hit_pct:.0f}%]"
+    )
+
+
 

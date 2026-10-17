@@ -31,8 +31,18 @@ def __getattr__(name):
 
 
 def main():
-    return importlib.import_module(f"{_PKG_NAME}.terminal.cli").main()
+    cli_mod = importlib.import_module(f"{_PKG_NAME}.terminal.cli")
+    reloader_mod = importlib.import_module(f"{_PKG_NAME}.core.reloader")
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        return cli_mod.main()
+    shm_path = asyncio.run(cli_mod.main())
+    if shm_path is not None:
+        reloader_mod.perform_execv_reload(shm_path)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

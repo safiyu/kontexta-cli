@@ -9,16 +9,18 @@ import contextvars
 import subprocess
 import urllib.request
 import urllib.error
+import hashlib
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 
 from ..config import OAUTH_TOKEN_PATH
 from ..terminal.ui import UI
 from ..terminal import say
 from ..core.llamashift import wake_compactor, ctx_size_for_port
-from ..core.coordinator import CudaCoordinator
+from ..core.coordinator import CudaCoordinator, PreemptedByHigherPriority, CudaPriority
 
 
-# Set by the async path, which wakes :9001 on the event loop so worker threads never touch session state
+# Set by the async path, which wakes :9002 on the event loop so worker threads never touch session state
 _SKIP_CUDA_WAKE: contextvars.ContextVar = contextvars.ContextVar("skip_cuda_wake", default=False)
 
 
@@ -166,7 +168,7 @@ class ContextCurator:
         max_ctx = None
         is_exact = False
 
-        if tgt in ("9000", "9001"):
+        if tgt in ("9000", "9002"):
             port = session.endpoints[tgt]["port"]
             try:
                 req = urllib.request.Request(f"http://localhost:{port}/slots", headers={"User-Agent": "Antigravity/1.0"})
@@ -189,7 +191,7 @@ class ContextCurator:
             sys_len = len(session.build_system_context(tgt, include_history=False))
             hist_len = sum(len(h.get("content", "")) for h in session.history)
             n_tokens = int((sys_len + hist_len) / 3.6)
-            if tgt in ("9000", "9001"):
+            if tgt in ("9000", "9002"):
                 max_ctx = ctx_size_for_port(session.endpoints[tgt]["port"]) or 131072
             else:
                 max_ctx = 1048576  # Gemini 1M context
@@ -260,8 +262,8 @@ class ContextCurator:
         target_lbl = session.target_name(session.active_target)
         ac_st = f"every {session.autocompact_threshold} turns" if session.autocompact_threshold > 0 else "off"
         cuda_syn_st = (
-            "online (:9001 Granite-8B)"
-            if session.endpoints.get("9001", {}).get("status") == "online"
+            "online (:9002 Granite-8B)"
+            if session.endpoints.get("9002", {}).get("status") == "online"
             else "standby or offline (launch_cuda_compactor.sh or /compactor start)"
         )
         say.card(f"Context window ({target_lbl})", [
@@ -278,7 +280,7 @@ class ContextCurator:
     @staticmethod
     def synthesize_context_cuda_sync(session: Any, turns: List[Dict[str, str]]) -> Optional[str]:
         """
-        Tier 1: Sends older turns to Port 9001 (NVIDIA CUDA GPU) to generate high-density Working Memory.
+        Tier 1: Sends older turns to Port 9002 (NVIDIA CUDA GPU) to generate high-density Working Memory.
         Auto-wakes via Llama-Launcher if offline.
         """
         if not turns:
@@ -286,16 +288,16 @@ class ContextCurator:
         if CudaCoordinator.state() == "subagent":
             # Defer to running subagent - do not compete for CUDA slots
             return None
-        ep9001 = session.endpoints.get("9001", {})
-        if ep9001.get("status") != "online" and not _SKIP_CUDA_WAKE.get():
-            woke = wake_compactor(9001)
+        ep9002 = session.endpoints.get("9002", {})
+        if ep9002.get("status") != "online" and not _SKIP_CUDA_WAKE.get():
+            woke = wake_compactor(9002)
             _note_wake_warnings(woke["warnings"])
             if woke["ok"]:
                 session.refresh_endpoints()
-                ep9001 = session.endpoints.get("9001", {})
+                ep9002 = session.endpoints.get("9002", {})
             else:
                 _note_wake_skipped(woke["reason"])
-        if ep9001.get("status") != "online":
+        if ep9002.get("status") != "online":
             return None
 
         conversation_log = _format_conversation_log(turns)
@@ -310,9 +312,9 @@ class ContextCurator:
             "Be factual, concise, and preserve filenames, functions, and error messages."
         )
 
-        model_name = ep9001.get("filename") or "granite-4.2-8b"
+        model_name = ep9002.get("filename") or "granite-4.2-8b"
         return _query_local_endpoint(
-            "http://127.0.0.1:9001/v1/chat/completions",
+            "http://127.0.0.1:9002/v1/chat/completions",
             model_name=model_name,
             system_instruction=system_instruction,
             conversation_log=conversation_log,
@@ -522,18 +524,18 @@ class ContextCurator:
     def synthesize_working_memory(cls, session: Any, turns: List[Dict[str, str]], silent: bool = False) -> Tuple[str, str]:
         """
         Synthesizes Working Memory through a resilient multi-tier fallback pipeline:
-          Tier 1: NVIDIA RTX 4060 (:9001) dedicated compactor
+          Tier 1: NVIDIA RTX 4060 (:9002) dedicated compactor
           Tier 2: AMD ROCm (:9000) primary executive model
           Tier 3: Google Cloud Gemini via OAuth
           Tier 4: Structured Deterministic Extractor (guaranteed non-empty)
         Returns: (synthesized_text, synthesized_by_label)
         """
-        # Tier 1: NVIDIA CUDA:9001
+        # Tier 1: NVIDIA CUDA:9002
         if CudaCoordinator.state() != "subagent":
             try:
                 syn = cls.synthesize_context_cuda_sync(session, turns)
                 if syn and syn.strip():
-                    return syn.strip(), "NVIDIA RTX 4060 (:9001)"
+                    return syn.strip(), "NVIDIA RTX 4060 (:9002)"
             except Exception:
                 pass
             if not silent and not session.json_output:
@@ -567,10 +569,10 @@ class ContextCurator:
 
     @staticmethod
     async def _wake_cuda_async(session: Any):
-        """Starts :9001 and refreshes endpoints on the event loop, so the synthesis thread never mutates session state."""
-        if session.endpoints.get("9001", {}).get("status") == "online":
+        """Starts :9002 and refreshes endpoints on the event loop, so the synthesis thread never mutates session state."""
+        if session.endpoints.get("9002", {}).get("status") == "online":
             return
-        woke = await asyncio.to_thread(wake_compactor, 9001)
+        woke = await asyncio.to_thread(wake_compactor, 9002)
         _note_wake_warnings(woke["warnings"])
         if woke["ok"]:
             await asyncio.to_thread(session.refresh_endpoints)
@@ -687,4 +689,359 @@ class ContextCurator:
             say.ok(f"History compacted{label_by}: {removed} old entries moved to working memory, {len(sanitized_recent)} recent kept verbatim.")
 
         return removed
+
+
+# GBNF / JSON Schema enforced on Granite 4.2 8B (:9002) so it never hallucinates prose
+EPOCH_LEDGER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "epoch_goal": {"type": "string"},
+        "files_touched": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "changes": {"type": "string"},
+                },
+                "required": ["path", "changes"],
+            },
+        },
+        "decisions_and_invariants": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "failed_hypotheses_do_not_repeat": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "unresolved_blockers": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "epoch_goal",
+        "files_touched",
+        "decisions_and_invariants",
+        "failed_hypotheses_do_not_repeat",
+        "unresolved_blockers",
+    ],
+}
+
+
+@dataclass(slots=True)
+class FrozenEpoch:
+    epoch_id: int
+    turn_range: tuple[int, int]
+    kontexta_ref: str          # e.g., "kxta://session/abc/epoch-1"
+    git_tree_sha: str | None   # Checkpoint hash from checkpoints.py
+    ledger: dict[str, Any]     # Parsed EPOCH_LEDGER_SCHEMA
+
+    def to_prompt_block(self) -> str:
+        """Renders a dense, deterministic Markdown block that never mutates."""
+        files = ", ".join(
+            f"`{f['path']}` ({f['changes']})" for f in self.ledger.get("files_touched", [])
+        ) or "none"
+        decisions = "; ".join(self.ledger.get("decisions_and_invariants", [])) or "none"
+        failed = "; ".join(self.ledger.get("failed_hypotheses_do_not_repeat", [])) or "none"
+        blockers = "; ".join(self.ledger.get("unresolved_blockers", [])) or "none"
+
+        return (
+            f"### [Frozen Epoch {self.epoch_id} | Turns {self.turn_range[0]}-{self.turn_range[1]} "
+            f"| git:{self.git_tree_sha or 'none'} | raw:{self.kontexta_ref}]\n"
+            f"- **Goal:** {self.ledger.get('epoch_goal', '')}\n"
+            f"- **Files Modified:** {files}\n"
+            f"- **Verified Decisions:** {decisions}\n"
+            f"- **Failed Approaches (Do Not Repeat):** {failed}\n"
+            f"- **Open Blockers:** {blockers}"
+        )
+
+
+class HippocampusCompactor:
+    """
+    3-Tier Prefix-Preserving Memory Compactor:
+      - Tier 0: Zero-LLM deterministic tool output pruning (<0.5ms)
+      - Tier 1: Append-only Frozen Epochs (preserves :9000 KV cache prefix)
+      - Tier 2: Schema-constrained Granite 8B extraction + Kontexta raw archival
+    """
+
+    def __init__(
+        self,
+        coordinator: CudaCoordinator,
+        cuda_http_client: Any = None,
+        kontexta_bridge: Any = None,
+        keep_verbatim_turns: int = 4,
+        epoch_chunk_turns: int = 6,
+        compactor_agent: Any = None,
+    ) -> None:
+        self.coord = coordinator
+        self.http = cuda_http_client  # httpx.AsyncClient pointing to http://127.0.0.1:9002
+        self.kontexta = kontexta_bridge
+        self.keep_verbatim_turns = keep_verbatim_turns
+        self.epoch_chunk_turns = epoch_chunk_turns
+        self.agent = compactor_agent or (cuda_http_client if hasattr(cuda_http_client, "send_message_stream") else None)
+
+        self.frozen_epochs: list[FrozenEpoch] = []
+
+    # -------------------------------------------------------------------------
+    # TIER 0: Deterministic Zero-LLM Tool-Output Pruning (<0.5ms on CPU)
+    # -------------------------------------------------------------------------
+
+    def prune_stale_tool_outputs(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """
+        Strips bulky read_file, grep, and test logs from turns older than
+        `keep_verbatim_turns` WITHOUT touching the LLM or breaking message roles.
+        """
+        cutoff = max(0, len(messages) - (self.keep_verbatim_turns * 2))
+        pruned: list[dict[str, Any]] = []
+
+        for idx, msg in enumerate(messages):
+            if idx >= cutoff or msg.get("role") != "tool":
+                pruned.append(msg)
+                continue
+
+            tool_name = msg.get("name", "")
+            content = str(msg.get("content", ""))
+
+            # Only prune tool outputs larger than 600 chars
+            if len(content) <= 600:
+                pruned.append(msg)
+                continue
+
+            if tool_name in ("read_file", "view_file"):
+                stub = (
+                    f"[Tier-0 Pruned `{tool_name}` output ({len(content)} chars). "
+                    f"Current symbol signatures are live in RepoMap; re-read file if exact lines needed.]"
+                )
+            elif tool_name in ("bash", "run_command", "shell"):
+                lines = content.splitlines()
+                head = "\n".join(lines[:4])
+                tail = "\n".join(lines[-8:])
+                stub = (
+                    f"[Tier-0 Pruned `{tool_name}` stdout ({len(lines)} lines):\n"
+                    f"{head}\n... ({len(lines) - 12} lines elided) ...\n{tail}]"
+                )
+            else:
+                digest = hashlib.blake2s(content.encode(), digest_size=4).hexdigest()
+                stub = f"{content[:300]}\n... [Elided {len(content) - 300} chars | hash:{digest}]"
+
+            pruned.append({**msg, "content": stub})
+
+        return pruned
+
+    # -------------------------------------------------------------------------
+    # TIER 1 & 2: Schema-Constrained Epoch Extraction on CUDA:9002 + Kontexta
+    # -------------------------------------------------------------------------
+
+    async def maybe_compact_epoch(
+        self,
+        messages: list[dict[str, Any]],
+        latest_git_tree_sha: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        If active messages exceed (epoch_chunk_turns + keep_verbatim_turns),
+        slices off the oldest chunk, archives verbatim text to Kontexta,
+        extracts a structured FrozenEpoch on :9002, and returns the trimmed history.
+        """
+        # Always run Tier-0 deterministic pruning first (free, instant)
+        messages = self.prune_stale_tool_outputs(messages)
+
+        min_msgs_for_epoch = (self.epoch_chunk_turns + self.keep_verbatim_turns) * 2
+        if len(messages) < min_msgs_for_epoch:
+            return messages
+
+        chunk_end = self.epoch_chunk_turns * 2
+        evicted_slice = messages[:chunk_end]
+        remaining_slice = messages[chunk_end:]
+
+        epoch_id = len(self.frozen_epochs) + 1
+        turn_start = (epoch_id - 1) * self.epoch_chunk_turns + 1
+        turn_end = turn_start + self.epoch_chunk_turns - 1
+
+        # 1. Offload verbatim evicted slice to Kontexta SQLite FTS5 vault (if active)
+        kxta_ref = f"kxta://epoch/{epoch_id}"
+        if self.kontexta is not None:
+            if hasattr(self.kontexta, "archive_raw_turns"):
+                res = self.kontexta.archive_raw_turns(
+                    epoch_id=epoch_id, messages=evicted_slice, git_sha=latest_git_tree_sha
+                )
+                if hasattr(res, "__await__"):
+                    kxta_ref = await res
+                else:
+                    kxta_ref = res
+
+        # 2. Synthesize structured JSON ledger on RTX 4060 (:9002) via CudaCoordinator
+        ledger = await self._run_granite_structured_extraction(evicted_slice)
+        if ledger is None:
+            # Preempted by a /spawn subagent; leave messages intact for next idle window
+            return messages
+
+        self.frozen_epochs.append(
+            FrozenEpoch(
+                epoch_id=epoch_id,
+                turn_range=(turn_start, turn_end),
+                kontexta_ref=kxta_ref,
+                git_tree_sha=latest_git_tree_sha,
+                ledger=ledger,
+            )
+        )
+        return remaining_slice
+
+    async def _run_granite_structured_extraction(
+        self, evicted_messages: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """
+        Calls llama-server on :9002 with `response_format={"type": "json_object", "schema": ...}`.
+        Automatically yields if CudaCoordinator preempts for a /spawn subagent.
+        """
+        transcript = "\n".join(
+            f"[{m.get('role', 'unknown').upper()}]: {str(m.get('content', ''))[:1200]}"
+            for m in evicted_messages
+        )
+        prompt = (
+            "Extract the technical engineering state from the following conversation slice. "
+            "Preserve exact file paths, function names, root causes, and failed attempts.\n\n"
+            f"{transcript}"
+        )
+
+        try:
+            async with self.coord.acquire_compaction_slot() as abort_event:
+                if self.http is not None and hasattr(self.http, "stream"):
+                    async with self.http.stream(
+                        "POST",
+                        "/v1/chat/completions",
+                        json={
+                            "model": "granite42_8b",
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "You are a deterministic state extractor. Output strict JSON matching the schema.",
+                                },
+                                {"role": "user", "content": prompt},
+                            ],
+                            "temperature": 0.0,
+                            "stream": True,
+                            "response_format": {
+                                "type": "json_object",
+                                "schema": EPOCH_LEDGER_SCHEMA,
+                            },
+                            "cache_prompt": True,
+                        },
+                    ) as resp:
+                        self.coord.bind_stream_closer(resp.aclose)
+                        buf: list[str] = []
+                        async for line in resp.aiter_lines():
+                            if abort_event.is_set():
+                                await resp.aclose()
+                                raise PreemptedByHigherPriority()
+                            if not line.startswith("data: ") or line == "data: [DONE]":
+                                continue
+                            chunk = json.loads(line[6:])
+                            delta = chunk["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                buf.append(delta)
+
+                        raw_text = "".join(buf)
+                        return json.loads(raw_text)
+                elif self.agent is not None and hasattr(self.agent, "send_message_stream"):
+                    stream = await self.agent.send_message_stream(prompt)
+                    if hasattr(stream, "aclose"):
+                        self.coord.bind_stream_closer(stream.aclose)
+                    chunks: list[str] = []
+                    async for token in stream:
+                        if abort_event.is_set():
+                            if hasattr(stream, "aclose"):
+                                await stream.aclose()
+                            raise PreemptedByHigherPriority()
+                        chunks.append(token)
+                    raw_text = "".join(chunks).strip()
+                    try:
+                        return json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        return {
+                            "epoch_goal": "State extraction",
+                            "files_touched": [],
+                            "decisions_and_invariants": [raw_text[:200]] if raw_text else [],
+                            "failed_hypotheses_do_not_repeat": [],
+                            "unresolved_blockers": [],
+                        }
+                return None
+
+        except PreemptedByHigherPriority:
+            return None
+
+    def render_working_memory_prefix(self) -> str:
+        """
+        Appended in order after the System Prompt so Zone 2 grows append-only,
+        maximizing llama-server KV cache reuse on :9000.
+        """
+        if not self.frozen_epochs:
+            return ""
+        blocks = "\n\n".join(ep.to_prompt_block() for ep in self.frozen_epochs)
+        return f"## Working Memory (Frozen Epochs)\n{blocks}"
+
+    def _format_compaction_prompt(self, messages_to_condense: list[dict]) -> str:
+        turns_text = _format_conversation_log(messages_to_condense) if messages_to_condense else ""
+        return (
+            "You are a context distillation specialist. Synthesize the salient facts, decisions, "
+            "code changes, and unresolved tasks from these prior turns into a concise, structured Working Memory summary:\n\n"
+            f"{turns_text}"
+        )
+
+    async def compact_with_preemption_retry(
+        self, messages_to_condense: list[dict], max_retries: int = 3
+    ) -> str | None:
+        """
+        Runs rolling working-memory synthesis on CUDA:9002.
+        If preempted by /spawn or /build, yields immediately and retries once :9002 is free.
+        """
+        prompt = self._format_compaction_prompt(messages_to_condense)
+
+        for attempt in range(max_retries):
+            try:
+                async with self.coord.acquire_compaction_slot() as abort_event:
+                    if self.agent and hasattr(self.agent, "send_message_stream"):
+                        stream = await self.agent.send_message_stream(prompt)
+                        if hasattr(stream, "aclose"):
+                            self.coord.bind_stream_closer(stream.aclose)
+
+                        chunks: list[str] = []
+                        async for token in stream:
+                            if abort_event.is_set():
+                                if hasattr(stream, "aclose"):
+                                    await stream.aclose()
+                                raise PreemptedByHigherPriority()
+                            chunks.append(token)
+
+                        return "".join(chunks).strip()
+                    elif self.http and hasattr(self.http, "stream"):
+                        async with self.http.stream(
+                            "POST",
+                            "/v1/chat/completions",
+                            json={
+                                "model": "granite42_8b",
+                                "messages": [{"role": "user", "content": prompt}],
+                                "stream": True,
+                            },
+                        ) as resp:
+                            self.coord.bind_stream_closer(resp.aclose)
+                            chunks = []
+                            async for line in resp.aiter_lines():
+                                if abort_event.is_set():
+                                    await resp.aclose()
+                                    raise PreemptedByHigherPriority()
+                                if not line.startswith("data: ") or line == "data: [DONE]":
+                                    continue
+                                chunk = json.loads(line[6:])
+                                delta = chunk["choices"][0]["delta"].get("content", "")
+                                if delta:
+                                    chunks.append(delta)
+                            return "".join(chunks).strip()
+
+            except PreemptedByHigherPriority:
+                await asyncio.sleep(0.2)
+                continue
+
+        return None
 

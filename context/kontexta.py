@@ -222,3 +222,32 @@ class KontextaManager:
             "[End of Kontexta Context Engine]",
         ])
         return "\n".join(lines)
+
+    @classmethod
+    async def journal_brainstorm_commit(
+        cls,
+        idea: str,
+        spec_markdown: str,
+        commit_sha: str,
+        commit_message: str,
+        files_touched: list[str],
+        repo_root: str = ".",
+    ) -> bool:
+        """Journals the brainstorm spec and commit to Kontexta."""
+        try:
+            from . import kontexta_sync
+            text, tags = kontexta_sync.build_entry(
+                kind="brainstorm",
+                title=idea,
+                repo_root=repo_root,
+                commit={
+                    "hash": commit_sha[:8],
+                    "subject": commit_message,
+                    "files": [{"path": f, "added": "1", "removed": "0"} for f in files_touched],
+                },
+                notes=[f"Spec summary: {spec_markdown[:300]}..."],
+            )
+            return await kontexta_sync.push(text, tags, repo_root=repo_root)
+        except Exception:
+            return False
+

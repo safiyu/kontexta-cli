@@ -4,12 +4,13 @@ import os
 import json
 from typing import Any, Dict
 
-from ..config import PREFS_PATH, DEFAULT_CLOUD_MODEL
+from ..config import PREFS_PATH, DEFAULT_CLOUD_MODEL, DEFAULT_CLOUD_IDLE_TIMEOUT
 
 # Session attribute -> default value; only these keys are persisted
 PREF_DEFAULTS: Dict[str, Any] = {
     "active_target": "9000",
     "cloud_model": DEFAULT_CLOUD_MODEL,
+    "cloud_idle_timeout": DEFAULT_CLOUD_IDLE_TIMEOUT,
     "use_laya_adaptive_permissions": True,
     "dangerously_skip_permissions": True,
     "verbose": False,
@@ -26,6 +27,7 @@ PREF_DEFAULTS: Dict[str, Any] = {
     "max_tool_steps_per_turn": 0,
     "render_markdown": True,
     "theme": "dark",
+    "auto_shift": True,
 }
 
 
@@ -38,6 +40,8 @@ def load_prefs(path: str = PREFS_PATH) -> Dict[str, Any]:
         return {}
     if not isinstance(raw, dict):
         return {}
+    if "auto_shift" not in raw and "auto_git_shift" in raw:
+        raw["auto_shift"] = raw["auto_git_shift"]
     return {k: v for k, v in raw.items() if k in PREF_DEFAULTS and _type_matches(v, PREF_DEFAULTS[k])}
 
 

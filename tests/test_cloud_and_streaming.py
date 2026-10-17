@@ -13,6 +13,12 @@ open(os.environ["AGY_PID_FILE"], "w").write(str(os.getpid()))
 if os.environ.get("AGY_MODE") == "hang":
     print(json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "partial "}}), flush=True)
     time.sleep(60)
+if os.environ.get("AGY_MODE") == "tool_long":
+    print(json.dumps({"event": "step_update", "step_update": {"step_type": "tool", "state": "ACTIVE", "tool_name": "run_command", "tool_info": {"parameters": {"CommandLine": "vitest"}}}}), flush=True)
+    time.sleep(0.3)
+    print(json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "Tests passed"}}), flush=True)
+    print(json.dumps({"event": "result"}), flush=True)
+    sys.exit(0)
 for part in ("Hello ", "**world**"):
     print(json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": part}}), flush=True)
 print(json.dumps({"event": "result"}), flush=True)
@@ -144,3 +150,20 @@ def test_consume_token_stream_finalizes_on_cancel(session, monkeypatch):
             await task
 
     asyncio.run(go())  # must not leave a live display running or raise anything else
+
+
+def test_cloud_tool_execution_does_not_trigger_idle_timeout(session, fake_agy, monkeypatch):
+    monkeypatch.setenv("AGY_MODE", "tool_long")
+    session.cloud_idle_timeout = 0.1
+    # Tool sleeps 0.3s, which is longer than idle_timeout (0.1s).
+    # Since tool is ACTIVE, it should not trigger idle timeout.
+    text = asyncio.run(session.chat_cloud_oauth("run vitest", with_project_context=False))
+    assert text == "Tests passed"
+
+
+def test_cloud_idle_timeout_triggers_when_not_in_tool(session, fake_agy, monkeypatch):
+    monkeypatch.setenv("AGY_MODE", "hang")
+    session.cloud_idle_timeout = 0.1
+    with pytest.raises(RuntimeError, match="Cloud model timed out"):
+        asyncio.run(session.chat_cloud_oauth("hang", with_project_context=False))
+

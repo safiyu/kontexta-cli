@@ -205,7 +205,7 @@ def test_control_switches_model_before_next_milestone(monkeypatch):
 
     async def fake_switch(session, arg, ctx):
         calls.append(arg)
-        session.active_target = "9001"
+        session.active_target = "9002"
 
     monkeypatch.setitem(cli.COMMANDS, "/switch", fake_switch)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
@@ -217,7 +217,7 @@ def test_control_switches_model_before_next_milestone(monkeypatch):
 
     s = S()
     assert asyncio.run(B._control(s, "Next: m1")) == "continue"
-    assert calls == ["qwen"] and s.active_target == "9001"
+    assert calls == ["qwen"] and s.active_target == "9002"
 
 
 def test_control_quits_and_skips(monkeypatch):

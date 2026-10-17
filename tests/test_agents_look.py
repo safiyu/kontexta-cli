@@ -133,7 +133,7 @@ def test_context_summary_card(session, capsys):
 
 @pytest.fixture
 def online_session(session):
-    session.endpoints["9001"].update(status="online", filename="granite.gguf", model="/m/granite.gguf", url="http://localhost:9001/v1")
+    session.endpoints["9002"].update(status="online", filename="granite.gguf", model="/m/granite.gguf", url="http://localhost:9002/v1")
     session.json_output = False
     return session
 

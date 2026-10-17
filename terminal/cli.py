@@ -6,23 +6,39 @@ import json
 import signal
 import select
 import asyncio
+import logging
 import threading
 import argparse
 import subprocess
+import shutil
+import time
 import traceback
+from typing import Any, Optional, Dict, List
+
+# Suppress raw WARNING:root: noise from the google.antigravity library (e.g. "System step error");
+# myagy surfaces those errors via its own say.warn() / say.err() paths.
+logging.getLogger().setLevel(logging.ERROR)
 
 from ..config import (
     MCP_CONFIG_PATH,
     DEFAULT_CLOUD_MODEL,
     HISTORY_PATH,
+    PORT_ROCM,
+    setup_antigravity_sdk,
 )
 from . import say
-from .ui import UI, StreamRenderer
+from .ui import UI, StreamRenderer, RICH_AVAILABLE, console
 from ..core.prefs import PREF_DEFAULTS, load_prefs, reset_prefs
 from ..core.llamashift import wake_compactor
 from ..context.mcp_loader import load_mcp_servers, McpStdioServer
 from ..core.session import MultiGpuHybridSession
 from ..core.sudo_manager import SudoManager
+from ..core.reloader import (
+    ReloadRequested,
+    perform_execv_reload,
+    write_reload_snapshot,
+    consume_reload_snapshot,
+)
 from .esc_listener import EscListener, prompt_input
 
 
@@ -34,7 +50,7 @@ _COMPLETION_ONLY = ["/paste"]
 _EXTRA_HELP = [(("/paste",), "Session", "Paste a multi-line block (end with EOF, . or END)")]
 _EXIT = "exit"
 _NO_SAVE = "no_save"
-_TARGET_LABELS = {"auto": "AUTO:Laya", "9000": "ROCm:9000", "9001": "CUDA:9001", "cloud": "CLOUD:OAuth"}
+_TARGET_LABELS = {"auto": "AUTO:Laya", "9000": "ROCm:9000", "9002": "CUDA:9002", "cloud": "CLOUD:OAuth"}
 
 
 class PromptInterrupted(Exception):
@@ -68,7 +84,7 @@ def _sync_say(session) -> None:
     say.configure(json_output=session.json_output, verbose=session.verbose)
 
 
-AT_TARGETS = ["@rocm", "@cuda", "@cloud", "@auto", "@local", "@9000", "@9001"]
+AT_TARGETS = ["@rocm", "@cuda", "@cloud", "@auto", "@local", "@9000", "@9001", "@9002"]
 _dynamic_targets: list = []
 _pt_session = None
 _toolbar_provider = None
@@ -100,6 +116,7 @@ COMMAND_USAGES = {
     "/rocm": "/rocm",
     "/amd": "/amd",
     "/9001": "/9001",
+    "/9002": "/9002",
     "/cuda": "/cuda",
     "/nvidia": "/nvidia",
     "/cloud": "/cloud [<model-id>]",
@@ -112,9 +129,11 @@ COMMAND_USAGES = {
     "/models": "/models",
     "/mode": "/mode <num|id>",
     "/laya": "/laya",
+    "/autoshift": "/autoshift [on|off]",
+    "/auto-shift": "/auto-shift [on|off]",
+    "/model-shift": "/model-shift [on|off]",
     "/git-shift": "/git-shift [on|off]",
     "/gitshift": "/gitshift [on|off]",
-    "/autoshift": "/autoshift [on|off]",
     "/skip-permissions": "/skip-permissions [on|off]",
     "/dangerously-skip-permissions": "/dangerously-skip-permissions [on|off]",
     "/permissions": "/permissions [auto|skip|safe]",
@@ -190,6 +209,7 @@ COMMAND_USAGES = {
     "/fetch": "/fetch <url>",
     "/browse": "/browse <url>",
     "/readurl": "/readurl <url>",
+    "/hermes": "/hermes [<prompt>|tui|status]",
     "/diff": "/diff [<n>]",
     "/undo": "/undo",
     "/paste": "/paste",
@@ -199,9 +219,10 @@ AT_TARGET_DOCS = {
     "@rocm": "@rocm — AMD ROCm model on port 9000",
     "@9000": "@9000 — AMD ROCm model on port 9000",
     "@amd": "@amd — AMD ROCm model on port 9000",
-    "@cuda": "@cuda — NVIDIA CUDA model on port 9001",
+    "@cuda": "@cuda — NVIDIA CUDA model on port 9001/9002",
     "@9001": "@9001 — NVIDIA CUDA model on port 9001",
-    "@nvidia": "@nvidia — NVIDIA CUDA model on port 9001",
+    "@9002": "@9002 — NVIDIA CUDA model on port 9002",
+    "@nvidia": "@nvidia — NVIDIA CUDA model on port 9001/9002",
     "@cloud": "@cloud — Google Cloud model via OAuth",
     "@gemini": "@gemini — Google Cloud Gemini via OAuth",
     "@oauth": "@oauth — Google Cloud OAuth target",
@@ -262,14 +283,28 @@ def _get_pt_session():
         style = Style.from_dict({
             "bottom-toolbar": "noreverse",
             "bottom-toolbar.text": "noreverse",
+            "bottom-toolbar.rule": "#444444",
             "completion-menu.completion": "bg:#2b2b2b #ffffff",
             "completion-menu.completion.current": "bg:#005f87 #ffffff bold",
             "completion-menu.meta": "bg:#222222 #9e9e9e",
             "completion-menu.meta.current": "bg:#005f87 #e0e0e0",
         })
+        from prompt_toolkit.key_binding import KeyBindings
+        kb = KeyBindings()
+
+        @kb.add("escape")
+        def _handle_escape(event):
+            buf = event.current_buffer
+            if buf.text:
+                buf.text = ""
+                buf.cursor_position = 0
+            else:
+                event.app.exit(result="")
+
         _pt_session = PromptSession(
             history=FileHistory(HISTORY_PATH),
             completer=_InputCompleter(),
+            key_bindings=kb,
             style=style,
             complete_while_typing=True,
             complete_style=CompleteStyle.COLUMN,
@@ -310,6 +345,9 @@ def read_input_prompt(first_prompt: str, multiline: bool = True, prefill: str = 
     - Pressing Enter on an empty line or pressing Ctrl+D submits the multi-line input.
     - Pasted text with internal blank lines is preserved without prematurely submitting.
     """
+    if sys.stdout.isatty() and not say.is_json():
+        print(say.rule_line("", UI.DARK_GRAY), flush=True)
+
     try:
         first_line = _read_line(first_prompt, default=prefill) if prefill else _read_line(first_prompt)
     except EOFError:
@@ -319,14 +357,20 @@ def read_input_prompt(first_prompt: str, multiline: bool = True, prefill: str = 
 
     stripped = first_line.strip()
     if not multiline:
+        if sys.stdout.isatty() and not say.is_json() and stripped:
+            print(say.rule_line("", UI.DARK_GRAY), flush=True)
         return stripped
 
     # A multi-line paste arrives as one buffer when prompt_toolkit is active
     if "\n" in first_line:
+        if sys.stdout.isatty() and not say.is_json() and stripped:
+            print(say.rule_line("", UI.DARK_GRAY), flush=True)
         return stripped
 
     # Slash commands and session exit keywords submit immediately on first Enter
     if stripped.startswith("/") or stripped.lower() in ("exit", "quit", "q", "/exit", "/quit"):
+        if sys.stdout.isatty() and not say.is_json() and stripped:
+            print(say.rule_line("", UI.DARK_GRAY), flush=True)
         return stripped
 
     # Empty first line returns immediately
@@ -359,7 +403,10 @@ def read_input_prompt(first_prompt: str, multiline: bool = True, prefill: str = 
             say.dim("[^C] Input cancelled.")
             return ""
 
-    return "\n".join(lines).strip()
+    result = "\n".join(lines).strip()
+    if sys.stdout.isatty() and not say.is_json() and result:
+        print(say.rule_line("", UI.DARK_GRAY), flush=True)
+    return result
 
 
 def _settle(fut, result, exc):
@@ -427,8 +474,17 @@ async def _confirm(title, rows, prompt="Proceed?", style="warn", assume_yes=Fals
 
 @command("/auto", group="Models", help="Route every prompt automatically with Laya")
 async def _cmd_auto(session, arg, ctx):
-    session.active_target = "auto"
-    say.ok("Default target set to AUTO (Laya System 1 routing in ~33ms)")
+    session.auto_route = not getattr(session, "auto_route", False)
+    session.active_target = "auto" if session.auto_route else "rocm"
+    state = "enabled" if session.auto_route else "disabled"
+    avg_lat = getattr(session.laya.telemetry, "avg_latency_ms", 32.8) if hasattr(session, "laya") and hasattr(session.laya, "telemetry") else 32.8
+    if RICH_AVAILABLE and console:
+        console.print(
+            f"[cyan]⚡ Laya System 1 auto-routing (:8003) {state} "
+            f"(avg {avg_lat:.1f}ms)[/cyan]"
+        )
+    else:
+        say.ok(f"Laya System 1 auto-routing (:8003) {state} (avg {avg_lat:.1f}ms)")
 
 
 @command("/9000", "/rocm", "/amd", group="Models", help="Use the AMD ROCm model on port 9000")
@@ -439,23 +495,31 @@ async def _cmd_9000(session, arg, ctx):
     say.ok(f"Default target set to AMD ROCm Port 9000 ({fn})")
 
 
-@command("/9001", "/cuda", "/nvidia", group="Models", help="Use the NVIDIA CUDA model on port 9001")
-async def _cmd_9001(session, arg, ctx):
-    session.active_target = "9001"
+@command("/9002", "/9001", "/cuda", "/nvidia", group="Models", help="Use the NVIDIA CUDA model on port 9001/9002")
+async def _cmd_9002(session, arg, ctx):
+    target = session.resolve_target_alias("9001" if (ctx and "/9001" in str(ctx)) else "9002")
+    session.active_target = target
     await asyncio.to_thread(session.refresh_endpoints)
-    fn = session.endpoints['9001']['filename']
-    say.ok(f"Default target set to NVIDIA CUDA Port 9001 ({fn})")
+    ep = session.get_endpoint(target) if hasattr(session, "get_endpoint") else session.endpoints.get(target, {})
+    fn = ep.get('filename') or session.endpoints.get('9002', {}).get('filename') or session.endpoints.get('9001', {}).get('filename') or "model"
+    say.ok(f"Default target set to NVIDIA CUDA Port {ep.get('port', target)} ({fn})")
 
 
 @command("/cloud", "/gemini", "/oauth", group="Models", help="Use Google cloud via OAuth, or /cloud <model-id>")
 async def _cmd_cloud(session, arg, ctx):
-    if arg:
-        new_model = arg.strip()
-        session.cloud_model = new_model
+    clean = arg.strip().strip("[]<>") if arg else ""
+    if clean and clean.lower() not in ("id", "model", "model-id", "model_id"):
+        session.cloud_model = clean
         session.active_target = "cloud"
         session.save_preferences()
-        say.ok(f"Cloud model set to {new_model} and target switched to CLOUD (saved to prefs).")
+        say.ok(f"Cloud model set to {clean} and target switched to CLOUD (saved to prefs).")
     else:
+        if arg and arg.strip():
+            say.warn(f"Ignoring placeholder '{arg.strip()}'. Using cloud model '{session.cloud_model}'.")
+        # Ensure session.cloud_model itself isn't a placeholder
+        if not session.cloud_model or session.cloud_model.strip().strip("[]<>").lower() in ("", "id", "model", "model-id", "model_id"):
+            session.cloud_model = DEFAULT_CLOUD_MODEL
+            session.save_preferences()
         session.active_target = "cloud"
         say.ok(f"Default target set to CLOUD via OAuth ({session.cloud_model})")
 
@@ -492,21 +556,27 @@ async def _cmd_laya(session, arg, ctx):
     ])
 
 
-@command("/git-shift", "/gitshift", "/autoshift", group="Git", help="Toggle fast model for git work, dense model for code")
-async def _cmd_git_shift(session, arg, ctx):
+@command("/autoshift", "/auto-shift", "/model-shift", "/git-shift", "/gitshift", group="Models", help="Toggle auto-shifting models (fast for git/tools, dense for deep code)")
+async def _cmd_autoshift(session, arg, ctx):
     arg_low = arg.lower().strip()
     if arg_low in ("on", "true", "1", "enable"):
-        session.auto_git_shift = True
-        say.ok(f"Git auto-shift: ENABLED ({session.fast_git_model} for git/tools, {session.dense_code_model} for deep code)")
+        session.auto_shift = True
+        session.save_preferences()
+        say.ok(f"Auto-shift: ENABLED ({session.fast_git_model} for git/tools, {session.dense_code_model} for deep code)")
     elif arg_low in ("off", "false", "0", "disable"):
-        session.auto_git_shift = False
-        say.ok("Git auto-shift: DISABLED (manual model control)")
+        session.auto_shift = False
+        session.save_preferences()
+        say.ok("Auto-shift: DISABLED (manual model control)")
     elif not arg_low:
-        session.auto_git_shift = not session.auto_git_shift
-        st = f"ENABLED ({session.fast_git_model} for git, {session.dense_code_model} for deep code)" if session.auto_git_shift else "DISABLED"
-        say.ok(f"Git auto-shift: {st}")
+        session.auto_shift = not session.auto_shift
+        session.save_preferences()
+        st = f"ENABLED ({session.fast_git_model} for git, {session.dense_code_model} for deep code)" if session.auto_shift else "DISABLED"
+        say.ok(f"Auto-shift: {st}")
     else:
-        say.warn("Usage: /git-shift [on|off]")
+        say.warn("Usage: /autoshift [on|off]")
+
+
+_cmd_git_shift = _cmd_autoshift
 
 
 # ── Settings ──────────────────────────────────────────────────────────
@@ -519,27 +589,52 @@ async def _cmd_skip_permissions(session, arg, ctx):
     say.ok(f"Dangerously skip permissions: {'ENABLED' if new_val else 'DISABLED'}")
 
 
-@command("/permissions", group="Settings", help="Permission mode: auto (Laya), skip, or safe")
+@command("/permissions", group="Settings", help="Permission mode: auto (Laya), strict, or yolo")
 async def _cmd_permissions(session, arg, ctx):
-    arg_low = arg.lower()
-    if arg_low in ("auto", "laya", "dynamic", "smart"):
+    parts = arg.split() if arg else []
+    mode = parts[0].lower() if parts else "auto"
+    if mode in ("auto", "laya", "dynamic", "smart"):
+        session.permission_mode = "auto"
         session.set_dangerously_skip_permissions(False)
         session.use_laya_adaptive_permissions = True
         session.save_preferences()
         await session.reset_local_agent()
-        say.ok("Permissions: LAYA ADAPTIVE")
-    elif arg_low in ("on", "skip", "true", "1", "yolo"):
+        thresh = getattr(session.laya, "safety_threshold", 0.90) if hasattr(session, "laya") else 0.90
+        if RICH_AVAILABLE and console:
+            console.print(
+                f"[green]🛡️ Permission mode set to 'auto' "
+                f"(Laya /noul threshold: P(Safe) >= {thresh:.2f})[/green]"
+            )
+        else:
+            say.ok(f"🛡️ Permission mode set to 'auto' (Laya /noul threshold: P(Safe) >= {thresh:.2f})")
+    elif mode in ("on", "skip", "true", "1", "yolo"):
+        session.permission_mode = "yolo"
         session.use_laya_adaptive_permissions = False
         session.set_dangerously_skip_permissions(True)
         session.save_preferences()
-        say.ok("Dangerously skip permissions: ENABLED")
-    elif arg_low in ("off", "safe", "prompt", "false", "0"):
+        thresh = getattr(session.laya, "safety_threshold", 0.90) if hasattr(session, "laya") else 0.90
+        if RICH_AVAILABLE and console:
+            console.print(
+                f"[yellow]🛡️ Permission mode set to 'yolo' "
+                f"(Laya /noul threshold: P(Safe) >= {thresh:.2f})[/yellow]"
+            )
+        else:
+            say.ok("Dangerously skip permissions: ENABLED")
+    elif mode in ("off", "safe", "prompt", "false", "0", "strict"):
+        session.permission_mode = "strict"
         session.use_laya_adaptive_permissions = False
         session.set_dangerously_skip_permissions(False)
         session.save_preferences()
-        say.ok("Permissions: SAFE MODE")
+        thresh = getattr(session.laya, "safety_threshold", 0.90) if hasattr(session, "laya") else 0.90
+        if RICH_AVAILABLE and console:
+            console.print(
+                f"[green]🛡️ Permission mode set to 'strict' "
+                f"(Laya /noul threshold: P(Safe) >= {thresh:.2f})[/green]"
+            )
+        else:
+            say.ok("Permissions: SAFE MODE")
     else:
-        say.warn("Usage: /permissions auto | skip | safe")
+        say.warn("Usage: /permissions auto | strict | yolo")
 
 
 @command("/sudo", group="Settings", help="Authenticate for root, check status, clear, or run a sudo command")
@@ -670,17 +765,16 @@ async def _cmd_kontexta(session, arg, ctx):
 
 @command("/memory", "/journal", group="Settings", help="Journal brainstorm results and commits to Kontexta (on|off)")
 async def _cmd_memory(session, arg, ctx):
-    from ..context import kontexta_sync
-    choice = arg.strip().lower()
-    if choice in ("on", "off"):
-        session.kontexta_sync = choice == "on"
-        say.ok(f"Kontexta journal sync {choice}.")
-    elif kontexta_sync.enabled(session, session._repo_root or "."):
-        say.ok("Kontexta journal sync is on. Brainstorm results and commits are journaled. Use /memory off to stop.")
-    elif not session.kontexta_sync:
-        say.dim("Kontexta journal sync is off. Use /memory on to enable.")
+    parts = arg.split()
+    if len(parts) > 0 and parts[0].lower() in ("on", "off"):
+        session.memory_sync_enabled = (parts[0].lower() == "on")
+        session.kontexta_sync = session.memory_sync_enabled
+    state = "enabled" if getattr(session, "memory_sync_enabled", getattr(session, "kontexta_sync", True)) else "disabled"
+    if console and RICH_AVAILABLE:
+        console.print(f"[cyan]📓 Kontexta brainstorm/commit journal sync: {state}[/cyan]")
     else:
-        say.warn("Sync is on but inactive: Kontexta is not installed or this repo is not a registered project.")
+        say.plain(f"Kontexta brainstorm/commit journal sync: {state}")
+    return True
 
 
 @command("/autocompact", "/auto-compact", group="Settings", help="Auto-compact threshold in turns (on, off, <turns>)")
@@ -718,7 +812,7 @@ async def _cmd_curation(session, arg, ctx):
         st = f"{UI.GREEN}ENABLED{UI.RST}" if session.continuous_curation else f"{UI.GRAY}DISABLED{UI.RST}"
         say.card("Continuous curation", [
             ("Status", st),
-            ("Engine", "CUDA:9001 (NVIDIA RTX 4060, Granite 8B)"),
+            ("Engine", "CUDA:9002 (NVIDIA RTX 4060, Granite 8B)"),
             ("Window", f"Preserves last {session.max_recent_turns} turns verbatim"),
             ("Trigger", "Runs in the background after every turn"),
         ])
@@ -727,30 +821,55 @@ async def _cmd_curation(session, arg, ctx):
 
 @command("/repomap", "/ast", group="Settings", help="Repo symbol map: view, on, off, refresh, stats")
 async def _cmd_repomap(session, arg, ctx):
-    arg_low = arg.lower().strip()
-    if arg_low in ("on", "enable", "true"):
+    parts = arg.split(maxsplit=1)
+    sub = parts[0].lower().strip() if parts else ""
+
+    if sub in ("on", "enable", "true"):
+        if hasattr(session, "repomap"):
+            session.repomap.enabled = True
         session.auto_repomap = True
         await session.reset_local_agent()
-        say.ok("Automatic repository AST symbol map injection ENABLED (cached, zero-latency).")
-    elif arg_low in ("off", "disable", "false"):
+        say.ok("✓ Automatic RepoMap injection enabled.")
+    elif sub in ("off", "disable", "false"):
+        if hasattr(session, "repomap"):
+            session.repomap.enabled = False
         session.auto_repomap = False
         await session.reset_local_agent()
-        say.ok("Automatic repository AST symbol map injection DISABLED.")
-    elif arg_low in ("refresh", "reload", "sync"):
-        session.refresh_repomap(".")
-        say.ok("Repository AST symbol map cache invalidated and refreshed.")
-    elif arg_low == "stats":
+        say.warn("○ Automatic RepoMap injection disabled.")
+    elif sub in ("refresh", "reload", "sync"):
+        if hasattr(session, "repomap"):
+            session.repomap.invalidate_and_refresh()
+            scan_ms = session.repomap._last_scan_ms
+        else:
+            session.refresh_repomap(".")
+            scan_ms = 0.0
+        await session.reset_local_agent()
+        say.ok(f"✓ RepoMap cache rebuilt in {scan_ms:.2f}ms.")
+    elif sub == "stats":
         from ..context.repomap import RepoMap
-        st = RepoMap.cache_stats()
-        say.card("Repo map cache", [
-            ("Auto-inject", f"{UI.GREEN}ENABLED{UI.RST}" if session.auto_repomap else f"{UI.GRAY}DISABLED{UI.RST}"),
-            ("Root path", str(st['root'])),
-            ("Indexed", f"{st['file_count']} Python files ({st['char_count']} chars)"),
+        st = session.repomap.cache_stats() if hasattr(session, "repomap") and hasattr(session.repomap, "cache_stats") else RepoMap.cache_stats()
+        repomap_enabled = getattr(session.repomap, "enabled", True) if hasattr(session, "repomap") else session.auto_repomap
+        say.card("RepoMap Cache (<1.5ms Two-Tier)", [
+            ("Status", f"{UI.GREEN}ENABLED{UI.RST}" if repomap_enabled else f"{UI.GRAY}DISABLED{UI.RST}"),
+            ("Root", str(st.get("root", session._repo_root or os.getcwd()))),
+            ("Cached Files", f"{st.get('file_count', 0)} files ({st.get('char_count', 0)} chars)"),
+            ("Scan Time", f"{st.get('last_scan_ms', 0.0):.2f}ms"),
+            ("Engine", "Tree-Sitter + SQLite WAL + RAM"),
         ])
     else:
-        session.print_repomap(arg or ".")
-        st_tag = "Active (auto-injected into model memory)" if session.auto_repomap else "Disabled"
-        say.dim(f"Auto-injection: {st_tag} | Toggle: /repomap [on|off|refresh]")
+        # Render interactive AST symbol tree for repo or subpath
+        subpath = arg.strip() if arg.strip() else None
+        if hasattr(session, "repomap") and hasattr(session.repomap, "build_rich_tree"):
+            tree = session.repomap.build_rich_tree(subpath=subpath)
+            if RICH_AVAILABLE and console and tree:
+                console.print(tree)
+            else:
+                say.dim(session.repomap.get_cached_outline(subpath=subpath))
+        else:
+            session.print_repomap(arg or ".")
+        repomap_enabled = getattr(session.repomap, "enabled", True) if hasattr(session, "repomap") else session.auto_repomap
+        st_tag = "Active (auto-injected)" if repomap_enabled else "Disabled"
+        say.dim(f"Auto-injection: {st_tag} | Commands: /repomap [path|on|off|refresh|stats]")
 
 
 @command("/instructions", "/rules", "/guidelines", group="Settings", help="Project rule files: view, on, off, refresh")
@@ -946,7 +1065,7 @@ async def _cmd_coordinator(session, arg, ctx):
     c_status = CudaCoordinator.status_summary()
     st_col = UI.GREEN if c_status['state'] == 'idle' else (UI.CUDA_BOLD if c_status['state'] == 'subagent' else UI.AMBER)
     permit = f"{UI.GREEN}ALLOWED (idle){UI.RST}" if c_status['can_compact'] else f"{UI.AMBER}PAUSED (subagent has priority){UI.RST}"
-    say.card("NVIDIA CUDA:9001 resource coordinator", [
+    say.card("NVIDIA CUDA:9002 resource coordinator", [
         ("State", f"{st_col}{c_status['state'].upper()}{UI.RST}"),
         ("Subagents", f"{c_status['active_subagents']} running"),
         ("Compacting", "YES" if c_status['compactor_running'] else "NO"),
@@ -969,7 +1088,7 @@ async def _cmd_history(session, arg, ctx):
     rows = []
     for idx, t in enumerate(session.history, 1):
         target = t.get("target", "").lower()
-        label = {"rocm": "ROCm:9000", "9000": "ROCm:9000", "cuda": "CUDA:9001", "9001": "CUDA:9001", "cloud": "Cloud"}.get(target, target.upper())
+        label = {"rocm": "ROCm:9000", "9000": "ROCm:9000", "cuda": "CUDA:9002", "9002": "CUDA:9002", "cloud": "Cloud"}.get(target, target.upper())
         role = f"{UI.WHITE}USER{UI.RST}" if t["role"] == "user" else f"{UI.GREEN}ASSISTANT{UI.RST}"
         preview = t["content"].replace("\n", " ").strip()
         if len(preview) > 120:
@@ -996,14 +1115,20 @@ async def _cmd_save(session, arg, ctx):
     say.ok(f"Session saved to {session.save_session(arg or None)}")
 
 
-@command("/load", group="Session", help="Resume a saved session by name or file")
+@command("/load", "/resume", group="Session", help="Resume a saved session by name/file, or '/resume' to load the latest")
 async def _cmd_load(session, arg, ctx):
-    if not arg:
-        say.warn("Usage: /load <session_name_or_file>. Type /sessions to list saved sessions.")
-    elif session.load_session(arg):
-        say.ok(f"Session '{arg}' loaded! Restored {len(session.history)//2} turns.")
+    target = arg.strip()
+    if not target:
+        sessions = session.list_sessions()
+        if sessions:
+            target = sessions[0]["file"]
+        else:
+            say.warn("Usage: /load <session_name_or_file> (no saved sessions found to resume).")
+            return
+    if session.load_session(target):
+        say.ok(f"Session '{target}' loaded! Restored {len(session.history)//2} turns.")
     else:
-        say.err(f"Could not find session '{arg}'. Type /sessions to view available sessions.")
+        say.err(f"Could not find session '{target}'. Type /sessions to view available sessions.")
 
 
 @command("/sessions", group="Session", help="List saved sessions")
@@ -1033,7 +1158,13 @@ async def _cmd_summarize(session, arg, ctx):
 
 @command("/context", "/ctx", group="Session", help="Show context window usage per target")
 async def _cmd_context(session, arg, ctx):
+    if hasattr(session, "get_context_telemetry"):
+        from .ui import render_context_telemetry
+        telemetry = await session.get_context_telemetry()
+        render_context_telemetry(telemetry)
+        return True
     session.print_context_summary()
+    return True
 
 
 @command("/compact", group="Session", help="Compact older history now (/compact <turns> keeps that many)")
@@ -1060,7 +1191,7 @@ def _reload_flags(prefs: dict, json_output: bool = False) -> list:
     flags = []
     if prefs.get("cloud_model"):
         flags += ["--cloud-model", prefs["cloud_model"]]
-    if prefs.get("active_target") in ("auto", "9000", "9001", "cloud"):
+    if prefs.get("active_target") in ("auto", "9000", "9002", "cloud"):
         flags += ["--target", prefs["active_target"]]
     if "dangerously_skip_permissions" in prefs:
         flags.append("-y" if prefs["dangerously_skip_permissions"] else "--safe")
@@ -1079,15 +1210,12 @@ def _reload_flags(prefs: dict, json_output: bool = False) -> list:
 
 @command("/reload", "/restart", group="Session", help="Restart the agent in place, keeping this session")
 async def _cmd_reload(session, arg, ctx):
-    if session.history:
-        session.save_session("latest_session")
+    say.dim("↻ Snapshotting session to /dev/shm and hot-reloading...")
     session.save_preferences()
-    say.card("Hot reload", [("Action", "Restarting antigravity_agent.py"), ("Session", "Saved as latest_session and restored after restart")])
-    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    runner_script = os.path.join(pkg_root, "antigravity_agent.py")
-    new_args = [sys.executable, runner_script, "--load", "latest_session"]
-    new_args += _reload_flags(session.preferences(), session.json_output)
-    os.execv(sys.executable, new_args)
+    snap = session.export_reload_snapshot()
+    shm_path = write_reload_snapshot(snap)
+    await session.graceful_shutdown_for_reload()
+    raise ReloadRequested(shm_path)
 
 
 @command("/help", group="Session", help="Show this list, or '/help <group>' for one group")
@@ -1116,8 +1244,8 @@ async def _cmd_exit(session, arg, ctx):
 async def _cmd_compactor(session, arg, ctx):
     arg_low = arg.lower()
     if arg_low in ("start", "on", "launch", "wake"):
-        say.step("starting the compactor model on port 9001 via LlamaShift")
-        res = await asyncio.to_thread(wake_compactor, 9001)
+        say.step("starting the compactor model on port 9002 via LlamaShift")
+        res = await asyncio.to_thread(wake_compactor, 9002)
         for warning in res["warnings"]:
             say.warn(warning)
         if res["ok"]:
@@ -1129,11 +1257,67 @@ async def _cmd_compactor(session, arg, ctx):
                 say.detail(res["log_tail"])
     elif arg_low in ("status", ""):
         await asyncio.to_thread(session.refresh_endpoints)
-        ep = session.endpoints.get("9001", {})
+        ep = session.endpoints.get("9002", {})
         st = f"{UI.GREEN}ONLINE{UI.RST}" if ep.get("status") == "online" else f"{UI.RED}OFFLINE{UI.RST}"
         fn = ep.get("filename") or "granite-4.2-8b-Q4_K_M.gguf"
-        say.plain(f"{UI.WHITE}NVIDIA Compactor (RTX 4060 :9001){UI.RST}: {st} ({fn})")
+        say.plain(f"{UI.WHITE}NVIDIA Compactor (RTX 4060 :9002){UI.RST}: {st} ({fn})")
         say.dim("Controls: /compactor start | /compactor status")
+
+
+def handle_slash_command(cmd: str, session: Any) -> bool:
+    """Dispatches background subagent and build tasks on CUDA:9002."""
+    mgr = getattr(session, "subagent_mgr", None) or SubagentManager.get_instance()
+    if cmd.startswith("/spawn"):
+        task_prompt = cmd.removeprefix("/spawn").strip()
+        if not task_prompt:
+            console.print("[yellow]Usage: /spawn <background task description>[/yellow]")
+            return True
+        if hasattr(session, "spawn_subagent") and not hasattr(session, "subagent_mgr"):
+            session.spawn_subagent(task_prompt)
+            return True
+        task = mgr.spawn(task_prompt, kind="spawn")
+        console.print(
+            f"[bold cyan]🛰️ Enqueued Subagent #{task.task_id} on CUDA:9002[/bold cyan] "
+            f"[dim](use `/tasks` or `/subagent view {task.task_id}` to inspect)[/dim]"
+        )
+        return True
+
+    if cmd.startswith("/build"):
+        custom_cmd = cmd.removeprefix("/build").strip() or "python3 -m pytest -q"
+        task = mgr.spawn_build(custom_cmd)
+        console.print(
+            f"[bold green]🔨 Enqueued Build & Test Subagent #{task.task_id} on CUDA:9002[/bold green] "
+            f"[dim](`{custom_cmd}`)[/dim]"
+        )
+        return True
+
+    if cmd.strip() == "/tasks":
+        mgr.render_tasks_table()
+        return True
+
+    if cmd.startswith("/subagent"):
+        parts = cmd.split(maxsplit=2)
+        if len(parts) < 3:
+            console.print("[yellow]Usage: /subagent <view|inject|cancel> <#|all>[/yellow]")
+            return True
+
+        action, target_arg = parts[1].lower(), parts[2].strip()
+        if action == "view" and target_arg.isdigit():
+            mgr.render_task_detail(int(target_arg))
+        elif action == "cancel" and target_arg.isdigit():
+            ok, msg = mgr.cancel_task(int(target_arg))
+            style = "green" if ok else "yellow"
+            console.print(f"[{style}]{msg}[/{style}]")
+        elif action == "inject":
+            count, ids = mgr.inject_into_session(session, target_arg)
+            if count:
+                console.print(
+                    f"[bold magenta]✓ Injected findings from Subagent(s) {ids} into active context.[/bold magenta]"
+                )
+            else:
+                console.print("[yellow]○ No completed un-injected subagent findings matched.[/yellow]")
+        return True
+    return False
 
 
 @command("/spawn", "/subagent", "/task", group="Agents", help="Run a background subagent (view, inject, cancel, list)")
@@ -1144,60 +1328,96 @@ async def _cmd_spawn(session, arg, ctx):
 
     if sub_cmd == "view":
         if sub_arg.isdigit():
-            session.print_subagent_detail(int(sub_arg))
+            if hasattr(session, "subagent_mgr"):
+                session.subagent_mgr.render_task_detail(int(sub_arg))
+            else:
+                session.print_subagent_detail(int(sub_arg))
         else:
             say.dim("Usage: /subagent view <#>")
     elif sub_cmd == "inject":
         if sub_arg.lower() in ("all", "*"):
-            count = session.inject_all_subagents()
+            count = session.inject_all_subagents() if hasattr(session, "inject_all_subagents") else (session.subagent_mgr.inject_into_session(session, "all")[0] if hasattr(session, "subagent_mgr") else 0)
             if count > 0:
                 say.ok(f"Successfully injected findings from {count} completed subagent(s) into conversation context.")
             else:
                 say.warn("No uninjected completed subagents found to inject.")
         elif sub_arg.isdigit():
-            if session.inject_subagent(int(sub_arg)):
-                say.ok(f"Subagent #{sub_arg} result successfully injected into conversation memory.")
-            else:
-                say.warn(f"Could not inject Subagent #{sub_arg}. Ensure it has finished and produced output.")
+            if hasattr(session, "inject_subagent"):
+                if session.inject_subagent(int(sub_arg)):
+                    say.ok(f"Subagent #{sub_arg} result successfully injected into conversation memory.")
+                else:
+                    say.warn(f"Could not inject Subagent #{sub_arg}. Ensure it has finished and produced output.")
+            elif hasattr(session, "subagent_mgr"):
+                c, _ = session.subagent_mgr.inject_into_session(session, sub_arg)
+                if c:
+                    say.ok(f"Subagent #{sub_arg} result successfully injected into conversation memory.")
+                else:
+                    say.warn(f"Could not inject Subagent #{sub_arg}. Ensure it has finished and produced output.")
         else:
             say.dim("Usage: /subagent inject <#|all>")
     elif sub_cmd in ("cancel", "kill", "stop"):
         if not sub_arg.isdigit():
             say.dim("Usage: /subagent cancel <#>")
-        elif session.cancel_subagent(int(sub_arg)):
+        elif hasattr(session, "cancel_subagent") and session.cancel_subagent(int(sub_arg)):
+            say.ok(f"Subagent #{sub_arg} cancelled.")
+        elif hasattr(session, "subagent_mgr") and session.subagent_mgr.cancel_task(int(sub_arg))[0]:
             say.ok(f"Subagent #{sub_arg} cancelled.")
         else:
             say.warn(f"Subagent #{sub_arg} is not running or not found in queue.")
     elif sub_cmd == "list" or not arg:
-        session.print_subagents()
+        if hasattr(session, "subagent_mgr"):
+            session.subagent_mgr.render_tasks_table()
+        else:
+            session.print_subagents()
     elif sub_cmd and sub_cmd.isdigit() and not sub_arg:
-        session.print_subagent_detail(int(sub_cmd))
+        if hasattr(session, "subagent_mgr"):
+            session.subagent_mgr.render_task_detail(int(sub_cmd))
+        else:
+            session.print_subagent_detail(int(sub_cmd))
     else:
-        session.spawn_subagent(arg)
+        if hasattr(session, "subagent_mgr"):
+            handle_slash_command(f"/spawn {arg}".strip(), session)
+        else:
+            session.spawn_subagent(arg)
 
 
 @command("/build", "/test", group="Agents", help="Run build and tests on the CUDA subagent")
 async def _cmd_build(session, arg, ctx):
-    task = session.run_build_subagent(custom_cmd=arg.strip() if arg else None, repo_root=".")
-    if not session.json_output:
-        say.step(f"Pushed build and test verification to NVIDIA Subagent #{task.id} (port 9001). Type /subagent view {task.id} to inspect.")
+    handle_slash_command(f"/build {arg}".strip() if arg else "/build", session)
 
 
 @command("/tasks", "/subagents", group="Agents", help="List subagent tasks")
 async def _cmd_tasks(session, arg, ctx):
-    session.print_subagents()
+    handle_slash_command("/tasks", session)
 
 
 @command("/brainstorm", "/spec", "/plan", group="Agents", help="Spec-driven plan, build, review and commit workflow")
 async def _cmd_brainstorm(session, arg, ctx):
-    from ..agents.brainstorm import BrainstormWorkflow
-    ctx.task = asyncio.create_task(BrainstormWorkflow.execute_workflow(arg, session, repo_root="."))
+    idea = arg.strip()
+    if not idea:
+        if console and RICH_AVAILABLE:
+            console.print("[yellow]Usage: /brainstorm <architectural idea or feature spec>[/yellow]")
+        else:
+            say.warn("Usage: /brainstorm <architectural idea or feature spec>")
+        return True
+    from ..agents.brainstorm import AutonomousBrainstormWorkflow
+    workflow = AutonomousBrainstormWorkflow(session)
+    ctx.task = asyncio.create_task(
+        workflow.run(
+            idea=idea,
+            memory_sync_enabled=getattr(session, "memory_sync_enabled", getattr(session, "kontexta_sync", True)),
+        )
+    )
     try:
         await ctx.task
     except asyncio.CancelledError:
-        say.warn("[^C] Brainstorm workflow stopped. Run /brainstorm with the same idea to resume.")
+        if console and RICH_AVAILABLE:
+            console.print("[yellow][^C] Brainstorm workflow cancelled.[/yellow]")
+        else:
+            say.warn("[^C] Brainstorm workflow cancelled.")
     finally:
         ctx.task = None
+    return True
 
 
 @command("/search", "/web", "/google", "/ddg", group="Agents", help="Search the web")
@@ -1223,16 +1443,170 @@ async def _cmd_fetch(session, arg, ctx):
         say.plain(content)
 
 
+@command("/hermes", group="Agents", help="Run Hermes Agent strictly targeting AMD ROCm (:9000)")
+async def _cmd_hermes(session, arg, ctx):
+    hermes_bin = os.environ.get("HERMES_BIN") or shutil.which("hermes") or os.path.expanduser("~/.local/bin/hermes")
+    if not hermes_bin or not os.path.exists(hermes_bin):
+        say.err("Hermes CLI not found. Install or ensure ~/.local/bin/hermes exists.")
+        return
+
+    await asyncio.to_thread(session.refresh_endpoints)
+    ep = session.endpoints.get("9000", {})
+    port = ep.get("port", PORT_ROCM)
+    rocm_url = f"http://localhost:{port}/v1"
+    is_online = (ep.get("status") == "online")
+    model_name = ep.get("name_friendly") or ep.get("filename") or "ROCm Model"
+
+    if not is_online:
+        say.warn(f"AMD ROCm (: {port}) is currently OFFLINE.")
+        say.dim(f"Use '/switch <model_id>' or start your model server on port {port} before invoking Hermes.")
+        return
+
+    arg_clean = arg.strip()
+    if not arg_clean or arg_clean in ("status", "info", "-h", "--help"):
+        say.card(f"Hermes Agent · AMD ROCm ({port})", [
+            ("Target Port", f":{port} (AMD ROCm GPU)"),
+            ("Status", f"{UI.GREEN}ONLINE{UI.RST}"),
+            ("Loaded Model", f"{UI.ROCM}{model_name}{UI.RST}"),
+            ("Endpoint", rocm_url),
+            ("Hermes Binary", hermes_bin),
+            ("Usage", "/hermes <prompt>"),
+            ("Launch TUI", "/hermes tui"),
+        ])
+        return
+
+    env = os.environ.copy()
+    env["OPENAI_BASE_URL"] = rocm_url
+    env["OPENAI_API_KEY"] = "local"
+    env["HERMES_INFERENCE_MODEL"] = "local"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    if arg_clean in ("tui", "--tui", "repl", "interactive"):
+        say.step(f"Launching Hermes TUI targeting AMD ROCm ({rocm_url})...")
+        try:
+            subprocess.run([hermes_bin, "--tui", "--provider", "custom", "-m", "local"], env=env)
+        except Exception as e:
+            say.err(f"Failed to launch Hermes TUI: {e}")
+        return
+
+    say.turn_header(f"Hermes Agent · AMD ROCm ({model_name})", "9000")
+    say.step(f"Hermes active on AMD ROCm (: {port})...")
+
+    t0 = time.perf_counter()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            hermes_bin,
+            "chat",
+            "--provider", "custom",
+            "-m", "local",
+            "--yolo",
+            "--accept-hooks",
+            "-q", arg_clean,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        ctx.task = proc
+
+        response_lines = []
+        accumulated_lines = []
+        in_response_box = False
+
+        while True:
+            line_bytes = await proc.stdout.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+            accumulated_lines.append(line)
+
+            # Filter noisy preambles
+            if "Warning: Unknown toolsets" in line:
+                continue
+            if line.startswith("Query: ") or line == "Initializing agent..." or line.startswith("────"):
+                continue
+
+            # Detect and print live tool steps
+            if "┊" in line or line.strip().startswith(("$", "💻", "📁", "🔍", "⚙", "preparing", "running")):
+                clean_step = line.strip().lstrip("┊").strip()
+                say.step(f"hermes: {clean_step}")
+                continue
+
+            # Detect Hermes response block
+            if "╭─ ⚕ Hermes" in line:
+                in_response_box = True
+                say.group(f"Hermes ({model_name})")
+                continue
+            elif "╰─" in line and in_response_box:
+                in_response_box = False
+                continue
+
+            if in_response_box:
+                # Strip leading 4-space box margin
+                content = line[4:] if line.startswith("    ") else line
+                response_lines.append(content)
+                say.plain(content)
+                continue
+
+            # Dim post-session summary lines
+            if line.startswith(("Resume this session with:", "Session:", "Duration:", "Messages:", "hermes --resume")):
+                say.dim(f"  {line.strip()}")
+                continue
+
+            # Any other tool or diagnostic line
+            if line.strip():
+                say.detail(f"  {line.strip()}")
+
+        stderr_bytes = await proc.stderr.read()
+        err_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        await proc.wait()
+        dur = time.perf_counter() - t0
+
+        out_text = "\n".join(response_lines).strip() or "\n".join(accumulated_lines).strip()
+
+        if proc.returncode != 0 and not out_text:
+            say.err(f"Hermes failed (exit code {proc.returncode}): {err_text or 'unknown error'}")
+            return
+
+        if session.show_metrics and not session.json_output:
+            words = len(out_text.split())
+            ctx_badge = session.format_context_badge("9000", reset_col=UI.GRAY)
+            say.dim(f"  hermes [ROCm:9000] · {dur:.2f}s · ~{words} words · {ctx_badge}")
+
+        session.history.append({"role": "user", "target": "9000", "content": f"[Hermes Prompt]: {arg_clean}"})
+        session.history.append({"role": "assistant", "target": "9000", "content": out_text})
+        session.last_answer = out_text
+        session._record_stats("9000", "9000", len(out_text.split()), None, None, dur)
+    except asyncio.CancelledError:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        say.warn("[^C] Hermes execution cancelled.")
+    except Exception as e:
+        say.err(f"Hermes execution error: {e}")
+    finally:
+        ctx.task = None
+
+
 # ── Git ───────────────────────────────────────────────────────────────
 
 @command("/diff", group="Git", help="Show the file changes from a recent turn (/diff <n>)")
 async def _cmd_diff(session, arg, ctx):
-    nth = int(arg) if arg.isdigit() else 1
-    text = await asyncio.to_thread(session.turn_diff, nth)
+    parts = arg.split()
+    n = int(parts[0]) if parts and parts[0].isdigit() else 1
+    if hasattr(session, "checkpointer") and session.checkpointer.checkpoints:
+        diff_output = session.checkpointer.get_diff(nth_latest=n)
+        if RICH_AVAILABLE and console:
+            console.print(diff_output)
+        else:
+            print(diff_output)
+        return
+
+    text = await asyncio.to_thread(session.turn_diff, n)
     if not text:
         say.warn("No recorded file changes for that turn (needs a git repo and a turn that edited files).")
         return
-    stat = await asyncio.to_thread(session.turn_diff, nth, True)
+    stat = await asyncio.to_thread(session.turn_diff, n, True)
     say.dim(stat)
     for line in text.splitlines():
         if line.startswith("+") and not line.startswith("+++"):
@@ -1247,6 +1621,24 @@ async def _cmd_diff(session, arg, ctx):
 
 @command("/undo", group="Git", help="Revert the files changed by the last turn (asks first)")
 async def _cmd_undo(session, arg, ctx):
+    if hasattr(session, "checkpointer") and session.checkpointer.checkpoints:
+        success, message, files = session.checkpointer.undo_latest()
+        if success:
+            if RICH_AVAILABLE and console:
+                console.print(f"[green]✓ {message}[/green]")
+                for f in files:
+                    console.print(f"  [dim]• Restored: {f}[/dim]")
+            else:
+                say.ok(message)
+                for f in files:
+                    say.dim(f"  • Restored: {f}")
+        else:
+            if RICH_AVAILABLE and console:
+                console.print(f"[yellow]○ {message}[/yellow]")
+            else:
+                say.warn(message)
+        return
+
     plan = await asyncio.to_thread(session.undo_plan)
     if not plan or not plan["files"]:
         say.warn("Nothing to undo: no recorded turn with file changes.")
@@ -1406,6 +1798,8 @@ async def interactive_loop(session: MultiGpuHybridSession):
                 else:
                     try:
                         result = await handler(session, arg, ctx)
+                    except ReloadRequested:
+                        raise
                     except Exception as exc:
                         say.err(f"{cmd} failed: {type(exc).__name__}: {exc}")
                         say.dim(traceback.format_exc())
@@ -1423,8 +1817,9 @@ async def interactive_loop(session: MultiGpuHybridSession):
             lower_input = user_input.lower()
             if lower_input.startswith(("@9000 ", "@rocm ", "@amd ")):
                 force_target, prompt = "9000", user_input.split(maxsplit=1)[1].strip()
-            elif lower_input.startswith(("@9001 ", "@cuda ", "@nvidia ")):
-                force_target, prompt = "9001", user_input.split(maxsplit=1)[1].strip()
+            elif lower_input.startswith(("@9001 ", "@9002 ", "@cuda ", "@nvidia ")):
+                t_key = "9001" if lower_input.startswith("@9001 ") else "9002"
+                force_target, prompt = session.resolve_target_alias(t_key), user_input.split(maxsplit=1)[1].strip()
             elif lower_input.startswith(("@cloud ", "@gemini ", "@oauth ")):
                 force_target, prompt = "cloud", user_input.split(maxsplit=1)[1].strip()
             elif lower_input.startswith(("@auto ", "@laya ")):
@@ -1471,7 +1866,8 @@ async def interactive_loop(session: MultiGpuHybridSession):
             esc_listener = EscListener(
                 on_escape=lambda: loop.call_soon_threadsafe(
                     lambda: ctx.task.cancel() if ctx.task and not ctx.task.done() else None
-                )
+                ),
+                session=session,
             )
             turn_ok = False
             try:
@@ -1500,6 +1896,7 @@ async def interactive_loop(session: MultiGpuHybridSession):
                     print(json.dumps({"status": "error", "error": err, "prompt": prompt}, indent=2))
                 else:
                     say.err(f"Error during turn: {e}")
+                await session.reset_local_agent()
             finally:
                 ctx.task = None
                 # Pick up anything typed during the turn; discard on abort/error
@@ -1520,7 +1917,7 @@ async def main():
     parser.add_argument(
         "--target",
         "--mode",
-        choices=["auto", "9000", "9001", "rocm", "cuda", "cloud"],
+        choices=["auto", "9000", "9002", "rocm", "cuda", "cloud"],
         default=None,
         help="Initial active model target (default: saved preference, else 'rocm'/port 9000)",
     )
@@ -1542,8 +1939,8 @@ async def main():
         "--cuda",
         action="store_const",
         dest="target",
-        const="9001",
-        help="Alias to start with NVIDIA CUDA GPU (port 9001)",
+        const="9002",
+        help="Alias to start with NVIDIA CUDA GPU (port 9002)",
     )
     parser.add_argument(
         "--dangerously-skip-permissions",
@@ -1631,8 +2028,23 @@ async def main():
         default=False,
         help="Enable verbose mode (detailed tool inputs, output previews, step numbers)",
     )
+    parser.add_argument(
+        "--restore-shm",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,  # Internal flag used by /reload os.execv handoff
+    )
+    parser.add_argument(
+        "--sdk-path",
+        type=str,
+        default=None,
+        help="Explicit directory path to google-antigravity Python SDK",
+    )
 
     args = parser.parse_args()
+
+    if getattr(args, "sdk_path", None):
+        setup_antigravity_sdk(args.sdk_path)
 
     # Precedence: explicit CLI flag > saved preference > built-in default
     prefs = load_prefs()
@@ -1651,7 +2063,19 @@ async def main():
     session.apply_preferences({k: v for k, v in prefs.items() if k not in handled})
     _sync_say(session)
 
-    if args.load_session:
+    if getattr(args, "restore_shm", None):
+        snap = consume_reload_snapshot(args.restore_shm)
+        if snap is not None:
+            session.restore_from_snapshot(snap)
+            elapsed_ms = (time.time() - snap.timestamp) * 1000.0
+            turns_cnt = len(snap.chat_history) // 2
+            say.card("Hot reload", [
+                ("Status", f"Restored in {elapsed_ms:.0f}ms"),
+                ("Target", session.active_target.upper()),
+                ("History", f"{turns_cnt} turn(s)"),
+                ("Checkpoints", f"{len(snap.checkpoint_trees)}"),
+            ])
+    elif args.load_session:
         session.load_session(args.load_session)
     elif args.resume_latest:
         sessions = session.list_sessions()
@@ -1669,5 +2093,14 @@ async def main():
                 await interactive_loop(session)
         else:
             await interactive_loop(session)
+    except ReloadRequested as req:
+        return req.shm_path
     finally:
         await session.close()
+    return None
+
+
+if __name__ == "__main__":
+    _shm = asyncio.run(main())
+    if _shm is not None:
+        perform_execv_reload(_shm)

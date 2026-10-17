@@ -108,3 +108,9 @@ def test_turn_header_and_group_and_table(capsys):
 def test_rule_line_and_fmt_elapsed():
     assert "receipt" in say.rule_line("receipt", "", 30)
     assert say.fmt_elapsed(5) == "5.0s" and say.fmt_elapsed(125) == "2m05s"
+
+
+def test_say_markdown(capsys):
+    say.markdown("**bold text**")
+    out = capsys.readouterr().out
+    assert "bold text" in out

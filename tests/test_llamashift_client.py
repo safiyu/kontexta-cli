@@ -11,7 +11,7 @@ from myagy.agents import compactor
 from myagy.agents.compactor import ContextCurator
 
 
-def _status(mode="multi_port", granite_port=9001, running=("qwen27",), granite_dedicated=False, effective=False):
+def _status(mode="multi_port", granite_port=9002, running=("qwen27",), granite_dedicated=False, effective=False):
     def model(mid, port, ctx, fname, dedicated=False):
         return {"id": mid, "name": mid.upper(), "filename": fname, "port": port, "ctxSize": ctx, "dedicated": dedicated,
                 "status": "running" if mid in running else "stopped", "gpu": "GPU", "size": "8B"}
@@ -147,7 +147,7 @@ def test_running_models_and_ctx_size(shift):
     shift()
     assert [m["id"] for m in ls.get_llamashift_active()] == ["qwen27"]
     assert ls.ctx_size_for_port(9000) == 65152
-    assert ls.ctx_size_for_port(9001) is None
+    assert ls.ctx_size_for_port(9002) is None
     assert ls.detect_port_model(9000)["status"] == "online"
 
 
@@ -206,27 +206,27 @@ def test_resolve_model_id(shift):
 def test_wake_refused_in_single_port_and_never_calls_start(shift, monkeypatch):
     fake = shift(_status(mode="single_port"))
     monkeypatch.setattr("myagy.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
-    res = ls.wake_compactor(9001, timeout=2)
+    res = ls.wake_compactor(9002, timeout=2)
     assert not res["ok"] and "single_port" in res["reason"] and "dedicated" in res["reason"]
     assert "/api/start" not in fake.paths
 
 
 def test_wake_allowed_for_dedicated_model_in_single_port(shift):
     shift(_status(mode="single_port", granite_dedicated=True))
-    assert ls.can_wake_secondary("granite_8b_q4", 9001) == (True, "")
+    assert ls.can_wake_secondary("granite_8b_q4", 9002) == (True, "")
 
 
 def test_wake_refused_when_profile_is_on_another_port(shift, monkeypatch):
     shift(_status(granite_port=9005))
     monkeypatch.setattr("myagy.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
-    res = ls.wake_compactor(9001, timeout=2)
+    res = ls.wake_compactor(9002, timeout=2)
     assert not res["ok"] and "9005" in res["reason"]
 
 
 def test_wake_refused_when_no_profile_matches(shift, monkeypatch):
     shift()
     monkeypatch.setattr("myagy.config.COMPACTOR_MODEL_ID", "nosuchmodel")
-    res = ls.wake_compactor(9001, timeout=2)
+    res = ls.wake_compactor(9002, timeout=2)
     assert not res["ok"] and "MYAGY_COMPACTOR_MODEL" in res["reason"]
 
 
@@ -351,7 +351,7 @@ def test_effective_port_from_status_needs_no_config_call(shift):
 def test_wake_result_always_carries_warnings(shift, monkeypatch):
     shift(_status(mode="single_port"))
     monkeypatch.setattr("myagy.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
-    assert ls.wake_compactor(9001, timeout=1)["warnings"] == []
+    assert ls.wake_compactor(9002, timeout=1)["warnings"] == []
 
 
 def test_refresh_endpoints_explains_unauthorized(monkeypatch, capsys):
@@ -369,7 +369,7 @@ def test_refresh_endpoints_explains_unauthorized(monkeypatch, capsys):
 def test_compactor_start_command_shows_vram_warnings(monkeypatch, capsys):
     from myagy.terminal import cli
 
-    monkeypatch.setattr(cli, "wake_compactor", lambda port=9001, **k: {
+    monkeypatch.setattr(cli, "wake_compactor", lambda port=9002, **k: {
         "ok": True, "reason": "", "log_tail": "", "elapsed": 2.0, "warnings": ["Model may not fit: 9 GB needed"]})
 
     class Fake:
@@ -478,8 +478,8 @@ def test_toolbar_shows_rocm_vram_for_9000(session, monkeypatch):
     assert "vram 14.2/24G" in text and "2.9" not in text
 
 
-def test_toolbar_shows_cuda_vram_for_9001(session, monkeypatch):
-    assert "vram 2.9/8.0G" in _toolbar_text(session, monkeypatch, "9001")
+def test_toolbar_shows_cuda_vram_for_9002(session, monkeypatch):
+    assert "vram 2.9/8.0G" in _toolbar_text(session, monkeypatch, "9002")
 
 
 def test_toolbar_shows_both_gpus_under_auto(session, monkeypatch):

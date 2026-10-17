@@ -77,7 +77,7 @@ class FakeSession:
     multiline_input = True
     active_target = "auto"
     history = []
-    endpoints = {"9001": {"status": "online", "filename": "g.gguf"}}
+    endpoints = {"9002": {"status": "online", "filename": "g.gguf"}}
 
     def __init__(self):
         self.spawned = []
@@ -185,11 +185,11 @@ def test_first_line_keyboard_interrupt_raises_prompt_interrupted(monkeypatch):
 
 def test_reload_flags_come_from_preferences():
     flags = cli._reload_flags(
-        {"cloud_model": "m", "active_target": "9001", "dangerously_skip_permissions": False,
+        {"cloud_model": "m", "active_target": "9002", "dangerously_skip_permissions": False,
          "verbose": True, "enable_mcp": False, "enable_kontexta": False, "multiline_input": False},
         json_output=True,
     )
-    assert flags == ["--cloud-model", "m", "--target", "9001", "--safe", "--verbose", "--json",
+    assert flags == ["--cloud-model", "m", "--target", "9002", "--safe", "--verbose", "--json",
                      "--no-mcp", "--no-kontexta", "--single-line"]
     assert cli._reload_flags({"active_target": "some-model-id"}) == []
 
@@ -209,3 +209,21 @@ def test_esc_listener_exit_joins_thread_before_restoring_terminal():
     lst._cleanup_terminal = lambda: order.append("cleanup")
     lst.__exit__(None, None, None)
     assert order == ["join", "cleanup"]
+
+
+def test_resume_command_loads_latest_session(monkeypatch):
+    class Sess:
+        def __init__(self):
+            self.loaded = None
+            self.history = ["h1", "h2"]
+        def list_sessions(self):
+            return [{"file": "latest_session.json", "turns": 1, "saved_at": "2026-10-16", "size_kb": 1.0}]
+        def load_session(self, name):
+            self.loaded = name
+            return True
+
+    s = Sess()
+    cmd = cli.COMMANDS["/resume"]
+    asyncio.run(cmd(s, "", None))
+    assert s.loaded == "latest_session.json"
+

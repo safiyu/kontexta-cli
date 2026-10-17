@@ -54,7 +54,8 @@ CTX_ERR = RuntimeError("exceed_context_size_error: request exceeds the available
 def test_context_exceeded_on_last_attempt_escalates_instead_of_dropping_turn(session, monkeypatch):
     _online(session)
     session.enable_hooks = False
-    agent = ScriptedAgent([CTX_ERR, CTX_ERR, CTX_ERR])
+    # 3 normal attempts fail, then total distillation attempt also fails, triggering cloud fallback
+    agent = ScriptedAgent([CTX_ERR, CTX_ERR, CTX_ERR, CTX_ERR])
     _bind_agent(session, monkeypatch, agent)
     monkeypatch.setattr(session, "compact_history", lambda keep_recent=None, silent=False: 1)
     session.history = [{"role": "user", "target": "9000", "content": "a"}, {"role": "assistant", "target": "9000", "content": "b"}, {"role": "user", "target": "9000", "content": "c"}]
@@ -66,15 +67,66 @@ def test_context_exceeded_on_last_attempt_escalates_instead_of_dropping_turn(ses
 
     out = asyncio.run(session.chat("big prompt", force_target="9000"))
     assert out == "cloud answer"
-    assert agent.calls == 3
+    assert agent.calls == 4
     assert session.history[-1] == {"role": "assistant", "target": "cloud", "content": "cloud answer"}
     assert session.stats["cloud"]["turns"] == 1
+
+
+def test_context_exceeded_forces_total_distillation_and_succeeds_on_local(session, monkeypatch):
+    _online(session)
+    session.enable_hooks = False
+    # 3 normal attempts fail, then post-total-distillation attempt succeeds locally
+    agent = ScriptedAgent([CTX_ERR, CTX_ERR, CTX_ERR, "distilled answer"])
+    _bind_agent(session, monkeypatch, agent)
+    compact_calls = []
+
+    def mock_compact(keep_recent=None, silent=False):
+        compact_calls.append(keep_recent)
+        return 1
+
+    monkeypatch.setattr(session, "compact_history", mock_compact)
+    session.history = [{"role": "user", "target": "9000", "content": "a"}, {"role": "assistant", "target": "9000", "content": "b"}]
+
+    out = asyncio.run(session.chat("big prompt", force_target="9000"))
+    assert out == "distilled answer"
+    assert agent.calls == 4
+    # The final compaction before retry was total distillation (keep_recent=0)
+    assert compact_calls[-1] == 0
+    assert session.history[-1] == {"role": "assistant", "target": "9000", "content": "distilled answer"}
+    assert session.stats["9000"]["turns"] == 1
+
+
+def test_context_exceeded_normal_compaction_zero_triggers_immediate_total_distillation(session, monkeypatch):
+    _online(session)
+    session.enable_hooks = False
+    # Attempt 1 fails, normal compaction (keep_recent=2 and 1) returns 0,
+    # immediately triggers total distillation (keep_recent=0) which succeeds!
+    agent = ScriptedAgent([CTX_ERR, "distilled answer on attempt 2"])
+    _bind_agent(session, monkeypatch, agent)
+    compact_calls = []
+
+    def mock_compact(keep_recent=None, silent=False):
+        compact_calls.append(keep_recent)
+        if keep_recent == 0:
+            return 2  # Total distillation frees 2 entries
+        return 0  # Normal compaction cannot free anything
+
+    monkeypatch.setattr(session, "compact_history", mock_compact)
+    session.history = [{"role": "user", "target": "9000", "content": "a"}, {"role": "assistant", "target": "9000", "content": "b"}]
+
+    out = asyncio.run(session.chat("big prompt", force_target="9000"))
+    assert out == "distilled answer on attempt 2"
+    assert agent.calls == 2
+    # keep_recent=2, then keep_recent=0 (total distillation)
+    assert 0 in compact_calls
+    assert session.history[-1] == {"role": "assistant", "target": "9000", "content": "distilled answer on attempt 2"}
+    assert session.stats["9000"]["turns"] == 1
 
 
 def test_context_exceeded_with_failed_escalation_raises_and_counts_error(session, monkeypatch):
     _online(session)
     session.enable_hooks = False
-    agent = ScriptedAgent([CTX_ERR, CTX_ERR, CTX_ERR])
+    agent = ScriptedAgent([CTX_ERR, CTX_ERR, CTX_ERR, CTX_ERR])
     _bind_agent(session, monkeypatch, agent)
     monkeypatch.setattr(session, "compact_history", lambda keep_recent=None, silent=False: 1)
     monkeypatch.setattr(session.laya, "choose_escalation_target", lambda *a, **k: ("cloud", 0.9))
@@ -284,3 +336,97 @@ def test_prefs_reject_bool_for_int_keys_and_int_for_bool_keys(tmp_path):
     with open(path, "w") as f:
         json.dump({"autocompact_threshold": True, "max_tool_steps_per_turn": 3, "verbose": 1, "show_metrics": False}, f)
     assert load_prefs(path) == {"max_tool_steps_per_turn": 3, "show_metrics": False}
+
+
+@pytest.mark.parametrize("err", [
+    RuntimeError("unexpected EOF: unexpected EOF"),
+    ConnectionResetError("Connection reset by peer"),
+    BrokenPipeError("Broken pipe"),
+    RuntimeError("ClientPayloadError: Response payload is not completed"),
+    RuntimeError("RemoteProtocolError: peer closed connection"),
+    RuntimeError("unexpected EOF"),
+])
+def test_unexpected_eof_and_connection_drops_trigger_escalation(session, monkeypatch, err):
+    _online(session)
+    session.enable_hooks = False
+    agent = ScriptedAgent([err])
+    _bind_agent(session, monkeypatch, agent)
+    monkeypatch.setattr(session.laya, "choose_escalation_target", lambda *a, **k: ("cloud", 0.95))
+
+    async def cloud(prompt, with_project_context=True):
+        return "escalated cloud reply"
+
+    monkeypatch.setattr(session, "chat_cloud_oauth", cloud)
+
+    out = asyncio.run(session.chat("build test harness", force_target="9000"))
+    assert out == "escalated cloud reply"
+    assert session.history[-1] == {"role": "assistant", "target": "cloud", "content": "escalated cloud reply"}
+    assert session.stats["cloud"]["turns"] == 1
+
+
+def test_turn_autosaves_latest_session(session, monkeypatch, tmp_path):
+    _online(session)
+    session.enable_hooks = False
+    saved = []
+    monkeypatch.setattr(session, "save_session", lambda name=None: saved.append(name) or "/tmp/session.json")
+    _bind_agent(session, monkeypatch, ScriptedAgent(["test reply"]))
+
+    asyncio.run(session.chat("hello"))
+    assert "latest_session" in saved
+
+
+def test_turn_error_resets_local_agent(session, monkeypatch):
+    _online(session)
+    session.enable_hooks = False
+    agent = ScriptedAgent([RuntimeError("Fatal endpoint drop")])
+    _bind_agent(session, monkeypatch, agent)
+    # No escalation targets so it raises
+    monkeypatch.setattr(session.laya, "choose_escalation_target", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no candidates")))
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(session.chat("boom", force_target="9000"))
+    assert session._active_local_agent is None
+
+
+def test_wedged_non_idle_agent_is_reset_before_reuse(session, monkeypatch):
+    _online(session)
+    session.enable_hooks = False
+
+    class FakeConn:
+        is_idle = False
+
+    class FakeConv:
+        _connection = FakeConn()
+
+    class WedgedAgent:
+        _conversation = FakeConv()
+        closed = False
+        async def __aexit__(self, *args):
+            self.closed = True
+
+    wedged = WedgedAgent()
+    session._active_local_agent = wedged
+    session._current_agent_target = "9000"
+    session._active_local_model = session.endpoints["9000"]["model"]
+
+    # When get_or_switch_local_agent runs, it should detect is_idle is False and reset
+    reset_called = []
+    real_reset = session.reset_local_agent
+
+    async def spy_reset():
+        reset_called.append(True)
+        await real_reset()
+
+    monkeypatch.setattr(session, "reset_local_agent", spy_reset)
+
+    class FreshAgent:
+        _conversation = None
+        async def __aenter__(self):
+            return self
+
+    monkeypatch.setattr(session_mod, "Agent", lambda cfg: FreshAgent())
+    fresh = asyncio.run(session.get_or_switch_local_agent("9000"))
+    assert reset_called == [True]
+    assert fresh is not wedged
+
+

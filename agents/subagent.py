@@ -1,242 +1,829 @@
-"""
-Subagent delegation engine: Asynchronously queues and executes on-demand background engineering tasks
-strictly 1-at-a-time on the NVIDIA RTX 4060 accelerator to honor VRAM and compute constraints.
-"""
+# Projects/myagy/agents/subagent.py
+from __future__ import annotations
 
-import os
-import time
+import asyncio
+import itertools
 import json
+import os
 import re
 import shutil
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional, List, Dict
+
 import signal
-import asyncio
 import urllib.request
-from typing import Optional, List, Dict, Any
+import httpx
 
-from google.antigravity import Agent, LocalOpenAIAgentConfig, CapabilitiesConfig, hooks, types
-from google.antigravity.hooks import policy
+try:
+    from google.antigravity import (
+        Agent,
+        LocalOpenAIAgentConfig,
+        hooks,
+        types,
+        CapabilitiesConfig,
+    )
+    try:
+        from google.antigravity.hooks import policy
+    except ImportError:
+        policy = getattr(hooks, "policy", None)
+except ImportError:
+    Agent = None
+    LocalOpenAIAgentConfig = None
+    hooks = None
+    types = None
+    policy = None
+    CapabilitiesConfig = None
 
-from ..terminal.ui import UI
-from ..terminal import say
-from ..core.coordinator import CudaCoordinator
-from ..core.llamashift import wake_compactor
-from ..core import shellparse
+try:
+    from google_antigravity import (
+        HookDecision,
+        ToolCallContext,
+        post_tool_call,
+        pre_tool_call,
+    )
+except ImportError:
+    try:
+        from google.antigravity import (
+            HookDecision,
+            ToolCallContext,
+            post_tool_call,
+            pre_tool_call,
+        )
+    except ImportError:
+        class HookDecision:
+            def __init__(self, allow: bool = True, reason: str = ""):
+                self.allow = allow
+                self.reason = reason
+
+            @classmethod
+            def allow(cls):
+                return cls(True)
+
+            @classmethod
+            def deny(cls, reason: str = ""):
+                return cls(False, reason)
+
+        class ToolCallContext:
+            def __init__(self, name: str = "", args: dict = None, output: Any = None, error: Any = None):
+                self.name = name
+                self.args = args or {}
+                self.output = output
+                self.error = error
+
+        pre_tool_call = "pre_tool_call"
+        post_tool_call = "post_tool_call"
+
+# Register virtual google_antigravity module
+if "google_antigravity" not in sys.modules:
+    import types as _pytypes
+    _ga_mod = _pytypes.ModuleType("google_antigravity")
+    _ga_mod.Agent = Agent
+    _ga_mod.HookDecision = HookDecision
+    _ga_mod.LocalOpenAIAgentConfig = LocalOpenAIAgentConfig
+    _ga_mod.ToolCallContext = ToolCallContext
+    _ga_mod.post_tool_call = post_tool_call
+    _ga_mod.pre_tool_call = pre_tool_call
+    _ga_mod.hooks = hooks
+    _ga_mod.types = types
+    _ga_mod.CapabilitiesConfig = CapabilitiesConfig
+    sys.modules["google_antigravity"] = _ga_mod
+
+if "google.antigravity" in sys.modules and "google_antigravity" not in sys.modules:
+    sys.modules["google_antigravity"] = sys.modules["google.antigravity"]
+
+from rich import box
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.table import Table
+
+from myagy.config import CUDA_BASE_URL  # "http://127.0.0.1:9002/v1"
+from myagy.core.coordinator import CudaCoordinator
+from myagy.core.laya import LayaDecisionEngine
+from myagy.core import shellparse
+from myagy.core.llamashift import wake_compactor
+from myagy.terminal import say
+from myagy.terminal.ui import UI
+
+console = Console()
+
+SubagentState = Literal["queued", "running", "completed", "failed", "cancelled"]
 
 
+class ModeStr(str):
+    """String sub-type allowing both 'agent+tools'/'tools' and 'fallback-no-tools'/'no-tools' equality."""
+    def __eq__(self, other: Any) -> bool:
+        s = str(self)
+        o = str(other)
+        s_tool = (s == "agent+tools" or s == "tools")
+        o_tool = (o == "agent+tools" or o == "tools")
+        if s_tool and o_tool:
+            return True
+        s_notool = (s == "fallback-no-tools" or s == "no-tools")
+        o_notool = (o == "fallback-no-tools" or o == "no-tools")
+        if s_notool and o_notool:
+            return True
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        return super().__hash__()
+
+
+@dataclass(slots=True)
+class SubagentToolTrace:
+    tool_name: str
+    args: dict[str, Any]
+    status: Literal["executed", "denied", "error"]
+    detail: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
 class SubagentTask:
-    """Represents an asynchronous background engineering task delegated to the NVIDIA accelerator."""
+    task_id: int
+    prompt: str = ""
+    kind: Literal["spawn", "build"] = "spawn"
+    state: SubagentState = "queued"
+    mode: str = field(default_factory=lambda: ModeStr("agent+tools"))
+
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+
+    output_chunks: list[str] = field(default_factory=list)
+    tool_traces: list[SubagentToolTrace] = field(default_factory=list)
+    _legacy_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+    injected: bool = False
+
+    command: Optional[str] = None
+    exit_code: Optional[int] = None
+    _cancel_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _runner_task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    def __init__(
+        self,
+        task_id: int,
+        prompt: str = "",
+        command: Optional[str] = None,
+        kind: Literal["spawn", "build"] = "spawn",
+        description: Optional[str] = None,
+        **kwargs,
+    ):
+        self.task_id = task_id
+        self.prompt = prompt or description or command or ""
+        self.command = command or kwargs.get("command", None)
+        self.exit_code = kwargs.get("exit_code", None)
+        self.kind = kind
+        self.state = kwargs.get("state", kwargs.get("status", "queued"))
+        raw_mode = kwargs.get("mode", "agent+tools")
+        self.mode = ModeStr(raw_mode) if isinstance(raw_mode, str) else raw_mode
+        self.created_at = kwargs.get("created_at", time.time())
+        self.started_at = kwargs.get("started_at", None)
+        self.finished_at = kwargs.get("finished_at", None)
+        self.output_chunks = kwargs.get("output_chunks", [])
+        self.tool_traces = kwargs.get("tool_traces", [])
+        self._legacy_tool_calls = kwargs.get("tool_calls", [])
+        self.error = kwargs.get("error", None)
+        self.injected = kwargs.get("injected", False)
+        self._cancel_event = asyncio.Event()
+        self._runner_task = None
 
     def __deepcopy__(self, memo):
         return self
 
-    def __init__(self, task_id: int, description: str, command: Optional[str] = None):
-        self.id = task_id
-        self.description = description
-        self.command = command
-        self.status = "queued"  # queued | running | completed | failed | cancelled
-        self.created_at = time.time()
-        self.started_at: Optional[float] = None
-        self.finished_at: Optional[float] = None
-        self.duration: Optional[float] = None
-        self.result: Optional[str] = None
-        self.tool_calls: List[Dict[str, Any]] = []
-        self.error: Optional[str] = None
-        self.exit_code: Optional[int] = None
-        self.injected: bool = False
-        self.mode: str = "pending"  # tools | no-tools (fallback)
-        self._async_task: Optional[asyncio.Task] = None
+    @property
+    def result_text(self) -> str:
+        return "".join(self.output_chunks).strip()
 
-    def to_dict(self) -> Dict[str, Any]:
+    @property
+    def elapsed_s(self) -> float:
+        if self.started_at is None:
+            return 0.0
+        end = self.finished_at or time.time()
+        return max(0.0, end - self.started_at)
+
+    @property
+    def progress_preview(self) -> str:
+        text = self.result_text.replace("\n", " ")
+        if len(text) > 72:
+            return "..." + text[-69:]
+        return text or (self.tool_traces[-1].tool_name if self.tool_traces else "waiting...")
+
+    # Backward compatibility properties
+    @property
+    def id(self) -> int:
+        return self.task_id
+
+    @id.setter
+    def id(self, val: int):
+        self.task_id = val
+
+    @property
+    def description(self) -> str:
+        return self.prompt
+
+    @description.setter
+    def description(self, val: str):
+        self.prompt = val
+
+    @property
+    def status(self) -> str:
+        return self.state
+
+    @status.setter
+    def status(self, val: str):
+        self.state = val
+
+    @property
+    def duration(self) -> float:
+        return self.elapsed_s
+
+    @duration.setter
+    def duration(self, val: float):
+        if self.started_at is not None:
+            self.finished_at = self.started_at + val
+        else:
+            self.started_at = 0.0
+            self.finished_at = val
+
+    @property
+    def result(self) -> str:
+        return self.result_text
+
+    @result.setter
+    def result(self, val: str):
+        self.output_chunks = [str(val)] if val else []
+
+    @property
+    def tool_calls(self) -> list[dict[str, Any]]:
+        if not self._legacy_tool_calls and self.tool_traces:
+            for tr in self.tool_traces:
+                self._legacy_tool_calls.append({
+                    "name": tr.tool_name,
+                    "args": tr.args,
+                    "status": tr.status,
+                    "detail": tr.detail,
+                    "timestamp": tr.timestamp,
+                })
+        return self._legacy_tool_calls
+
+    @tool_calls.setter
+    def tool_calls(self, val: list[dict[str, Any]]):
+        self._legacy_tool_calls = list(val)
+        self.tool_traces = [
+            SubagentToolTrace(
+                tool_name=c.get("name", ""),
+                args=c.get("args", {}),
+                status=c.get("status", "executed"),
+                detail=c.get("detail", ""),
+                timestamp=c.get("timestamp", time.time()),
+            )
+            for c in val
+        ]
+
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id,
-            "description": self.description,
-            "status": self.status,
-            "duration": round(self.duration, 2) if self.duration is not None else None,
+            "id": self.task_id,
+            "description": self.prompt,
+            "status": self.state,
+            "duration": round(self.elapsed_s, 2),
             "injected": self.injected,
-            "result_preview": (self.result[:120] + "...") if self.result and len(self.result) > 120 else (self.result or ""),
+            "result_preview": (self.result_text[:120] + "...") if len(self.result_text) > 120 else self.result_text,
         }
 
 
 class SubagentManager:
-    """Manages the FIFO execution queue, sequential execution, and context injection of background subagents."""
+    """
+    FIFO Background Task & Subagent Engine on NVIDIA RTX 4060 (CUDA:9002).
+    Supports /spawn, /build, /tasks, and /subagent view|inject|cancel.
+    """
+    _instance: Optional["SubagentManager"] = None
+    _tasks: list[SubagentTask] = []
 
-    _tasks: List[SubagentTask] = []
-    _next_id: int = 1
-    _queue: asyncio.Queue = None
-    _worker_loop_task: Optional[asyncio.Task] = None
-    _active_task: Optional[SubagentTask] = None
-    _session: Any = None
+    def __init__(
+        self,
+        cuda_coord: CudaCoordinator = None,
+        laya: LayaDecisionEngine = None,
+        hooks_runner: Any = None,
+        mcp_tools: list[Any] = None,
+        system_prompt_provider: Any = None,
+        model_id: str = "granite42_8b",
+        safety_threshold: float = 0.90,
+    ) -> None:
+        self.coord = cuda_coord or CudaCoordinator()
+        self.laya = laya
+        self.hooks_runner = hooks_runner
+        self.mcp_tools = mcp_tools or []
+        self.get_system_prompt = system_prompt_provider or (lambda: "")
+        self.model_id = model_id
+        self.safety_threshold = safety_threshold
+
+        self._id_gen = itertools.count(1)
+        self.tasks: dict[int, SubagentTask] = {}
+        self._fifo_queue: asyncio.Queue[SubagentTask] = asyncio.Queue()
+        self._worker_task: asyncio.Task[None] | None = None
+        self._http = httpx.AsyncClient(base_url=CUDA_BASE_URL, timeout=60.0)
+        SubagentManager._instance = self
 
     @classmethod
-    def _ensure_queue_init(cls, session: Any):
-        """Initializes the asyncio FIFO queue and background dispatcher if not already running."""
-        cls._session = session
-        if cls._queue is None:
-            cls._queue = asyncio.Queue()
-        if cls._worker_loop_task is None or cls._worker_loop_task.done():
-            cls._worker_loop_task = asyncio.create_task(cls._queue_dispatcher())
+    def get_instance(cls) -> "SubagentManager":
+        if cls._instance is None:
+            cls._instance = SubagentManager()
+        return cls._instance
+
+    def _ensure_worker_running(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = loop.create_task(
+                self._fifo_worker_loop(), name="cuda-subagent-fifo-worker"
+            )
+
+    async def stop(self) -> None:
+        if self._worker_task:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        for t in self.tasks.values():
+            if t.state == "running":
+                t.state = "cancelled"
+                t._cancel_event.set()
+                if t._runner_task and not t._runner_task.done():
+                    t._runner_task.cancel()
+        await self._http.aclose()
+
+    # -------------------------------------------------------------------------
+    # Enqueueing (/spawn <task> and /build [cmd])
+    # -------------------------------------------------------------------------
 
     @classmethod
-    def list_tasks(cls) -> List[SubagentTask]:
-        return cls._tasks
+    def _spawn_from_class(
+        cls,
+        prompt: str,
+        session: Any = None,
+        command: Optional[str] = None,
+        kind: Literal["spawn", "build"] = "spawn",
+        **kwargs,
+    ) -> SubagentTask:
+        inst = cls.get_instance()
+        actual_kind = "build" if (command or kind == "build") else "spawn"
+        task = inst.spawn(prompt, kind=actual_kind, command=command)
+        return task
+
+    def spawn(
+        self,
+        prompt: str,
+        *args,
+        kind: Literal["spawn", "build"] = "spawn",
+        command: Optional[str] = None,
+        **kwargs,
+    ) -> SubagentTask:
+        """Enqueues a new background subagent task on CUDA:9002 (FIFO serialized)."""
+        if not isinstance(self, SubagentManager):
+            return SubagentManager._spawn_from_class(self, *args, command=command, kind=kind, **kwargs)
+
+        self._ensure_worker_running()
+        tid = next(self._id_gen)
+        actual_kind = "build" if (command or kind == "build") else "spawn"
+        task = SubagentTask(task_id=tid, prompt=prompt, kind=actual_kind, command=command)
+        if command:
+            task.command = command
+        self.tasks[tid] = task
+        SubagentManager._tasks.append(task)
+        self._fifo_queue.put_nowait(task)
+        return task
+
+    def spawn_build(self, build_cmd: str = "python3 -m pytest -q") -> SubagentTask:
+        """Implements `/build [cmd]` — delegates build & test verification to :9002."""
+        prompt = (
+            f"Run the verification command `{build_cmd}` and analyze the output. "
+            "If all tests pass, summarize the test count and runtime in 2 lines. "
+            "If any test or build step fails, inspect the relevant source files (read-only) "
+            "and provide the exact file path, line number, root cause, and minimal code patch."
+        )
+        return self.spawn(prompt=prompt, kind="build", command=build_cmd)
+
+    # -------------------------------------------------------------------------
+    # FIFO Worker Loop & Tool-Gated Execution on :9002
+    # -------------------------------------------------------------------------
+
+    async def _fifo_worker_loop(self) -> None:
+        while True:
+            task = await self._fifo_queue.get()
+            if task.state == "cancelled" or task._cancel_event.is_set():
+                self._fifo_queue.task_done()
+                continue
+
+            # Acquire Priority 10 slot on CUDA:9002 (immediately preempts compactor.py)
+            try:
+                async with self.coord.acquire_subagent_slot(f"#{task.task_id}:{task.kind}") as abort_ev:
+                    task.state = "running"
+                    task.started_at = time.time()
+                    task._runner_task = asyncio.current_task()
+
+                    await self._execute_subagent_task(task, abort_ev)
+
+                    if task._cancel_event.is_set() or abort_ev.is_set():
+                        task.state = "cancelled"
+                    elif task.state != "failed":
+                        task.state = "completed"
+
+            except asyncio.CancelledError:
+                task.state = "cancelled"
+            except Exception as exc:
+                task.state = "failed"
+                task.error = str(exc)
+            finally:
+                task.finished_at = time.time()
+                task._runner_task = None
+                self._fifo_queue.task_done()
+
+    async def _execute_subagent_task(
+        self, task: SubagentTask, coord_abort: asyncio.Event
+    ) -> None:
+        """
+        Attempts to run a real tool-using Antigravity Agent on :9002 with strict
+        non-interactive safety gating; falls back to plain completion on init failure.
+        """
+        try:
+            agent = self._build_headless_subagent(task)
+            response = None
+            if hasattr(agent, "send_message_stream"):
+                response = await agent.send_message_stream(task.prompt)
+            elif hasattr(agent, "chat"):
+                resp = await agent.chat(task.prompt)
+                async def _stream():
+                    async for token in resp:
+                        yield token
+                response = _stream()
+            else:
+                raise RuntimeError("No streaming method on agent")
+
+            closer = getattr(response, "aclose", None)
+            if closer:
+                self.coord.bind_stream_closer(closer)
+
+            async for token in response:
+                if task._cancel_event.is_set() or coord_abort.is_set():
+                    if closer:
+                        await closer()
+                    return
+                task.output_chunks.append(token)
+
+        except Exception as agent_exc:
+            # If the agent failed before producing tokens, fall back to plain no-tools completion
+            if not task.output_chunks and not task._cancel_event.is_set():
+                task.mode = ModeStr("fallback-no-tools")
+                task.tool_traces.append(
+                    SubagentToolTrace(
+                        tool_name="agent_init",
+                        args={},
+                        status="error",
+                        detail=f"Agent fallback triggered ({agent_exc}); running plain completion",
+                    )
+                )
+                await self._run_plain_completion_fallback(task, coord_abort)
+            else:
+                task.state = "failed"
+                task.error = str(agent_exc)
+
+    def _build_headless_subagent(self, task: SubagentTask) -> Any:
+        """
+        Builds a :9002 Agent sharing hooks.json and Laya /noul gating.
+        Unsafe actions are strictly denied in-place (zero interactive prompts from background).
+        """
+        sys_prompt = (
+            f"{self.get_system_prompt()}\n\n"
+            "# Background Subagent Mode (CUDA:9002)\n"
+            "You are running asynchronously in the background. You may inspect files, search code, "
+            "and run safe read-only test/diagnostic commands. Destructive or mutating actions "
+            "will be automatically denied by the security gate."
+        )
+
+        def background_permission(tool: Any, args: Dict[str, Any]) -> bool:
+            name = getattr(tool, "name", str(tool))
+            cmd_line = args.get("CommandLine", "") if isinstance(args, dict) else ""
+            if "rm -rf" in cmd_line or (hasattr(shellparse, "elevates") and shellparse.elevates(cmd_line)):
+                task.tool_traces.append(SubagentToolTrace(name, dict(args) if isinstance(args, dict) else {}, "denied", "sudo/destructive command is not allowed in background tasks"))
+                return False
+            if self.laya is not None and hasattr(self.laya, "evaluate_action_safety"):
+                safe, _ = self.laya.evaluate_action_safety(f"Tool: {name} Args: {json.dumps(args, default=str)}")
+                if not safe:
+                    task.tool_traces.append(SubagentToolTrace(name, dict(args) if isinstance(args, dict) else {}, "denied", "not auto-approved as safe"))
+                    return False
+            return True
+
+        policies = ["allow_all", background_permission]
+
+        config = LocalOpenAIAgentConfig(
+            base_url=CUDA_BASE_URL,
+            api_key="llamashift-local",
+            model=self.model_id,
+            system_instruction=sys_prompt,
+            extra_body={"cache_prompt": True},
+            policies=policies,
+        )
+        if Agent is None:
+            raise RuntimeError("google.antigravity Agent unavailable")
+
+        agent = Agent(config=config)
+
+        if not hasattr(agent, "on"):
+            agent.on = lambda event: (lambda f: f)
+
+        @agent.on(pre_tool_call)
+        async def _subagent_pre_tool(ctx: ToolCallContext) -> HookDecision:
+            # 1. Run external hooks.json PreToolUse gate
+            if self.hooks_runner is not None and hasattr(self.hooks_runner, "run_pre_tool"):
+                ext = await self.hooks_runner.run_pre_tool(ctx.name, ctx.args)
+                if getattr(ext, "decision", None) == "deny":
+                    reason = getattr(ext, "reason", "hooks.json") or "hooks.json"
+                    task.tool_traces.append(
+                        SubagentToolTrace(ctx.name, dict(ctx.args), "denied", reason)
+                    )
+                    return HookDecision.deny(reason=f"Denied by hooks.json: {reason}")
+                if getattr(ext, "overwritten_args", None) is not None:
+                    ctx.args.update(ext.overwritten_args)
+
+            # 2. Enforce Laya /noul non-interactive safety gate (P(Safe) >= 0.90)
+            # Never prompt the user from a background thread — deny immediately if < 0.90
+            p_safe = 1.0
+            reason = "safe"
+            if self.laya is not None and hasattr(self.laya, "score_tool_safety"):
+                score = await self.laya.score_tool_safety(ctx.name, ctx.args)
+                p_safe = score.p_safe
+                reason = score.reason
+            elif self.laya is not None and hasattr(self.laya, "evaluate_action_safety"):
+                safe, r = self.laya.evaluate_action_safety(f"Tool: {ctx.name} Args: {json.dumps(ctx.args, default=str)}")
+                p_safe = 1.0 if safe else 0.0
+                reason = r or ("safe" if safe else "unsafe")
+
+            if p_safe < self.safety_threshold:
+                denial_reason = (
+                    f"Background subagent denied unsafe action `{ctx.name}` "
+                    f"(P(Safe)={p_safe:.2f} < {self.safety_threshold:.2f}: {reason}). "
+                    "Use read-only inspection tools instead."
+                )
+                task.tool_traces.append(
+                    SubagentToolTrace(ctx.name, dict(ctx.args), "denied", denial_reason)
+                )
+                return HookDecision.deny(reason=denial_reason)
+
+            task.tool_traces.append(
+                SubagentToolTrace(ctx.name, dict(ctx.args), "executed", f"P(Safe)={p_safe:.2f}")
+            )
+            return HookDecision.allow()
+
+        @agent.on(post_tool_call)
+        async def _subagent_post_tool(ctx: ToolCallContext) -> None:
+            if self.hooks_runner is not None and hasattr(self.hooks_runner, "run_post_tool"):
+                await self.hooks_runner.run_post_tool(ctx.name, ctx.args, ctx.output, ctx.error)
+
+        return agent
+
+    async def _run_plain_completion_fallback(
+        self, task: SubagentTask, coord_abort: asyncio.Event
+    ) -> None:
+        """Plain no-tools completion fallback on :9002 if the tool Agent cannot start."""
+        try:
+            async with self._http.stream(
+                "POST",
+                "/chat/completions",
+                json={
+                    "model": self.model_id,
+                    "messages": [
+                        {"role": "system", "content": self.get_system_prompt()},
+                        {"role": "user", "content": task.prompt},
+                    ],
+                    "stream": True,
+                    "temperature": 0.2,
+                },
+            ) as resp:
+                closer = getattr(resp, "aclose", None)
+                if closer:
+                    self.coord.bind_stream_closer(closer)
+                async for line in resp.aiter_lines():
+                    if task._cancel_event.is_set() or coord_abort.is_set():
+                        if closer:
+                            await closer()
+                        return
+                    if not line.startswith("data: ") or line == "data: [DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(line[6:])
+                        delta = chunk["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            task.output_chunks.append(delta)
+                    except Exception:
+                        pass
+        except Exception as e:
+            if not task.output_chunks:
+                task.state = "failed"
+                task.error = f"Fallback error: {e}"
+
+    # -------------------------------------------------------------------------
+    # Slash Command Actions: /subagent cancel, /subagent inject, /tasks, /subagent view
+    # -------------------------------------------------------------------------
+
+    def cancel_task(self, task_id: int) -> tuple[bool, str]:
+        """Implements `/subagent cancel <#>`."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return False, f"Subagent task #{task_id} not found."
+        if task.state in ("completed", "failed", "cancelled"):
+            return False, f"Subagent task #{task_id} is already {task.state}."
+
+        task._cancel_event.set()
+        task.state = "cancelled"
+        if task._runner_task and not task._runner_task.done():
+            task._runner_task.cancel()
+        return True, f"Cancelled subagent task #{task_id}."
+
+    def inject_into_session(
+        self, session: Any, target_spec: str
+    ) -> tuple[int, list[int]]:
+        """
+        Implements `/subagent inject <#|all>`.
+        Appends completed subagent findings into the active chat context.
+        Returns: (count_injected, list_of_task_ids)
+        """
+        if target_spec.lower() in ("all", "*"):
+            candidates = [
+                t for t in self.tasks.values()
+                if t.state == "completed" and not t.injected and t.result_text
+            ]
+        elif target_spec.isdigit():
+            t = self.tasks.get(int(target_spec))
+            candidates = [t] if (t and t.result_text and not t.injected) else []
+        else:
+            return 0, []
+
+        if not candidates:
+            return 0, []
+
+        injected_ids: list[int] = []
+
+        for task in candidates:
+            block = (
+                f"[Background Subagent #{task.task_id} ({task.kind.upper()} on CUDA:9002) Findings]\n"
+                f"Task: {task.prompt}\n\n"
+                f"{task.result_text}"
+            )
+            if hasattr(session, "agent") and hasattr(session.agent, "get_history") and hasattr(session.agent, "set_history"):
+                history = session.agent.get_history() or []
+                history.append({"role": "user", "content": block})
+                session.agent.set_history(history)
+            elif hasattr(session, "history"):
+                session.history.append({"role": "user", "target": "9002", "content": block})
+
+            task.injected = True
+            injected_ids.append(task.task_id)
+
+        return len(injected_ids), injected_ids
+
+    # -------------------------------------------------------------------------
+    # Rich UI Renderers for `/tasks` and `/subagent view <#>`
+    # -------------------------------------------------------------------------
+
+    def render_tasks_table(self) -> None:
+        """Implements `/tasks` — lists subagent queue, active task, and progress."""
+        if not self.tasks:
+            console.print("[dim]No subagent tasks queued or completed in this session.[/dim]")
+            return
+
+        table = Table(
+            title="[bold cyan]🛰️ NVIDIA CUDA:9002 Subagent Execution Queue (/tasks)[/bold cyan]",
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+        )
+        table.add_column("#", style="bold white", width=4)
+        table.add_column("Kind", width=7)
+        table.add_column("State", width=12)
+        table.add_column("Mode", style="dim", width=16)
+        table.add_column("Tools (Ok/Deny)", justify="right", width=15)
+        table.add_column("Time", justify="right", width=8)
+        table.add_column("Task / Live Progress", ratio=1)
+
+        state_styles = {
+            "queued": "[yellow]⏳ queued[/yellow]",
+            "running": "[bold cyan]⚙ running[/bold cyan]",
+            "completed": "[bold green]✓ done[/bold green]",
+            "failed": "[bold red]✗ failed[/bold red]",
+            "cancelled": "[dim]⊘ cancelled[/dim]",
+        }
+
+        for t in self.tasks.values():
+            ok_tools = sum(1 for tr in t.tool_traces if tr.status == "executed")
+            denied_tools = sum(1 for tr in t.tool_traces if tr.status == "denied")
+            injected_tag = " [magenta](injected)[/magenta]" if t.injected else ""
+            summary = f"[bold]{t.prompt[:48]}[/bold]{injected_tag}\n[dim]{t.progress_preview}[/dim]"
+
+            table.add_row(
+                str(t.task_id),
+                t.kind,
+                state_styles.get(t.state, t.state),
+                str(t.mode),
+                f"{ok_tools} / {denied_tools}",
+                f"{t.elapsed_s:.1f}s",
+                summary,
+            )
+
+        console.print(table)
+
+    def render_task_detail(self, task_id: int) -> None:
+        """Implements `/subagent view <#>` — shows full tool trace & Markdown output."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            console.print(f"[yellow]Subagent task #{task_id} not found.[/yellow]")
+            return
+
+        trace_lines: list[str] = []
+        for tr in task.tool_traces:
+            badge = "✓" if tr.status == "executed" else ("🛡️ DENIED" if tr.status == "denied" else "✗")
+            args_preview = json.dumps(tr.args)[:80]
+            trace_lines.append(f"- `{badge}` **{tr.tool_name}** `{args_preview}` — _{tr.detail}_")
+
+        trace_md = "\n".join(trace_lines) if trace_lines else "_No tool calls recorded._"
+        body_md = (
+            f"**Task Prompt:** {task.prompt}\n\n"
+            f"### Tool Call Audit Trail ({task.mode})\n{trace_md}\n\n"
+            f"### Subagent Result\n{task.result_text or '_No output yet._'}"
+        )
+        if task.error:
+            body_md += f"\n\n### Error\n```\n{task.error}\n```"
+
+        console.print(
+            Panel(
+                Markdown(body_md),
+                title=(
+                    f"[bold cyan]🛰️ Subagent #{task.task_id} ({task.state.upper()})[/bold cyan] "
+                    f"[dim]── {task.elapsed_s:.1f}s on CUDA:9002[/dim]"
+                ),
+                border_style="green" if task.state == "completed" else "cyan",
+            )
+        )
+
+    # -------------------------------------------------------------------------
+    # /reload Serialization Helpers
+    # -------------------------------------------------------------------------
+
+    def export_pending(self) -> list[dict[str, Any]]:
+        """Exports queued/unstarted tasks so /reload can re-enqueue them after execv."""
+        return [
+            {"prompt": t.prompt, "kind": t.kind}
+            for t in self.tasks.values()
+            if t.state in ("queued", "running")
+        ]
+
+    def restore_pending(self, pending: list[dict[str, Any]]) -> None:
+        for item in pending:
+            self.spawn(prompt=item["prompt"], kind=item.get("kind", "spawn"))
+
+    # -------------------------------------------------------------------------
+    # Backward compatibility classmethods
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def list_tasks(cls) -> list[SubagentTask]:
+        inst = cls._instance
+        return list(inst.tasks.values()) if inst else []
 
     @classmethod
     def get(cls, task_id: int) -> Optional[SubagentTask]:
         for t in cls._tasks:
-            if t.id == task_id:
+            if t.id == task_id or t.task_id == task_id:
                 return t
-        return None
+        inst = cls._instance
+        return inst.tasks.get(task_id) if inst else None
 
     @classmethod
-    def get_queue_status(cls) -> Dict[str, Any]:
-        """Returns statistics on active, queued, and completed subagents."""
-        queued_count = sum(1 for t in cls._tasks if t.status == "queued")
-        running_count = sum(1 for t in cls._tasks if t.status == "running")
-        completed_count = sum(1 for t in cls._tasks if t.status == "completed")
-        failed_count = sum(1 for t in cls._tasks if t.status == "failed")
+    def get_queue_status(cls) -> dict[str, Any]:
+        inst = cls._instance
+        tasks = list(inst.tasks.values()) if inst else []
+        queued_count = sum(1 for t in tasks if t.state == "queued")
+        running_count = sum(1 for t in tasks if t.state == "running")
+        completed_count = sum(1 for t in tasks if t.state == "completed")
+        failed_count = sum(1 for t in tasks if t.state == "failed")
         return {
             "queued": queued_count,
             "running": running_count,
             "completed": completed_count,
             "failed": failed_count,
-            "active_task": cls._active_task.to_dict() if cls._active_task else None,
+            "total": len(tasks),
         }
 
-    @classmethod
-    def spawn(cls, description: str, session: Any, command: Optional[str] = None) -> SubagentTask:
-        """
-        Enqueues a subagent task. If the NVIDIA GPU is currently idle, it begins executing immediately.
-        If a task is already running, this task queues in FIFO order, guaranteeing strict 1-at-a-time execution.
-        """
-        cls._ensure_queue_init(session)
-
-        task = SubagentTask(task_id=cls._next_id, description=description, command=command)
-        cls._next_id += 1
-        cls._tasks.append(task)
-
-        # Enqueue for serialized execution
-        cls._queue.put_nowait(task)
-
-        queued_ahead = sum(1 for t in cls._tasks if t.status == "queued") - 1
-        if not session.json_output:
-            if queued_ahead > 0:
-                say.step(f"subagent #{task.id} queued (position {queued_ahead + 1}): {description}")
-                say.detail("  one task at a time on :9001; /tasks shows the queue")
-            else:
-                say.step(f"subagent #{task.id} launched: {description}")
-                say.detail("  :9001 compactor paused while it runs; /tasks shows status")
-
-        return task
-
-    @classmethod
-    def cancel(cls, task_id: int) -> bool:
-        """Cancels a subagent task whether it is running or waiting in the FIFO queue."""
-        task = cls.get(task_id)
-        if not task:
-            return False
-
-        if task.status == "queued":
-            task.status = "cancelled"
-            task.finished_at = time.time()
-            return True
-
-        if task.status == "running" and task._async_task and not task._async_task.done():
-            task._async_task.cancel()
-            task.status = "cancelled"
-            task.finished_at = time.time()
-            if task.started_at:
-                task.duration = task.finished_at - task.started_at
-            return True
-
-        return False
-
-    @classmethod
-    def inject(cls, task_id: int, session: Any) -> bool:
-        """Injects completed subagent findings directly into the main conversation history."""
-        task = cls.get(task_id)
-        if not task or not task.result or task.status != "completed":
-            return False
-
-        summary_entry = {
-            "role": "user",
-            "target": session.active_target,
-            "content": f"[SYSTEM: Subagent #{task.id} Autonomous Findings on \"{task.description}\"]\n{task.result}",
-        }
-        companion_entry = {
-            "role": "assistant",
-            "target": session.active_target,
-            "content": f"[SYSTEM: Acknowledged Subagent #{task.id} findings. Ready to apply insights.]",
-        }
-
-        session.history.extend([summary_entry, companion_entry])
-        task.injected = True
-        session._active_local_agent = None  # refresh agent context
-        return True
-
-    @classmethod
-    def inject_all(cls, session: Any) -> int:
-        """Injects all uninjected completed subagent results into the session context in one shot."""
-        completed_uninjected = [t for t in cls._tasks if t.status == "completed" and not t.injected]
-        if not completed_uninjected:
-            return 0
-
-        entries = []
-        for t in completed_uninjected:
-            entries.append({
-                "role": "user",
-                "target": session.active_target,
-                "content": f"[SYSTEM: Subagent #{t.id} Autonomous Findings on \"{t.description}\"]\n{t.result}",
-            })
-            t.injected = True
-
-        entries.append({
-            "role": "assistant",
-            "target": session.active_target,
-            "content": f"[SYSTEM: Acknowledged findings from {len(completed_uninjected)} background subagent(s). Ready to apply collective insights.]",
-        })
-
-        session.history.extend(entries)
-        session._active_local_agent = None
-        return len(completed_uninjected)
-
-    @classmethod
-    async def _queue_dispatcher(cls):
-        """
-        Background loop that pulls subagents from the FIFO queue and executes them strictly one-at-a-time.
-        Prevents dual-subagent VRAM contention on NVIDIA RTX 4060.
-        """
-        while True:
-            try:
-                task: SubagentTask = await cls._queue.get()
-                if task.status == "cancelled":
-                    cls._queue.task_done()
-                    continue
-
-                cls._active_task = task
-                # Synchronously acquire lock so compactor yields
-                CudaCoordinator.reserve_for_subagent()
-                if cls._session and not getattr(cls._session, "json_output", False):
-                    say.detail(f"subagent #{task.id} executing on :9001")
-
-                task._async_task = asyncio.create_task(cls._run_worker(task, cls._session))
-                try:
-                    await task._async_task
-                except asyncio.CancelledError:
-                    task.status = "cancelled"
-                finally:
-                    cls._active_task = None
-                    cls._queue.task_done()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                await asyncio.sleep(1.0)
-
+    SHELL_TIMEOUT = 120
     TOOL_RUN_TIMEOUT = 300
-    SHELL_TIMEOUT = 600
 
-    @staticmethod
-    def _kill_process_group(proc: "asyncio.subprocess.Process"):
+    @classmethod
+    def _kill_process_group(cls, proc: asyncio.subprocess.Process):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, AttributeError):
@@ -246,7 +833,7 @@ class SubagentManager:
                 pass
 
     @classmethod
-    async def _run_shell(cls, shell_cmd: str) -> "tuple[int, str]":
+    async def _run_shell(cls, shell_cmd: str) -> tuple[int, str]:
         """Runs a shell command in its own process group, killing it on timeout or cancellation."""
         proc = await asyncio.create_subprocess_shell(
             shell_cmd,
@@ -270,8 +857,7 @@ class SubagentManager:
 
     @classmethod
     async def _run_with_tools(cls, task: SubagentTask, session: Any, ep: Dict[str, Any]) -> str:
-        """Runs the task as a real tool-using agent on :9001 (same SDK path as the main agent)."""
-
+        """Runs the task as a real tool-using agent on :9002 (same SDK path as the main agent)."""
         @hooks.pre_tool_call_decide
         def log_tool(call: types.ToolCall) -> types.HookResult:
             task.tool_calls.append({"name": getattr(call, "name", str(call)), "args": getattr(call, "args", {}) or {}, "timestamp": time.time()})
@@ -303,14 +889,17 @@ class SubagentManager:
             "3. If a tool call is denied, continue without it and say what you could not verify.\n"
             "4. Finish with a dense, factual summary preserving file paths, function names and exact numbers."
         )
+        url = ep.get("url") or CUDA_BASE_URL
+        pol_mod = getattr(hooks, "policy", None) or policy
+        pol_obj = pol_mod.confirm_run_command(handler=background_permission) if (pol_mod and hasattr(pol_mod, "confirm_run_command")) else None
         config = LocalOpenAIAgentConfig(
             model=ep.get("model") or ep.get("filename"),
-            base_url=ep.get("url", "http://localhost:9001/v1"),
+            base_url=url,
             system_instructions=instructions,
-            capabilities=CapabilitiesConfig(),
-            policies=policy.confirm_run_command(handler=background_permission),
-            hooks=[log_tool],
-            mcp_servers=session._mcp_servers,
+            capabilities=CapabilitiesConfig() if CapabilitiesConfig else None,
+            policies=pol_obj,
+            hooks=[log_tool] if hooks else [],
+            mcp_servers=getattr(session, "_mcp_servers", []),
         )
         agent = Agent(config)
         await agent.__aenter__()
@@ -347,8 +936,10 @@ class SubagentManager:
             "max_tokens": 1500,
             "temperature": 0.2,
         }
+        url = (ep.get("url") or CUDA_BASE_URL).rstrip("/") + "/chat/completions"
+        import urllib.request
         req = urllib.request.Request(
-            "http://127.0.0.1:9001/v1/chat/completions",
+            url,
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
@@ -359,30 +950,20 @@ class SubagentManager:
 
         data = await asyncio.to_thread(_call_http)
         choice = data["choices"][0]["message"]
-        return (choice.get("content") or choice.get("reasoning_content") or "").strip()
+        res_text = (choice.get("content") or choice.get("reasoning_content") or "").strip()
+        return res_text
 
     @classmethod
     async def _run_worker(cls, task: SubagentTask, session: Any):
         """Worker executing autonomously on NVIDIA RTX 4060 with tool access."""
         task.started_at = time.time()
         task.status = "running"
-
         try:
-            # 1. Ensure Port 9001 is online (auto-wake via llama-launcher if needed)
-            ep9001 = session.endpoints.get("9001", {})
-            wake_note = ""
-            if ep9001.get("status") != "online":
-                woke = await asyncio.to_thread(wake_compactor, 9001)
-                for warning in woke["warnings"]:
-                    say.warn(warning)
-                if woke["ok"]:
-                    await asyncio.to_thread(session.refresh_endpoints)
-                    ep9001 = session.endpoints.get("9001", {})
-                else:
-                    wake_note = f" ({woke['reason']})"
-
-            if ep9001.get("status") != "online":
-                raise RuntimeError(f"NVIDIA RTX 4060 (Port 9001) is offline{wake_note}. Start it via LlamaShift or /compactor start.")
+            ep9002 = getattr(session, "endpoints", {}).get("9002") or getattr(session, "endpoints", {}).get("9001", {})
+            if ep9002.get("status") != "online":
+                woke = await asyncio.to_thread(wake_compactor, 9002)
+                if not woke.get("ok"):
+                    raise RuntimeError(f"NVIDIA RTX 4060 (Port 9002) is offline ({woke.get('reason')}).")
 
             res_text = None
             # Check if this task involves running a build or shell command
@@ -422,7 +1003,7 @@ class SubagentManager:
                 user_msg = f"Analyze build/test execution for `{shell_cmd}` (exit code {return_code}). Output summary and diagnostics."
 
                 payload = {
-                    "model": ep9001.get("filename") or "granite-4.2-8b",
+                    "model": ep9002.get("filename") or "granite-4.2-8b",
                     "messages": [
                         {"role": "system", "content": subagent_instructions},
                         {"role": "user", "content": user_msg},
@@ -431,8 +1012,9 @@ class SubagentManager:
                     "temperature": 0.2,
                 }
                 req_data = json.dumps(payload).encode("utf-8")
+                url = (ep9002.get("url") or CUDA_BASE_URL).rstrip("/") + "/chat/completions"
                 req = urllib.request.Request(
-                    "http://127.0.0.1:9001/v1/chat/completions",
+                    url,
                     data=req_data,
                     headers={"Content-Type": "application/json"},
                 )
@@ -446,25 +1028,28 @@ class SubagentManager:
                 res_text = (choice.get("content") or choice.get("reasoning_content") or "").strip()
                 if not res_text and choice.get("reasoning_content"):
                     res_text = choice.get("reasoning_content").strip()
-                task.mode = "tools"
+                task.mode = ModeStr("tools")
             else:
                 try:
-                    res_text = await asyncio.wait_for(cls._run_with_tools(task, session, ep9001), timeout=cls.TOOL_RUN_TIMEOUT)
-                    task.mode = "tools"
+                    res_text = await asyncio.wait_for(cls._run_with_tools(task, session, ep9002), timeout=cls.TOOL_RUN_TIMEOUT)
+                    task.mode = ModeStr("tools")
                 except asyncio.CancelledError:
                     raise
                 except Exception as tool_err:
-                    task.tool_calls.append({"name": "(tool agent unavailable, using plain completion)", "args": {"error": str(tool_err)[:200]}, "timestamp": time.time()})
+                    task.tool_calls.append({
+                        "name": "(tool agent unavailable, using plain completion)",
+                        "args": {"error": str(tool_err)[:200]},
+                        "timestamp": time.time(),
+                    })
 
                 if not res_text:
-                    res_text = await cls._run_plain(task, ep9001)
-                    task.mode = "no-tools"
+                    res_text = await cls._run_plain(task, ep9002)
+                    task.mode = ModeStr("no-tools")
 
             if res_text:
                 task.result = res_text
             else:
-                raise RuntimeError("Port 9001 returned empty response")
-
+                raise RuntimeError("Port 9002 returned empty response")
         except asyncio.CancelledError:
             task.status = "cancelled"
         except Exception as e:
@@ -475,11 +1060,11 @@ class SubagentManager:
         finally:
             task.finished_at = time.time()
             task.duration = round((task.finished_at - task.started_at), 2) if task.started_at else 0.0
-            # Release lock back to idle coordinator
-            await CudaCoordinator.release_from_subagent()
+            if hasattr(CudaCoordinator, "release_from_subagent"):
+                await CudaCoordinator.release_from_subagent()
 
             # Terminal notification
-            if not session.json_output:
+            if not getattr(session, "json_output", False):
                 queued_left = sum(1 for t in cls._tasks if t.status == "queued")
                 queue_suffix = f" ({queued_left} next in queue)" if queued_left > 0 else ""
                 elapsed = say.fmt_elapsed(task.duration or 0.0)
@@ -495,30 +1080,57 @@ class SubagentManager:
                     say.step(f"subagent #{task.id} cancelled after {elapsed}: {desc_str}")
 
     @classmethod
-    def print_tasks(cls, session: Any):
-        """Renders an interactive status table of all background subagents with FIFO queue ordering."""
-        if not cls._tasks:
-            say.dim("(no background subagents spawned. Use /spawn <task> to delegate)")
+    def cancel(cls, task_id: int) -> bool:
+        inst = cls._instance
+        if inst:
+            ok, _ = inst.cancel_task(task_id)
+            return ok
+        return False
+
+    @classmethod
+    def inject(cls, task_id: int, session: Any) -> bool:
+        inst = cls._instance
+        if inst:
+            count, _ = inst.inject_into_session(session, str(task_id))
+            return count > 0
+        return False
+
+    @classmethod
+    def inject_all(cls, session: Any) -> int:
+        inst = cls._instance
+        if inst:
+            count, _ = inst.inject_into_session(session, "all")
+            return count
+        return 0
+
+    @classmethod
+    def print_tasks(cls, session: Any = None):
+        if cls._tasks:
+            coord_status = CudaCoordinator.status_summary() if hasattr(CudaCoordinator, "status_summary") else {"state": "idle"}
+            c_state = coord_status.get("state", "idle").upper()
+            c_label = {"IDLE": "idle", "SUBAGENT": "subagent running"}.get(c_state, "compacting")
+            queued_tasks = sum(1 for t in cls._tasks if t.status == "queued")
+            queue_tag = f"{queued_tasks} waiting" if queued_tasks else "empty"
+
+            marks = {"completed": f"{UI.GREEN}done{UI.RST}", "running": f"{UI.CUDA_BOLD}running{UI.RST}",
+                     "cancelled": f"{UI.GRAY}cancelled{UI.RST}", "failed": f"{UI.RED}failed{UI.RST}"}
+            rows = []
+            for t in cls._tasks:
+                dur_str = f"{t.duration:.1f}s" if t.duration is not None else (f"{time.time() - t.started_at:.1f}s" if t.started_at else "-")
+                preview = (t.result or t.error or "").replace("\n", " ").strip()
+                if len(preview) > 100:
+                    preview = preview[:97] + "..."
+                rows.append([str(t.id), marks.get(t.status, f"{UI.AMBER}queued{UI.RST}"), dur_str, t.description, preview, "yes" if t.injected else "no"])
+
+            say.table(f"Background subagents on :9002 ({c_label}, queue {queue_tag})", ["#", "status", "time", "task", "result", "injected"], rows)
+            say.dim("/subagent view <#> | inject <#|all> | cancel <#>")
             return
 
-        coord_status = CudaCoordinator.status_summary()
-        c_state = coord_status["state"].upper()
-        c_label = {"IDLE": "idle", "SUBAGENT": "subagent running"}.get(c_state, "compacting")
-        queued_tasks = sum(1 for t in cls._tasks if t.status == "queued")
-        queue_tag = f"{queued_tasks} waiting" if queued_tasks else "empty"
-
-        marks = {"completed": f"{UI.GREEN}done{UI.RST}", "running": f"{UI.CUDA_BOLD}running{UI.RST}",
-                 "cancelled": f"{UI.GRAY}cancelled{UI.RST}", "failed": f"{UI.RED}failed{UI.RST}"}
-        rows = []
-        for t in cls._tasks:
-            dur_str = f"{t.duration:.1f}s" if t.duration is not None else (f"{time.time() - t.started_at:.1f}s" if t.started_at else "-")
-            preview = (t.result or t.error or "").replace("\n", " ").strip()
-            if len(preview) > 100:
-                preview = preview[:97] + "..."
-            rows.append([str(t.id), marks.get(t.status, f"{UI.AMBER}queued{UI.RST}"), dur_str, t.description, preview, "yes" if t.injected else "no"])
-
-        say.table(f"Background subagents on :9001 ({c_label}, queue {queue_tag})", ["#", "status", "time", "task", "result", "injected"], rows)
-        say.dim("/subagent view <#> | inject <#|all> | cancel <#>")
+        inst = cls._instance
+        if inst:
+            inst.render_tasks_table()
+        else:
+            say.dim("(no background subagents spawned. Use /spawn <task> to delegate)")
 
     @classmethod
     def print_detail(cls, task_id: int):
@@ -532,7 +1144,7 @@ class SubagentManager:
         rows = [
             ("task", task.description),
             ("status", f"{task.status} ({dur_str})"),
-            ("engine", f"port 9001, {mode_tag}"),
+            ("engine", f"port 9002, {mode_tag}"),
             ("injected", "yes" if task.injected else "no"),
         ]
         if task.tool_calls:

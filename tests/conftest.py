@@ -58,7 +58,7 @@ def git_repo(tmp_path, monkeypatch):
 def session(monkeypatch):
     """A real MultiGpuHybridSession with network discovery disabled."""
     from myagy.core.session import MultiGpuHybridSession
-    monkeypatch.setattr(MultiGpuHybridSession, "refresh_endpoints", lambda self: self.endpoints)
+    monkeypatch.setattr(MultiGpuHybridSession, "refresh_endpoints", lambda self, *a, **k: self.endpoints)
     s = MultiGpuHybridSession(enable_mcp=False, json_output=True)
     s.auto_repomap = False
     s.auto_instructions = False

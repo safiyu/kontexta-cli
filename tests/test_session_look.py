@@ -112,12 +112,12 @@ def test_print_header_content_and_size(loud, capsys, monkeypatch):
     monkeypatch.setattr(session_mod.kontexta_sync, "enabled", lambda *a, **k: False)
     loud.enable_kontexta = False
     loud.endpoints["9000"].update(status="online", name_friendly="qwen27")
-    loud.endpoints["9001"].update(status="offline")
+    loud.endpoints["9002"].update(status="offline")
     loud.print_header()
     out = capsys.readouterr().out
     lines = out.strip().splitlines()
     assert 4 <= len(lines) <= 6
-    for expected in ("ROCm:9000", "qwen27", "CUDA:9001", "offline", "Cloud", "target", "permissions", "repo", "memory"):
+    for expected in ("ROCm:9000", "qwen27", "CUDA:9002", "offline", "Cloud", "target", "permissions", "repo", "memory"):
         assert expected in out
 
 

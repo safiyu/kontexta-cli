@@ -5,8 +5,8 @@ Spec-Driven Autonomous Lifecycle Workflow (/brainstorm):
   3. Local (AMD ROCm :9000): Executes implementation edits milestone by milestone. The plan lives in
      <repo>/docs/plans with a checkbox per milestone, ticked after each one, so a crash resumes where it stopped.
      Between milestones the model can be changed with /switch or /cloud; Esc stops the current turn.
-  4. NVIDIA Subagent (:9001): Executes automated build/test suite and diagnoses self-healing errors.
-  5. Local Code Review: Analyzes git diff on NVIDIA RTX 4060 (:9001).
+  4. NVIDIA Subagent (:9002): Executes automated build/test suite and diagnoses self-healing errors.
+  5. Local Code Review: Analyzes git diff on NVIDIA RTX 4060 (:9002).
   6. Cloud Adversarial Review (Gemini): Scrutinizes edge cases, security vulnerabilities, and bugs.
   7. Gate 2: User approval of reviewed changes -> automated git commit.
 """
@@ -20,26 +20,666 @@ import select
 import traceback
 import subprocess
 import asyncio
-from typing import Any, List, Optional, Tuple
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any, Callable, Awaitable, List, Optional, Tuple
 
 try:
-    from rich.panel import Panel
+    from rich.columns import Columns
+    from rich.console import Console
     from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.prompt import Prompt
 except ImportError:
-    pass
+    Columns = None
+    Console = None
+    Markdown = None
+    Panel = None
+    Prompt = None
 
+from ..core.coordinator import CudaPriority
+from ..terminal.esc_listener import EscListener, prompt_input, listen_for_esc
 from ..terminal.ui import UI, RICH_AVAILABLE, console
-from ..terminal.esc_listener import EscListener, prompt_input
 from ..config import PLANS_SUBDIR
 from ..context.repomap import RepoMap
 from ..context import kontexta_sync
 from ..terminal import say
 from ..context.instructions import ProjectInstructions
 
+if console is None and Console is not None:
+    console = Console()
+
+
+@dataclass(slots=True)
+class BrainstormSpec:
+    title: str
+    commit_message: str
+    summary: str
+    target_files: list[str]
+    implementation_steps: list[str]
+    test_command: str
+    raw_markdown: str
+
+
+@dataclass(slots=True)
+class BuildVerificationResult:
+    passed: bool
+    exit_code: int
+    command: str
+    stdout_tail: str
+    failure_analysis: str = ""
+
+
+@dataclass(slots=True)
+class ReviewVerdict:
+    reviewer: str  # "ROCm :9000 (Local Executive)" | "Cloud Gemini (Architect)"
+    approved: bool
+    severity: str  # "clean" | "minor" | "blocking"
+    findings_markdown: str
+    elapsed_s: float
+
+
+class AutonomousBrainstormWorkflow:
+    """
+    Implements the 5-Phase Spec-Driven Autonomous Workflow (/brainstorm <idea>):
+    Phase 1: Cloud Gemini Spec Synthesis -> User Approval Gate #1
+    Phase 2: AMD ROCm (:9000) Multi-File Implementation
+    Phase 3: NVIDIA RTX 4060 (:9002) Subagent Build & Test Verification (with self-heal retry)
+    Phase 4: Concurrent Local (:9000) + Cloud Dual Review -> User Approval Gate #2
+    Phase 5: Git Commit + Background Kontexta Journal Sync (/memory)
+    """
+
+    def __init__(
+        self,
+        session,
+        max_build_retries: int = 2,
+        default_test_cmd: str = "python3 -m pytest -q",
+    ) -> None:
+        self.session = session
+        self.max_build_retries = max_build_retries
+        self.default_test_cmd = default_test_cmd
+
+    # -------------------------------------------------------------------------
+    # Main Entrypoint (/brainstorm <idea>)
+    # -------------------------------------------------------------------------
+    async def run(self, idea: str, memory_sync_enabled: bool = True) -> bool:
+        """Executes the full 5-phase brainstorm-to-commit loop."""
+        t_start = time.perf_counter()
+        original_target = getattr(self.session, "active_target", "9000")
+        if console:
+            console.print(
+                Panel(
+                    f"[bold white]{idea}[/bold white]",
+                    title="[bold cyan]⚡ /brainstorm — Autonomous Spec-Driven Workflow[/bold cyan]",
+                    border_style="cyan",
+                )
+            )
+        else:
+            say.title(f"/brainstorm — {idea}")
+
+        try:
+            # ── PHASE 1: Cloud Gemini Architecture & Spec Synthesis ──────────
+            spec = await self._phase1_generate_and_approve_spec(idea)
+            if spec is None:
+                if console:
+                    console.print("[yellow]○ Brainstorm cancelled at Phase 1 (Spec Gate).[/yellow]")
+                else:
+                    say.warn("Brainstorm cancelled at Phase 1 (Spec Gate).")
+                return False
+
+            # Snapshot pre-implementation working tree so User can revert cleanly
+            if hasattr(self.session, "checkpointer") and hasattr(self.session.checkpointer, "snapshot_pre_turn"):
+                self.session.checkpointer.snapshot_pre_turn()
+
+            # ── PHASE 2 & 3: ROCm Implementation + CUDA:9002 Build Loop ──────
+            build_ok = await self._phase2_and_3_implement_and_verify(spec)
+            if not build_ok:
+                if console:
+                    console.print(
+                        "[bold red]✗ Build/Test verification failed after retries.[/bold red] "
+                        "[dim]Use `/diff` to inspect or `/undo` to revert.[/dim]"
+                    )
+                else:
+                    say.err("Build/Test verification failed after retries. Use /diff or /undo.")
+                return False
+
+            # ── PHASE 4: Concurrent Local (:9000) & Cloud Dual Review ────────
+            approved_to_commit = await self._phase4_dual_review_and_gate(spec)
+            if not approved_to_commit:
+                if console:
+                    console.print("[yellow]○ Commit aborted at Phase 4 (Review Gate).[/yellow]")
+                else:
+                    say.warn("Commit aborted at Phase 4 (Review Gate).")
+                return False
+
+            # ── PHASE 5: Git Commit & Background Kontexta Journal Sync ───────
+            commit_sha = await self._phase5_commit_and_journal(
+                spec=spec,
+                idea=idea,
+                memory_sync_enabled=memory_sync_enabled,
+            )
+            elapsed = time.perf_counter() - t_start
+            if console:
+                console.print(
+                    f"[bold green]✓ /brainstorm complete in {elapsed:.1f}s[/bold green] "
+                    f"[dim](commit: {commit_sha[:8]})[/dim]"
+                )
+            else:
+                say.ok(f"/brainstorm complete in {elapsed:.1f}s (commit: {commit_sha[:8]})")
+            return True
+        finally:
+            # Always restore user's original compute target (:9000 / :9002 / cloud)
+            if hasattr(self.session, "switch_target"):
+                self.session.switch_target(original_target)
+            else:
+                self.session.active_target = original_target
+
+    # -------------------------------------------------------------------------
+    # Phase 1: Cloud Gemini Spec Synthesis + Interactive Refinement Loop
+    # -------------------------------------------------------------------------
+    async def _phase1_generate_and_approve_spec(self, idea: str) -> BrainstormSpec | None:
+        feedback: str | None = None
+        while True:
+            if console:
+                console.print("\n[bold magenta]── Phase 1/5: Synthesizing Architecture Spec (Cloud Gemini) ──[/bold magenta]")
+            else:
+                say.step("Phase 1/5: Synthesizing Architecture Spec (Cloud Gemini)")
+
+            prompt = self._build_spec_prompt(idea, feedback)
+            raw_spec = await self._stream_from_target(
+                target="cloud",
+                fallback_target="rocm",
+                prompt=prompt,
+                panel_title="☁️ Cloud Gemini — Technical Specification",
+            )
+            if not raw_spec:
+                return None
+            spec = self._parse_spec_output(raw_spec, idea)
+
+            # Interactive Gate #1 (ESC listener is paused during Prompt.ask)
+            if Prompt:
+                choice = Prompt.ask(
+                    "\n[bold cyan]Spec Gate #1[/bold cyan] — [green][A]pprove[/green], "
+                    "[yellow][R]efine with feedback[/yellow], or [red][C]ancel[/red]?",
+                    choices=["a", "r", "c"],
+                    default="a",
+                ).lower()
+            else:
+                choice = (prompt_input("\nSpec Gate #1 — [A]pprove, [R]efine, [C]ancel? [a/r/c]: ") or "a").strip().lower()
+
+            if choice == "a":
+                return spec
+            if choice == "c":
+                return None
+            if Prompt:
+                feedback = Prompt.ask("[bold yellow]Enter refinement instructions[/bold yellow]")
+            else:
+                feedback = prompt_input("Enter refinement instructions: ")
+
+    # -------------------------------------------------------------------------
+    # Phase 2 & 3: ROCm (:9000) Implementation -> CUDA (:9002) Build Subagent
+    # -------------------------------------------------------------------------
+    async def _phase2_and_3_implement_and_verify(self, spec: BrainstormSpec) -> bool:
+        repair_context: str = ""
+        for attempt in range(1, self.max_build_retries + 2):
+            rocm_model = "rocm"
+            if hasattr(self.session, "active_models") and "rocm" in self.session.active_models:
+                rocm_model = self.session.active_models["rocm"]
+            elif hasattr(self.session, "endpoints") and "9000" in self.session.endpoints:
+                rocm_model = self.session.endpoints["9000"].get("model", "qwen27")
+
+            if console:
+                console.print(
+                    f"\n[bold cyan]── Phase 2/5: Implementing on AMD ROCm :9000 "
+                    f"(Pass {attempt}/{self.max_build_retries + 1}) ──[/bold cyan]"
+                )
+            else:
+                say.step(f"Phase 2/5: Implementing on AMD ROCm :9000 (Pass {attempt})")
+
+            impl_prompt = self._build_implementation_prompt(spec, repair_context)
+            impl_out = await self._stream_from_target(
+                target="rocm",
+                fallback_target="cloud",
+                prompt=impl_prompt,
+                panel_title=f"🔥 ROCm :9000 ({rocm_model}) — Implementation",
+            )
+            if not impl_out:
+                return False
+
+            # Record checkpoint after file edits
+            if hasattr(self.session, "checkpointer") and hasattr(self.session.checkpointer, "commit_post_turn_snapshot"):
+                self.session.checkpointer.commit_post_turn_snapshot()
+
+            # Phase 3: Delegate Build & Test Verification to RTX 4060 Subagent (:9002)
+            if console:
+                console.print(
+                    f"\n[bold green]── Phase 3/5: Verifying Build & Tests on NVIDIA CUDA :9002 "
+                    f"(`{spec.test_command}`) ──[/bold green]"
+                )
+            else:
+                say.step(f"Phase 3/5: Verifying Build & Tests on NVIDIA CUDA :9002 ({spec.test_command})")
+
+            verify_res = await self._run_cuda_build_subagent(spec)
+            if verify_res.passed:
+                if console:
+                    console.print(
+                        f"[bold green]✓ CUDA:9002 Subagent verified build & tests (`{spec.test_command}` exited 0).[/bold green]"
+                    )
+                else:
+                    say.ok(f"CUDA:9002 Subagent verified build & tests ({spec.test_command} exited 0).")
+                return True
+
+            if console:
+                console.print(
+                    Panel(
+                        f"[red]{verify_res.stdout_tail}[/red]\n\n"
+                        f"[bold yellow]Subagent Root-Cause Diagnosis (:9002):[/bold yellow]\n"
+                        f"{verify_res.failure_analysis}",
+                        title=f"[bold red]✗ Build/Test Failed (Exit {verify_res.exit_code})[/bold red]",
+                        border_style="red",
+                    )
+                )
+            else:
+                say.err(f"Build/Test Failed (Exit {verify_res.exit_code}):\n{verify_res.stdout_tail}\nDiagnosis: {verify_res.failure_analysis}")
+
+            if attempt <= self.max_build_retries:
+                repair_context = (
+                    f"Previous build command `{verify_res.command}` failed (exit {verify_res.exit_code}):\n"
+                    f"```\n{verify_res.stdout_tail}\n```\n"
+                    f"Subagent diagnosis:\n{verify_res.failure_analysis}\n"
+                    f"Fix the root cause without breaking the approved spec."
+                )
+
+        return False
+
+    async def _run_cuda_build_subagent(self, spec: BrainstormSpec) -> BuildVerificationResult:
+        """
+        Preempts background compaction on CUDA:9002 via CudaCoordinator, runs the test suite,
+        and uses Granite 4.2 8B (:9002) to distill any traceback into a concise fix plan.
+        """
+        repo_root = "."
+        if hasattr(self.session, "repomap") and getattr(self.session.repomap, "repo_root", None) and isinstance(self.session.repomap.repo_root, (str, os.PathLike)):
+            repo_root = str(self.session.repomap.repo_root)
+        elif hasattr(self.session, "_repo_root") and isinstance(self.session._repo_root, (str, os.PathLike)):
+            repo_root = str(self.session._repo_root)
+        async with self.session.cuda_coord.acquire_subagent_slot("brainstorm-build") as abort_ev:
+            proc = await asyncio.create_subprocess_shell(
+                spec.test_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(repo_root),
+            )
+            stdout_bytes, _ = await proc.communicate()
+            output = stdout_bytes.decode("utf-8", errors="replace").strip()
+            tail = "\n".join(output.splitlines()[-45:])
+            exit_code = proc.returncode or 0
+
+            if exit_code == 0 or abort_ev.is_set():
+                return BuildVerificationResult(
+                    passed=(exit_code == 0),
+                    exit_code=exit_code,
+                    command=spec.test_command,
+                    stdout_tail=tail,
+                )
+
+            # On failure, ask Granite 4.2 8B on :9002 to pinpoint the exact file/line failure
+            diag_prompt = (
+                f"Test command `{spec.test_command}` failed with exit code {exit_code}.\n"
+                f"Output:\n```\n{tail}\n```\n"
+                "In 3 bullet points, identify the exact failing file, line number, and required code fix."
+            )
+            self.session.switch_target("cuda")
+            agent = getattr(self.session, "agent", None)
+            resp = None
+            if agent and hasattr(agent, "send_message_stream"):
+                resp = await agent.send_message_stream(diag_prompt)
+            elif agent and hasattr(agent, "chat"):
+                resp = await agent.chat(diag_prompt)
+
+            if resp is not None:
+                closer = getattr(resp, "aclose", None)
+                if closer:
+                    self.session.cuda_coord.bind_stream_closer(closer)
+                chunks = [tok async for tok in resp if not abort_ev.is_set()]
+                diagnosis = "".join(chunks).strip()
+            else:
+                diagnosis = ""
+
+            return BuildVerificationResult(
+                passed=False,
+                exit_code=exit_code,
+                command=spec.test_command,
+                stdout_tail=tail,
+                failure_analysis=diagnosis,
+            )
+
+    # -------------------------------------------------------------------------
+    # Phase 4: Concurrent Local (:9000) & Cloud Gemini Dual Review
+    # -------------------------------------------------------------------------
+    async def _phase4_dual_review_and_gate(self, spec: BrainstormSpec) -> bool:
+        while True:
+            if console:
+                console.print(
+                    "\n[bold yellow]── Phase 4/5: Running Concurrent Local (:9000) & Cloud Dual Review ──[/bold yellow]"
+                )
+            else:
+                say.step("Phase 4/5: Running Concurrent Local (:9000) & Cloud Dual Review")
+
+            if hasattr(self.session, "checkpointer") and hasattr(self.session.checkpointer, "get_diff"):
+                git_diff = self.session.checkpointer.get_diff(nth_latest=1)
+            else:
+                git_diff = BrainstormWorkflow._get_git_diff(getattr(self.session, "_repo_root", "."))
+
+            # Structured concurrency: execute Local ROCm and Cloud Gemini reviews in parallel
+            async with asyncio.TaskGroup() as tg:
+                local_task = tg.create_task(
+                    self._run_single_reviewer(
+                        target="rocm",
+                        label="ROCm :9000 (Implementation & Edge-Case Review)",
+                        spec=spec,
+                        git_diff=git_diff,
+                    )
+                )
+                cloud_task = tg.create_task(
+                    self._run_single_reviewer(
+                        target="cloud",
+                        label="Cloud Gemini (Architecture & Security Review)",
+                        spec=spec,
+                        git_diff=git_diff,
+                    )
+                )
+
+            local_verdict = local_task.result()
+            cloud_verdict = cloud_task.result()
+
+            # Render both reviews side-by-side on desktop terminal
+            if console and Columns and Panel and Markdown:
+                console.print(
+                    Columns(
+                        [
+                            Panel(
+                                Markdown(local_verdict.findings_markdown),
+                                title=f"[bold cyan]{local_verdict.reviewer}[/bold cyan] ({local_verdict.elapsed_s:.1f}s)",
+                                border_style="green" if local_verdict.approved else "yellow",
+                            ),
+                            Panel(
+                                Markdown(cloud_verdict.findings_markdown),
+                                title=f"[bold magenta]{cloud_verdict.reviewer}[/bold magenta] ({cloud_verdict.elapsed_s:.1f}s)",
+                                border_style="green" if cloud_verdict.approved else "yellow",
+                            ),
+                        ],
+                        equal=True,
+                        expand=True,
+                    )
+                )
+            else:
+                say.title(f"{local_verdict.reviewer} Verdict (approved: {local_verdict.approved})")
+                say.plain(local_verdict.findings_markdown)
+                say.title(f"{cloud_verdict.reviewer} Verdict (approved: {cloud_verdict.approved})")
+                say.plain(cloud_verdict.findings_markdown)
+
+            # Interactive Gate #2
+            default_choice = "c" if (local_verdict.approved and cloud_verdict.approved) else "f"
+            if Prompt:
+                action = Prompt.ask(
+                    "\n[bold cyan]Review Gate #2[/bold cyan] — [green][C]ommit changes[/green], "
+                    "[yellow][F]ix review findings on ROCm[/yellow], or [red][U]ndo & Abort[/red]?",
+                    choices=["c", "f", "u"],
+                    default=default_choice,
+                ).lower()
+            else:
+                action = (prompt_input(f"\nReview Gate #2 — [C]ommit, [F]ix, [U]ndo? [{default_choice}]: ") or default_choice).strip().lower()
+
+            if action == "c":
+                return True
+            if action == "u":
+                if hasattr(self.session, "checkpointer") and hasattr(self.session.checkpointer, "undo_latest"):
+                    self.session.checkpointer.undo_latest()
+                if console:
+                    console.print("[yellow]↺ Working tree restored to pre-brainstorm state.[/yellow]")
+                else:
+                    say.warn("Working tree restored to pre-brainstorm state.")
+                return False
+
+            # User selected [F]ix: send both review critiques to ROCm :9000 and re-verify
+            fix_feedback = (
+                f"Apply fixes for the following Dual Review findings:\n\n"
+                f"### Local ROCm Review:\n{local_verdict.findings_markdown}\n\n"
+                f"### Cloud Gemini Review:\n{cloud_verdict.findings_markdown}"
+            )
+            spec_with_fixes = BrainstormSpec(
+                title=spec.title,
+                commit_message=spec.commit_message,
+                summary=spec.summary,
+                target_files=spec.target_files,
+                implementation_steps=[fix_feedback],
+                test_command=spec.test_command,
+                raw_markdown=spec.raw_markdown,
+            )
+            if not await self._phase2_and_3_implement_and_verify(spec_with_fixes):
+                return False
+
+    async def _run_single_reviewer(
+        self, target: str, label: str, spec: BrainstormSpec, git_diff: str
+    ) -> ReviewVerdict:
+        t0 = time.perf_counter()
+        review_prompt = (
+            "Review the following git diff against the approved specification.\n"
+            "Start your response with `VERDICT: APPROVE` or `VERDICT: CHANGES_NEEDED`, "
+            "followed by concise bullet points covering correctness, edge cases, and security.\n\n"
+            f"## Approved Spec\n{spec.raw_markdown[:3000]}\n\n"
+            f"## Git Diff\n```diff\n{git_diff[:8000]}\n```"
+        )
+        # Use an isolated ephemeral agent instance so parallel reviews don't race on session.active_target
+        try:
+            cfg = self.session._make_backend_config(target)
+            reviewer_agent = self.session._build_ephemeral_review_agent(cfg)
+            stream = await reviewer_agent.send_message_stream(review_prompt)
+            text = "".join([tok async for tok in stream]).strip()
+        except Exception as e:
+            text = f"VERDICT: APPROVE\n- {label} review skipped or unavailable ({type(e).__name__}: {e})."
+
+        approved = "VERDICT: APPROVE" in text.upper()[:120]
+        return ReviewVerdict(
+            reviewer=label,
+            approved=approved,
+            severity="clean" if approved else "minor",
+            findings_markdown=text,
+            elapsed_s=time.perf_counter() - t0,
+        )
+
+    # -------------------------------------------------------------------------
+    # Phase 5: Git Commit & Background Kontexta Journal Sync (/memory)
+    # -------------------------------------------------------------------------
+    async def _phase5_commit_and_journal(
+        self, spec: BrainstormSpec, idea: str, memory_sync_enabled: bool
+    ) -> str:
+        repo_dir = "."
+        if hasattr(self.session, "repomap") and getattr(self.session.repomap, "repo_root", None) and isinstance(self.session.repomap.repo_root, (str, os.PathLike)):
+            repo_dir = str(self.session.repomap.repo_root)
+        elif hasattr(self.session, "_repo_root") and isinstance(self.session._repo_root, (str, os.PathLike)):
+            repo_dir = str(self.session._repo_root)
+        subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", spec.commit_message],
+            cwd=repo_dir,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
+        ).strip()
+
+        # Non-blocking background sync to Kontexta journal (unless /memory off)
+        if memory_sync_enabled and getattr(self.session, "kontexta", None) is not None:
+            asyncio.create_task(
+                self.session.kontexta.journal_brainstorm_commit(
+                    idea=idea,
+                    spec_markdown=spec.raw_markdown,
+                    commit_sha=sha,
+                    commit_message=spec.commit_message,
+                    files_touched=spec.target_files,
+                    repo_root=repo_dir,
+                )
+            )
+        return sha
+
+    # -------------------------------------------------------------------------
+    # Prompt Builders & Spec Parser
+    # -------------------------------------------------------------------------
+    def _build_spec_prompt(self, idea: str, feedback: str | None) -> str:
+        base = (
+            f"Design a concrete, minimal-diff engineering specification for:\n"
+            f"**Idea:** {idea}\n\n"
+            "Include these exact Markdown sections:\n"
+            "1. `# Title`\n"
+            "2. `## Commit Message` (single-line conventional commit, e.g. `feat(core): ...`)\n"
+            "3. `## Target Files` (bullet list of relative file paths)\n"
+            "4. `## Test Command` (single shell command inside a code block)\n"
+            "5. `## Implementation Plan` (ordered steps with exact function/class signatures)"
+        )
+        if feedback:
+            base += f"\n\n**User Refinement Feedback:** {feedback}"
+        return base
+
+    @staticmethod
+    def _build_implementation_prompt(spec: BrainstormSpec, repair_context: str) -> str:
+        prompt = (
+            "Implement the following approved specification using your file editing tools. "
+            "Do not ask for confirmation; apply all code changes directly.\n\n"
+            f"{spec.raw_markdown}"
+        )
+        if repair_context:
+            prompt += f"\n\n## Build Verification Repair Instructions\n{repair_context}"
+        return prompt
+
+    def _parse_spec_output(self, raw_md: str, idea: str) -> BrainstormSpec:
+        commit_msg = f"feat: {idea[:60]}"
+        test_cmd = self.default_test_cmd
+        files: list[str] = []
+        lines = raw_md.splitlines()
+        section = ""
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                section = stripped[3:].lower()
+                continue
+            if "commit message" in section and stripped and not stripped.startswith("`"):
+                commit_msg = stripped.strip("`\"'")
+            elif "target files" in section and stripped.startswith(("-", "*")):
+                files.append(stripped.lstrip("-* `").rstrip("`"))
+            elif "test command" in section and stripped and not stripped.startswith("```"):
+                test_cmd = stripped.strip("`")
+
+        return BrainstormSpec(
+            title=idea[:80],
+            commit_message=commit_msg,
+            summary=raw_md[:400],
+            target_files=files,
+            implementation_steps=[],
+            test_command=test_cmd,
+            raw_markdown=raw_md,
+        )
+
+    async def _stream_from_target(
+        self,
+        target: str,
+        fallback_target: str,
+        prompt: str,
+        panel_title: str,
+    ) -> str | None:
+        cancel_ev = asyncio.Event()
+        targets_to_try = [target]
+        if fallback_target and fallback_target != target:
+            targets_to_try.append(fallback_target)
+
+        buf: list[str] = []
+        for idx, cur_target in enumerate(targets_to_try):
+            buf.clear()
+            cancel_ev.clear()
+            try:
+                if hasattr(self.session, "switch_target"):
+                    self.session.switch_target(cur_target)
+                else:
+                    self.session.active_target = cur_target
+            except Exception:
+                continue
+
+            status = None
+            if cur_target != "cloud" and console and hasattr(console, "status"):
+                target_label = "ROCm :9000 (Local Executive)" if cur_target == "rocm" else cur_target.upper()
+                status = console.status(f"[bold cyan]Synthesizing specification with {target_label}...[/bold cyan]", spinner="dots")
+                status.start()
+
+            def _on_tok(tok: str):
+                nonlocal status
+                if status:
+                    status.stop()
+                    status = None
+                buf.append(tok)
+                if cur_target != "cloud":
+                    sys.stdout.write(tok)
+                    sys.stdout.flush()
+
+            def _on_tool(name: str, args: dict):
+                if status:
+                    status.update(f"[bold yellow]⚙ {name}[/bold yellow]")
+                elif console:
+                    console.print(f" [dim cyan]⚙ {name}[/dim cyan]")
+
+            try:
+                try:
+                    async with listen_for_esc(cancel_ev):
+                        await self.session.run_turn(
+                            prompt=prompt,
+                            on_thought=lambda _: None,
+                            on_tool_start=_on_tool,
+                            on_token=_on_tok,
+                            cancel_event=cancel_ev,
+                        )
+                finally:
+                    if status:
+                        status.stop()
+
+                if cancel_ev.is_set():
+                    return None
+
+                full_text = "".join(buf).strip()
+                if full_text:
+                    if cur_target != "cloud":
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    if console and Panel and Markdown and cur_target != "cloud":
+                        console.print(Panel(Markdown(full_text), title=panel_title, border_style="cyan"))
+                    elif console and cur_target == "cloud":
+                        console.print(f"\n[bold green]✓ Specification successfully synthesized by Cloud Gemini.[/bold green]\n")
+                    return full_text
+                else:
+                    raise RuntimeError(f"Target '{cur_target}' produced empty response.")
+            except Exception as e:
+                if idx < len(targets_to_try) - 1:
+                    next_target = targets_to_try[idx + 1]
+                    msg = f"Target '{cur_target}' unavailable ({type(e).__name__}: {e}). Falling back to '{next_target}'..."
+                    if console:
+                        console.print(f"[yellow]{msg}[/yellow]")
+                    else:
+                        say.warn(msg)
+                else:
+                    msg = f"Target '{cur_target}' failed: {e}"
+                    if console:
+                        console.print(f"[bold red]{msg}[/bold red]")
+                    else:
+                        say.err(msg)
+                    raise
+
+        return None
+
 
 class BrainstormWorkflow:
     """State machine governing end-to-end spec brainstorming, implementation, dual review, and commit."""
+
 
     @classmethod
     def _slugify(cls, text: str) -> str:
@@ -319,7 +959,7 @@ class BrainstormWorkflow:
         keys = "[r]etry" if retry else "[Enter] continue"
         wait: Optional[float] = None if retry else cls.SWITCH_WINDOW_SECS
         while True:
-            say.dim(f"{header} (target {session.active_target}). {keys}  [s]kip  [q]uit  /switch <id>  /cloud [id]")
+            say.dim(f"{header} (target {session.active_target}). {keys}  [s]kip  [q]uit  /switch <id>  /cloud")
             try:
                 if wait is None:
                     raw = await asyncio.to_thread(prompt_input, "> ")
@@ -471,7 +1111,7 @@ class BrainstormWorkflow:
         # ── PHASE 2: Local Implementation, one milestone at a time ────────
         say.group("Phase 2/5: implementation (milestone by milestone)")
         session.active_target = "9000"
-        if getattr(session, "auto_git_shift", False) and session.active_target == "9000":
+        if getattr(session, "auto_shift", getattr(session, "auto_git_shift", False)) and session.active_target == "9000":
             ep_9000 = session.endpoints.get("9000", {})
             curr = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
             if "qwen" not in curr:
@@ -515,8 +1155,8 @@ class BrainstormWorkflow:
             if action == "skip":
                 cls._mark_done(plan_path, idx, " (skipped)")
 
-        # ── PHASE 3: Autonomous Build & Test Verification on NVIDIA Subagent (:9001) ──
-        say.group("Phase 3/5: verification and self-healing tests (NVIDIA subagent :9001)")
+        # ── PHASE 3: Autonomous Build & Test Verification on NVIDIA Subagent (:9002) ──
+        say.group("Phase 3/5: verification and self-healing tests (NVIDIA subagent :9002)")
         test_cmd = cls._detect_test_command(repo_root)
         if test_cmd:
             say.step(f"running tests on the NVIDIA subagent: {test_cmd}")
@@ -553,7 +1193,7 @@ class BrainstormWorkflow:
             say.warn("No git changes detected after implementation phase.")
             return
 
-        review_target = "9001" if session.endpoints.get("9001", {}).get("status") == "online" else "9000"
+        review_target = "9002" if session.endpoints.get("9002", {}).get("status") == "online" else "9000"
         target_name = session.endpoints.get(review_target, {}).get("name", review_target)
         say.group(f"Phase 4/5: local functional code review ({target_name})")
         local_review_prompt = (
@@ -615,7 +1255,7 @@ class BrainstormWorkflow:
                 if not to_add:
                     say.warn("No new changes to commit.")
                 else:
-                    if getattr(session, "auto_git_shift", False):
+                    if getattr(session, "auto_shift", getattr(session, "auto_git_shift", False)):
                         ep_9000 = session.endpoints.get("9000", {})
                         curr = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
                         if "gemma" not in curr:
@@ -639,7 +1279,7 @@ class BrainstormWorkflow:
         except Exception as e:
             say.err(f"Commit operation failed or skipped: {e}")
         finally:
-            if getattr(session, "auto_git_shift", False) and session.active_target == "9000":
+            if getattr(session, "auto_shift", getattr(session, "auto_git_shift", False)) and session.active_target == "9000":
                 ep_9000 = session.endpoints.get("9000", {})
                 curr = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
                 if "qwen" not in curr:

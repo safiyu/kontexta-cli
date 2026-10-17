@@ -8,7 +8,7 @@ An asynchronous, dual-accelerator pairing framework and terminal copilot built o
 
 * **Dual-GPU Asymmetric Compute Pipeline**:
   * **Primary Executive (`ROCm:9000`)**: AMD ROCm GPU running deep reasoning models (e.g. Qwen 2.5 35B / Muse Glimmer) with full tool execution privileges.
-  * **Dedicated Compactor & Subagent Engine (`CUDA:9001`)**: NVIDIA RTX 4060 running IBM Granite 4.2 8B for rolling background Working Memory synthesis and asynchronous task delegation.
+  * **Dedicated Compactor & Subagent Engine (`CUDA:9002`)**: NVIDIA RTX 4060 running IBM Granite 4.2 8B for rolling background Working Memory synthesis and asynchronous task delegation.
   * **LlamaShift Hot-Swapping (`Port 8002`)**: Zero-downtime model lifecycle management and VRAM hot-swapping.
 * **Laya System 1 Decision Engine (`Port 8003`)**:
   * ~33ms Non-Autoregressive ModernBERT (~421M params) for dynamic prompt auto-routing, escalation scoring, and Bayesian safe-action permission gating (`/noul`).
@@ -33,7 +33,7 @@ An asynchronous, dual-accelerator pairing framework and terminal copilot built o
 * **Usage Ledger (`/stats`)**: per-target tokens, tok/s, TTFT, time, escalations and errors for the session.
 * **Persistent Preferences (`~/.myagy/config.json`)**: target, permission mode, toggles and thresholds survive restarts and `/reload`. Explicit CLI flags win over saved values.
 * **Markdown Rendering**: responses stream through a live Markdown renderer (toggle with `/markdown`).
-* **Tool-Using Subagents**: `/spawn` runs a real agent on :9001 with the same hooks; unsafe actions are denied (no prompts from the background). Falls back to a plain no-tools completion if the agent can't start.
+* **Tool-Using Subagents**: `/spawn` runs a real agent on :9002 with the same hooks; unsafe actions are denied (no prompts from the background). Falls back to a plain no-tools completion if the agent can't start.
 * **Universal MCP Server Support**:
   * Inbuilt Kontexta MCP integration (`kxta`) with persistent project intelligence, SQLite knowledge store, and entity linking.
   * Auto-discovers Antigravity native, VS Code-compatible, and local Kontexta MCP tools.
@@ -53,7 +53,7 @@ Projects/myagy/
 │
 ├── core/                     # Core execution & multi-GPU routing engine
 │   ├── session.py            # MultiGpuHybridSession cross-GPU orchestrator
-│   ├── coordinator.py        # NVIDIA CUDA:9001 resource arbitrator
+│   ├── coordinator.py        # NVIDIA CUDA:9002 resource arbitrator
 │   ├── checkpoints.py        # Git tree snapshots behind /diff and /undo
 │   ├── prefs.py              # Persisted preferences (~/.myagy/config.json)
 │   ├── laya.py               # Laya System 1 ModernBERT decision protocol
@@ -101,6 +101,9 @@ python3 -m pytest
 ### 2. Environment Overrides (optional)
 | Variable | Default | Purpose |
 |---|---|---|
+| `MYAGY_CUDA_BASE_URL` | `http://127.0.0.1:9002/v1` | NVIDIA CUDA compactor & subagent llama-server (Port 9002; leaves 9001 free for Portainer) |
+| `MYAGY_ROCM_BASE_URL` | `http://127.0.0.1:9000/v1` | AMD ROCm executive llama-server (Port 9000) |
+| `MYAGY_LAYA_BASE_URL` | `http://127.0.0.1:8003` | Laya System 1 ModernBERT decision engine |
 | `MYAGY_MODEL_DIR` | `/home/safiyu/models` | GGUF model directory (also used by `launch_cuda_compactor.sh`) |
 | `MYAGY_KONTEXTA_MCP` | `~/Projects/kontexta/apps/mcp/dist/index.js` | Kontexta MCP entrypoint |
 | `MYAGY_KONTEXTA_DATA` | `~/.local/share/kontexta` | Kontexta data directory |
@@ -138,17 +141,17 @@ python3 /home/safiyu/Projects/myagy/antigravity_agent.py --dangerously-skip-perm
 | :--- | :--- |
 | `/auto` | Enable Laya System 1 Non-Autoregressive routing (~33ms) |
 | `/9000` or `/rocm` | Set active model to AMD ROCm GPU (Port 9000) |
-| `/9001` or `/cuda` | Set active model to NVIDIA CUDA GPU (Port 9001) |
+| `/9002` or `/cuda` | Set active model to NVIDIA CUDA GPU (Port 9002) |
 | `/cloud` or `/gemini` | Route queries through Google Cloud Gemini via OAuth |
 | `/models` | List all local and cloud models in catalog |
 | `/model <# or id>` | Hot-swap active model on the fly |
 | `/spawn <task>` | Enqueue background task on NVIDIA RTX 4060 (FIFO serialized) |
-| `/build [cmd]` | Push project build & test verification to NVIDIA RTX 4060 Subagent (:9001) |
+| `/build [cmd]` | Push project build & test verification to NVIDIA RTX 4060 Subagent (:9002) |
 | `/tasks` | List subagent execution queue, active task & progress |
 | `/subagent view <#>` | Inspect the complete result and tool calls of a subagent |
 | `/subagent inject <#\|all>`| Inject subagent findings (single or all) into current chat context |
 | `/subagent cancel <#>`| Cancel a running or queued background subagent task |
-| `/cuda` | Show NVIDIA CUDA:9001 resource coordinator status |
+| `/cuda` | Show NVIDIA CUDA:9002 resource coordinator status |
 | `/repomap [path]` | Render the rich AST symbol tree of codebase classes & functions |
 | `/repomap on\|off` | Toggle automatic codebase outline injection into model memory |
 | `/repomap refresh` | Force an immediate cache invalidation and re-index |

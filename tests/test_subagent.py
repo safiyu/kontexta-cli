@@ -42,7 +42,7 @@ def _fake_agent(text=None, fail=False):
 
 @pytest.fixture
 def online_session(session):
-    session.endpoints["9001"].update(status="online", filename="granite.gguf", model="/m/granite.gguf", url="http://localhost:9001/v1")
+    session.endpoints["9002"].update(status="online", filename="granite.gguf", model="/m/granite.gguf", url="http://localhost:9002/v1")
     return session
 
 
@@ -61,7 +61,7 @@ def test_tool_agent_success(online_session, monkeypatch):
     assert task.status == "completed" and task.mode == "tools"
     assert task.result == "all done here"
     assert Fake.closed
-    assert Fake.last.config.kwargs["base_url"] == "http://localhost:9001/v1"
+    assert Fake.last.config.kwargs["base_url"] == "http://localhost:9002/v1"
 
 
 def test_falls_back_to_plain_when_agent_fails(online_session, monkeypatch):
@@ -79,7 +79,7 @@ def test_falls_back_to_plain_when_agent_fails(online_session, monkeypatch):
 
 
 def test_offline_port_fails_cleanly(session, monkeypatch):
-    monkeypatch.setattr(sa, "wake_compactor", lambda port=9001, **k: {"ok": False, "reason": "down", "log_tail": "", "elapsed": 0.0, "warnings": []})
+    monkeypatch.setattr(sa, "wake_compactor", lambda port=9002, **k: {"ok": False, "reason": "down", "log_tail": "", "elapsed": 0.0, "warnings": []})
     task = SubagentTask(3, "x")
     _run(task, session)
     assert task.status == "failed" and "offline" in task.error

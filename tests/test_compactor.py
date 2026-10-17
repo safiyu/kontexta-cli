@@ -9,7 +9,7 @@ from myagy.core.coordinator import CudaCoordinator
 
 @pytest.fixture(autouse=True)
 def no_real_llamashift(monkeypatch):
-    monkeypatch.setattr(compactor, "wake_compactor", lambda port=9001, **k: {"ok": False, "reason": "disabled in tests", "log_tail": "", "elapsed": 0.0, "warnings": []})
+    monkeypatch.setattr(compactor, "wake_compactor", lambda port=9002, **k: {"ok": False, "reason": "disabled in tests", "log_tail": "", "elapsed": 0.0, "warnings": []})
 
 
 def _history(n):
