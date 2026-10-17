@@ -4,7 +4,7 @@ import pytest
 
 rich_console = pytest.importorskip("rich.console")
 
-from myagy.terminal import receipt, ui
+from kontexta_cli.terminal import receipt, ui
 
 
 def _render(monkeypatch, text, width=60):

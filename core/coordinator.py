@@ -1,4 +1,3 @@
-# Projects/myagy/core/coordinator.py
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +10,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Dict, List
 
 import httpx
 
-from myagy.config import CUDA_BASE_URL  # e.g. "http://127.0.0.1:9002/v1"
+from ..config import CUDA_BASE_URL  # e.g. "http://127.0.0.1:9002/v1"
 
 
 class CudaPriority(IntEnum):
@@ -260,7 +259,17 @@ class CudaCoordinator:
         try:
             await waiter.future
         except asyncio.CancelledError:
-            waiter.future.cancel()
+            if waiter.future.done() and not waiter.future.cancelled():
+                # Slot was granted but we were cancelled before entering the body; release it.
+                self._active_waiter = None
+                self._active_task = None
+                self._active_http_cancel = None
+                self._state = "idle"
+                CudaCoordinator._state = "idle"
+                CudaCoordinator._last_state_change = time.time()
+                self._slot_released.set()
+            else:
+                waiter.future.cancel()
             raise
 
         self._active_task = asyncio.current_task()
@@ -304,7 +313,7 @@ class CudaCoordinator:
 
     async def synthesize_working_memory(self, messages: list[dict[str, Any]]) -> str:
         """Synthesizes working memory on CUDA:9002 for compaction hook."""
-        from myagy.agents.compactor import ContextCurator
+        from ..agents.compactor import ContextCurator
         return ContextCurator.summarize_history_sync(None, messages)
 
     # -------------------------------------------------------------------------

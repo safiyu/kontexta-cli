@@ -34,17 +34,21 @@ def _emit(text: str):
     if _state["json"]:
         print(_strip(text), file=sys.stderr, flush=True)
     else:
+        cur = None
+        printed = False
         try:
             from .esc_listener import EscListener
             had_box = bool(EscListener._current and getattr(EscListener._current, "_box_drawn", False))
             if had_box:
                 EscListener.clear_box()
             print(text, flush=True)
+            printed = True
             cur = EscListener._current
             if cur and (cur.buffered_text or cur.submit_pending):
                 cur._render_live_input()
         except Exception:
-            print(text, flush=True)
+            if not printed:
+                print(text, flush=True)
 
 
 def _width(cap: int = 0) -> int:

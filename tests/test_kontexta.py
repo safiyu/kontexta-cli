@@ -2,9 +2,9 @@ import os
 import shutil
 import pytest
 
-from myagy.context.kontexta import KontextaManager
-from myagy.context.mcp_loader import load_mcp_servers
-from myagy.terminal import cli
+from kontexta_cli.context.kontexta import KontextaManager
+from kontexta_cli.context.mcp_loader import load_mcp_servers
+from kontexta_cli.terminal import cli
 
 
 def test_kontexta_manager_entrypoint_and_availability():
@@ -29,7 +29,7 @@ def test_kontexta_create_mcp_server():
 def test_load_mcp_servers_inbuilt_kontexta(monkeypatch, tmp_path):
     # Empty mcp_config.json
     fake_config = str(tmp_path / "empty_mcp.json")
-    monkeypatch.setattr("myagy.context.mcp_loader.MCP_CONFIG_PATH", fake_config)
+    monkeypatch.setattr("kontexta_cli.context.mcp_loader.MCP_CONFIG_PATH", fake_config)
 
     # When enable_kontexta=True, it should include kontexta if available
     servers = load_mcp_servers(enable_kontexta=True)
@@ -68,7 +68,7 @@ def test_kontexta_cli_tab_completion(monkeypatch):
     pytest.importorskip("prompt_toolkit")
     from prompt_toolkit.document import Document
     monkeypatch.setattr(cli, "_pt_session", None)
-    monkeypatch.setattr(cli, "HISTORY_PATH", "/tmp/myagy-test-history")
+    monkeypatch.setattr(cli, "HISTORY_PATH", "/tmp/kontexta-cli-test-history")
     pt = cli._get_pt_session()
     assert pt is not None
 

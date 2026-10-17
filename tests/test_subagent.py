@@ -3,9 +3,9 @@ import types
 
 import pytest
 
-from myagy.agents import subagent as sa
-from myagy.agents.subagent import SubagentManager, SubagentTask
-from myagy.core.coordinator import CudaCoordinator
+from kontexta_cli.agents import subagent as sa
+from kontexta_cli.agents.subagent import SubagentManager, SubagentTask
+from kontexta_cli.core.coordinator import CudaCoordinator
 
 
 class FakeResponse:

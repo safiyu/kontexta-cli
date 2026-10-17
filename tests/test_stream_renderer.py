@@ -4,7 +4,7 @@ import pytest
 
 rich_console = pytest.importorskip("rich.console")
 
-from myagy.terminal import ui
+from kontexta_cli.terminal import ui
 
 
 def _capture(monkeypatch, width=60):

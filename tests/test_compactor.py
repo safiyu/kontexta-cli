@@ -2,9 +2,9 @@ import asyncio
 
 import pytest
 
-from myagy.agents import compactor
-from myagy.agents.compactor import ContextCurator
-from myagy.core.coordinator import CudaCoordinator
+from kontexta_cli.agents import compactor
+from kontexta_cli.agents.compactor import ContextCurator
+from kontexta_cli.core.coordinator import CudaCoordinator
 
 
 @pytest.fixture(autouse=True)
@@ -97,7 +97,7 @@ def test_context_estimate_does_not_summarize(session, monkeypatch):
 
 
 def test_completion_parser_handles_reasoning_and_thinking_tags():
-    from myagy.agents.compactor import _parse_completion_response
+    from kontexta_cli.agents.compactor import _parse_completion_response
 
     # Standard content
     assert _parse_completion_response({"choices": [{"message": {"content": "Clean summary"}}]}) == "Clean summary"

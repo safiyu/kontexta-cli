@@ -1,4 +1,3 @@
-# Projects/myagy/agents/subagent.py
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +9,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, List, Dict
+from typing import Any, Callable, Literal, Optional, List, Dict
 
 import signal
 import urllib.request
@@ -36,76 +35,19 @@ except ImportError:
     policy = None
     CapabilitiesConfig = None
 
-try:
-    from google_antigravity import (
-        HookDecision,
-        ToolCallContext,
-        post_tool_call,
-        pre_tool_call,
-    )
-except ImportError:
-    try:
-        from google.antigravity import (
-            HookDecision,
-            ToolCallContext,
-            post_tool_call,
-            pre_tool_call,
-        )
-    except ImportError:
-        class HookDecision:
-            def __init__(self, allow: bool = True, reason: str = ""):
-                self.allow = allow
-                self.reason = reason
-
-            @classmethod
-            def allow(cls):
-                return cls(True)
-
-            @classmethod
-            def deny(cls, reason: str = ""):
-                return cls(False, reason)
-
-        class ToolCallContext:
-            def __init__(self, name: str = "", args: dict = None, output: Any = None, error: Any = None):
-                self.name = name
-                self.args = args or {}
-                self.output = output
-                self.error = error
-
-        pre_tool_call = "pre_tool_call"
-        post_tool_call = "post_tool_call"
-
-# Register virtual google_antigravity module
-if "google_antigravity" not in sys.modules:
-    import types as _pytypes
-    _ga_mod = _pytypes.ModuleType("google_antigravity")
-    _ga_mod.Agent = Agent
-    _ga_mod.HookDecision = HookDecision
-    _ga_mod.LocalOpenAIAgentConfig = LocalOpenAIAgentConfig
-    _ga_mod.ToolCallContext = ToolCallContext
-    _ga_mod.post_tool_call = post_tool_call
-    _ga_mod.pre_tool_call = pre_tool_call
-    _ga_mod.hooks = hooks
-    _ga_mod.types = types
-    _ga_mod.CapabilitiesConfig = CapabilitiesConfig
-    sys.modules["google_antigravity"] = _ga_mod
-
-if "google.antigravity" in sys.modules and "google_antigravity" not in sys.modules:
-    sys.modules["google_antigravity"] = sys.modules["google.antigravity"]
-
 from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
-from myagy.config import CUDA_BASE_URL  # "http://127.0.0.1:9002/v1"
-from myagy.core.coordinator import CudaCoordinator
-from myagy.core.laya import LayaDecisionEngine
-from myagy.core import shellparse
-from myagy.core.llamashift import wake_compactor
-from myagy.terminal import say
-from myagy.terminal.ui import UI
+from ..config import CUDA_BASE_URL, COMPACTOR_MODEL_ID, COMPACTOR_MODEL_FILE
+from ..core.coordinator import CudaCoordinator
+from ..core.laya import LayaDecisionEngine
+from ..core import shellparse
+from ..core.llamashift import wake_compactor
+from ..terminal import say
+from ..terminal.ui import UI
 
 console = Console()
 
@@ -307,15 +249,15 @@ class SubagentManager:
         self,
         cuda_coord: CudaCoordinator = None,
         laya: LayaDecisionEngine = None,
-        hooks_runner: Any = None,
+        hooks_provider: Optional[Callable[[], list]] = None,
         mcp_tools: list[Any] = None,
         system_prompt_provider: Any = None,
-        model_id: str = "granite42_8b",
+        model_id: str = COMPACTOR_MODEL_ID,
         safety_threshold: float = 0.90,
     ) -> None:
         self.coord = cuda_coord or CudaCoordinator()
         self.laya = laya
-        self.hooks_runner = hooks_runner
+        self.hooks_provider = hooks_provider
         self.mcp_tools = mcp_tools or []
         self.get_system_prompt = system_prompt_provider or (lambda: "")
         self.model_id = model_id
@@ -437,6 +379,12 @@ class SubagentManager:
 
             except asyncio.CancelledError:
                 task.state = "cancelled"
+                if not task._cancel_event.is_set():
+                    # Worker itself is being shut down (stop/reload), not a per-task cancel.
+                    raise
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
             except Exception as exc:
                 task.state = "failed"
                 task.error = str(exc)
@@ -452,19 +400,11 @@ class SubagentManager:
         Attempts to run a real tool-using Antigravity Agent on :9002 with strict
         non-interactive safety gating; falls back to plain completion on init failure.
         """
+        agent = None
         try:
             agent = self._build_headless_subagent(task)
-            response = None
-            if hasattr(agent, "send_message_stream"):
-                response = await agent.send_message_stream(task.prompt)
-            elif hasattr(agent, "chat"):
-                resp = await agent.chat(task.prompt)
-                async def _stream():
-                    async for token in resp:
-                        yield token
-                response = _stream()
-            else:
-                raise RuntimeError("No streaming method on agent")
+            await agent.__aenter__()
+            response = await agent.chat(task.prompt)
 
             closer = getattr(response, "aclose", None)
             if closer:
@@ -493,12 +433,50 @@ class SubagentManager:
             else:
                 task.state = "failed"
                 task.error = str(agent_exc)
+        finally:
+            if agent is not None and hasattr(agent, "__aexit__"):
+                try:
+                    await agent.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
+    def _gate_tool_call(self, task: SubagentTask, name: str, args: Dict[str, Any]) -> tuple[bool, str]:
+        """Non-interactive safety gate: Laya P(Safe) must reach the threshold, never prompts."""
+        args = args if isinstance(args, dict) else {}
+        cmd_line = str(args.get("CommandLine", "") or "")
+        if "rm -rf" in cmd_line or (hasattr(shellparse, "elevates") and shellparse.elevates(cmd_line)):
+            reason = "sudo/destructive command is not allowed in background tasks"
+            task.tool_traces.append(SubagentToolTrace(name, dict(args), "denied", reason))
+            return False, reason
+
+        p_safe = 1.0
+        if self.laya is not None and hasattr(self.laya, "evaluate_action_safety"):
+            is_safe, p_safe = self.laya.evaluate_action_safety(
+                f"Tool: {name} Args: {json.dumps(args, default=str)}"
+            )
+            if not is_safe:
+                p_safe = min(p_safe, self.safety_threshold - 1e-6)
+
+        if p_safe < self.safety_threshold:
+            reason = (
+                f"Background subagent denied unsafe action `{name}` "
+                f"(P(Safe)={p_safe:.2f} < {self.safety_threshold:.2f}). "
+                "Use read-only inspection tools instead."
+            )
+            task.tool_traces.append(SubagentToolTrace(name, dict(args), "denied", reason))
+            return False, reason
+
+        task.tool_traces.append(SubagentToolTrace(name, dict(args), "executed", f"P(Safe)={p_safe:.2f}"))
+        return True, ""
 
     def _build_headless_subagent(self, task: SubagentTask) -> Any:
         """
-        Builds a :9002 Agent sharing hooks.json and Laya /noul gating.
-        Unsafe actions are strictly denied in-place (zero interactive prompts from background).
+        Builds an unentered :9002 Agent (same SDK path as the main agent) with hooks.json
+        hooks and a non-interactive Laya gate. Callers must enter/exit its context.
         """
+        if Agent is None or LocalOpenAIAgentConfig is None:
+            raise RuntimeError("google.antigravity Agent unavailable")
+
         sys_prompt = (
             f"{self.get_system_prompt()}\n\n"
             "# Background Subagent Mode (CUDA:9002)\n"
@@ -508,85 +486,31 @@ class SubagentManager:
         )
 
         def background_permission(tool: Any, args: Dict[str, Any]) -> bool:
-            name = getattr(tool, "name", str(tool))
-            cmd_line = args.get("CommandLine", "") if isinstance(args, dict) else ""
-            if "rm -rf" in cmd_line or (hasattr(shellparse, "elevates") and shellparse.elevates(cmd_line)):
-                task.tool_traces.append(SubagentToolTrace(name, dict(args) if isinstance(args, dict) else {}, "denied", "sudo/destructive command is not allowed in background tasks"))
-                return False
-            if self.laya is not None and hasattr(self.laya, "evaluate_action_safety"):
-                safe, _ = self.laya.evaluate_action_safety(f"Tool: {name} Args: {json.dumps(args, default=str)}")
-                if not safe:
-                    task.tool_traces.append(SubagentToolTrace(name, dict(args) if isinstance(args, dict) else {}, "denied", "not auto-approved as safe"))
-                    return False
-            return True
+            allowed, _ = self._gate_tool_call(task, getattr(tool, "name", str(tool)), args)
+            return allowed
 
-        policies = ["allow_all", background_permission]
+        @hooks.pre_tool_call_decide
+        def subagent_gate(call: types.ToolCall) -> types.HookResult:
+            name = str(getattr(getattr(call, "name", ""), "value", getattr(call, "name", "")))
+            allowed, reason = self._gate_tool_call(task, name, getattr(call, "args", {}) or {})
+            if allowed:
+                return types.HookResult(allow=True)
+            return types.HookResult(allow=False, message=reason)
+
+        agent_hooks = [subagent_gate]
+        if self.hooks_provider is not None:
+            agent_hooks.extend(self.hooks_provider() or [])
 
         config = LocalOpenAIAgentConfig(
-            base_url=CUDA_BASE_URL,
-            api_key="llamashift-local",
             model=self.model_id,
-            system_instruction=sys_prompt,
-            extra_body={"cache_prompt": True},
-            policies=policies,
+            base_url=CUDA_BASE_URL,
+            system_instructions=sys_prompt,
+            capabilities=CapabilitiesConfig(),
+            policies=policy.confirm_run_command(handler=background_permission),
+            hooks=agent_hooks,
+            mcp_servers=self.mcp_tools,
         )
-        if Agent is None:
-            raise RuntimeError("google.antigravity Agent unavailable")
-
-        agent = Agent(config=config)
-
-        if not hasattr(agent, "on"):
-            agent.on = lambda event: (lambda f: f)
-
-        @agent.on(pre_tool_call)
-        async def _subagent_pre_tool(ctx: ToolCallContext) -> HookDecision:
-            # 1. Run external hooks.json PreToolUse gate
-            if self.hooks_runner is not None and hasattr(self.hooks_runner, "run_pre_tool"):
-                ext = await self.hooks_runner.run_pre_tool(ctx.name, ctx.args)
-                if getattr(ext, "decision", None) == "deny":
-                    reason = getattr(ext, "reason", "hooks.json") or "hooks.json"
-                    task.tool_traces.append(
-                        SubagentToolTrace(ctx.name, dict(ctx.args), "denied", reason)
-                    )
-                    return HookDecision.deny(reason=f"Denied by hooks.json: {reason}")
-                if getattr(ext, "overwritten_args", None) is not None:
-                    ctx.args.update(ext.overwritten_args)
-
-            # 2. Enforce Laya /noul non-interactive safety gate (P(Safe) >= 0.90)
-            # Never prompt the user from a background thread — deny immediately if < 0.90
-            p_safe = 1.0
-            reason = "safe"
-            if self.laya is not None and hasattr(self.laya, "score_tool_safety"):
-                score = await self.laya.score_tool_safety(ctx.name, ctx.args)
-                p_safe = score.p_safe
-                reason = score.reason
-            elif self.laya is not None and hasattr(self.laya, "evaluate_action_safety"):
-                safe, r = self.laya.evaluate_action_safety(f"Tool: {ctx.name} Args: {json.dumps(ctx.args, default=str)}")
-                p_safe = 1.0 if safe else 0.0
-                reason = r or ("safe" if safe else "unsafe")
-
-            if p_safe < self.safety_threshold:
-                denial_reason = (
-                    f"Background subagent denied unsafe action `{ctx.name}` "
-                    f"(P(Safe)={p_safe:.2f} < {self.safety_threshold:.2f}: {reason}). "
-                    "Use read-only inspection tools instead."
-                )
-                task.tool_traces.append(
-                    SubagentToolTrace(ctx.name, dict(ctx.args), "denied", denial_reason)
-                )
-                return HookDecision.deny(reason=denial_reason)
-
-            task.tool_traces.append(
-                SubagentToolTrace(ctx.name, dict(ctx.args), "executed", f"P(Safe)={p_safe:.2f}")
-            )
-            return HookDecision.allow()
-
-        @agent.on(post_tool_call)
-        async def _subagent_post_tool(ctx: ToolCallContext) -> None:
-            if self.hooks_runner is not None and hasattr(self.hooks_runner, "run_post_tool"):
-                await self.hooks_runner.run_post_tool(ctx.name, ctx.args, ctx.output, ctx.error)
-
-        return agent
+        return Agent(config)
 
     async def _run_plain_completion_fallback(
         self, task: SubagentTask, coord_abort: asyncio.Event
@@ -676,12 +600,21 @@ class SubagentManager:
                 f"Task: {task.prompt}\n\n"
                 f"{task.result_text}"
             )
-            if hasattr(session, "agent") and hasattr(session.agent, "get_history") and hasattr(session.agent, "set_history"):
+            target = getattr(session, "active_target", "9002")
+            user_entry = {"role": "user", "target": target, "content": block}
+            ack_entry = {
+                "role": "assistant",
+                "target": target,
+                "content": f"[SYSTEM: Acknowledged Subagent #{task.task_id} findings. Ready to apply insights.]",
+            }
+            if isinstance(getattr(session, "history", None), list):
+                session.history.extend([user_entry, ack_entry])
+                if hasattr(session, "_invalidate_local_agent"):
+                    session._invalidate_local_agent()
+            elif hasattr(session, "agent") and hasattr(session.agent, "get_history") and hasattr(session.agent, "set_history"):
                 history = session.agent.get_history() or []
-                history.append({"role": "user", "content": block})
+                history.extend([user_entry, ack_entry])
                 session.agent.set_history(history)
-            elif hasattr(session, "history"):
-                session.history.append({"role": "user", "target": "9002", "content": block})
 
             task.injected = True
             injected_ids.append(task.task_id)
@@ -928,7 +861,7 @@ class SubagentManager:
             "3. Conclude with a dense, structured summary and preserve any names and numbers from the task."
         )
         payload = {
-            "model": ep.get("filename") or "granite-4.2-8b",
+            "model": ep.get("filename") or COMPACTOR_MODEL_FILE,
             "messages": [
                 {"role": "system", "content": instructions},
                 {"role": "user", "content": task.description},
@@ -1003,7 +936,7 @@ class SubagentManager:
                 user_msg = f"Analyze build/test execution for `{shell_cmd}` (exit code {return_code}). Output summary and diagnostics."
 
                 payload = {
-                    "model": ep9002.get("filename") or "granite-4.2-8b",
+                    "model": ep9002.get("filename") or COMPACTOR_MODEL_FILE,
                     "messages": [
                         {"role": "system", "content": subagent_instructions},
                         {"role": "user", "content": user_msg},

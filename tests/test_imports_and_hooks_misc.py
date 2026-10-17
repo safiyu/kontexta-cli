@@ -6,16 +6,22 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-ORDERS = ["myagy", "myagy.agents", "myagy.core", "myagy.core.coordinator", "myagy.agents.subagent", "myagy.terminal", "myagy.core.session", "myagy.terminal.cli", "myagy.agents.brainstorm", "myagy.agents.compactor", "myagy.context", "myagy.tools", "myagy.context.hooks_loader", "myagy.context.kontexta"]
+BOOT = (
+    "import sys, importlib.util\n"
+    f"spec = importlib.util.spec_from_file_location('kontexta_cli', {os.path.join(ROOT, '__init__.py')!r}, submodule_search_locations=[{ROOT!r}])\n"
+    "mod = importlib.util.module_from_spec(spec); sys.modules['kontexta_cli'] = mod; spec.loader.exec_module(mod)\n"
+)
+
+ORDERS = ["kontexta_cli", "kontexta_cli.agents", "kontexta_cli.core", "kontexta_cli.core.coordinator", "kontexta_cli.agents.subagent", "kontexta_cli.terminal", "kontexta_cli.core.session", "kontexta_cli.terminal.cli", "kontexta_cli.agents.brainstorm", "kontexta_cli.agents.compactor", "kontexta_cli.context", "kontexta_cli.tools", "kontexta_cli.context.hooks_loader", "kontexta_cli.context.kontexta"]
 
 
 @pytest.mark.parametrize("first", ORDERS)
 def test_import_order_independent(first):
     code = (
         f"import sys; sys.path.insert(0, {os.path.join(ROOT, 'tests')!r}); import sdk_stub; sdk_stub.install()\n"
-        f"sys.path.insert(0, {os.path.dirname(ROOT)!r})\n"
+        + BOOT +
         f"import importlib; importlib.import_module({first!r})\n"
-        "from myagy import MultiGpuHybridSession; import myagy.core as c; assert c.MultiGpuHybridSession is MultiGpuHybridSession\n"
+        "from kontexta_cli import MultiGpuHybridSession; import kontexta_cli.core as c; assert c.MultiGpuHybridSession is MultiGpuHybridSession\n"
     )
     res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert res.returncode == 0, res.stderr
@@ -23,19 +29,19 @@ def test_import_order_independent(first):
 
 def test_core_leaf_modules_import_without_sdk():
     code = (
-        f"import sys; sys.path.insert(0, {os.path.dirname(ROOT)!r})\n"
-        "sys.modules['google'] = None\n"
-        "from myagy.core.coordinator import CudaCoordinator\n"
-        "from myagy.core.laya import LayaDecisionEngine\n"
-        "from myagy.core.checkpoints import Checkpoints\n"
-        "from myagy.core.prefs import load_prefs\n"
+        "import sys; sys.modules['google'] = None\n"
+        + BOOT +
+        "from kontexta_cli.core.coordinator import CudaCoordinator\n"
+        "from kontexta_cli.core.laya import LayaDecisionEngine\n"
+        "from kontexta_cli.core.checkpoints import Checkpoints\n"
+        "from kontexta_cli.core.prefs import load_prefs\n"
     )
     res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert res.returncode == 0, res.stderr
 
 
 def test_hook_returning_non_dict_json_is_tolerated(tmp_path):
-    from myagy.context.hooks_loader import ExternalHooksManager
+    from kontexta_cli.context.hooks_loader import ExternalHooksManager
     res = ExternalHooksManager.execute_command_hook("echo '[1,2]'", str(tmp_path), {})
     assert isinstance(res, dict) and res["raw_output"] == "[1,2]"
 

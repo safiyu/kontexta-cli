@@ -3,7 +3,8 @@ import os
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
-from myagy.terminal import cli
+from kontexta_cli.config import service_url
+from kontexta_cli.terminal import cli
 
 
 def test_hermes_slash_command_registered():
@@ -92,13 +93,15 @@ def test_hermes_prompt_execution(monkeypatch):
     fake_proc.wait = AsyncMock(return_value=0)
 
     async def mock_subprocess_exec(*args, **kwargs):
-        assert kwargs["env"]["OPENAI_BASE_URL"] == "http://localhost:9000/v1"
+        assert kwargs["env"]["OPENAI_BASE_URL"] == service_url(9000, "/v1")
         assert kwargs["env"]["OPENAI_API_KEY"] == "local"
         assert "chat" in args
         assert "-q" in args
         return fake_proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_subprocess_exec)
+    # Hermetic: the command bails out early when no hermes binary exists on the host
+    monkeypatch.setenv("HERMES_BIN", __file__)
 
     session = FakeSession()
     ctx = MagicMock()

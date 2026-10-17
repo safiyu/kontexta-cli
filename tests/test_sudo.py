@@ -11,8 +11,8 @@ try:
 except ImportError:
     pytest = None
 
-from myagy.core.sudo_manager import SudoManager
-from myagy.core.session import MultiGpuHybridSession
+from kontexta_cli.core.sudo_manager import SudoManager
+from kontexta_cli.core.session import MultiGpuHybridSession
 
 
 def test_is_sudo_command():
@@ -107,7 +107,7 @@ def test_session_permission_handler_sudo_unauthenticated(session, monkeypatch):
     args = {"CommandLine": "sudo apt-get update"}
 
     # User approves and enters valid password
-    monkeypatch.setattr("myagy.core.session.prompt_input", lambda p="": "y")
+    monkeypatch.setattr("kontexta_cli.core.session.prompt_input", lambda p="": "y")
     monkeypatch.setattr(SudoManager, "prompt_password_entry", lambda reason=None: True)
 
     allowed = session.permission_prompt_handler(tool, args)
@@ -125,7 +125,7 @@ def test_session_permission_handler_sudo_cached(session, monkeypatch):
     args = {"CommandLine": "sudo systemctl restart"}
 
     # User confirms execution with Enter or 'y'
-    monkeypatch.setattr("myagy.core.session.prompt_input", lambda p="": "y")
+    monkeypatch.setattr("kontexta_cli.core.session.prompt_input", lambda p="": "y")
 
     allowed = session.permission_prompt_handler(tool, args)
     assert allowed is True

@@ -1,7 +1,7 @@
 import pytest
 
-from myagy.terminal import ui
-from myagy.terminal.ui import UI
+from kontexta_cli.terminal import ui
+from kontexta_cli.terminal.ui import UI
 
 ATTRS = ["ROCM", "CUDA", "CLOUD", "LAYA", "AMBER", "GREEN", "RED", "CYAN",
          "ROCM_BOLD", "CUDA_BOLD", "CLOUD_BOLD", "LAYA_BOLD", "AMBER_BOLD", "GREEN_BOLD", "RED_BOLD", "CYAN_BOLD",
@@ -61,13 +61,13 @@ def test_no_color_records_name_but_clears_attributes(monkeypatch):
 
 
 def test_detect_theme_env(monkeypatch):
-    monkeypatch.setenv("MYAGY_THEME", "Light")
+    monkeypatch.setenv("KXTC_THEME", "Light")
     assert UI.detect_theme() == "light"
-    monkeypatch.setenv("MYAGY_THEME", "mono")
+    monkeypatch.setenv("KXTC_THEME", "mono")
     assert UI.detect_theme() == "mono"
-    monkeypatch.setenv("MYAGY_THEME", "neon")
+    monkeypatch.setenv("KXTC_THEME", "neon")
     assert UI.detect_theme() == "dark"
-    monkeypatch.delenv("MYAGY_THEME")
+    monkeypatch.delenv("KXTC_THEME")
     assert UI.detect_theme() == "dark"
 
 

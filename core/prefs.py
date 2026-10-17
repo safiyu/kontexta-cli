@@ -1,4 +1,4 @@
-"""Persisted user preferences (~/.myagy/config.json)."""
+"""Persisted user preferences (~/.kontexta-cli/config.json)."""
 
 import os
 import json

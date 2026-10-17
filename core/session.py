@@ -120,6 +120,10 @@ from ..config import (
     DEFAULT_LAYA_ENDPOINT,
     FAST_GIT_MODEL,
     DENSE_CODE_MODEL,
+    FAST_GIT_FAMILY,
+    DENSE_CODE_FAMILY,
+    COMPACTOR_MODEL_ID,
+    service_url,
 )
 from ..terminal.ui import UI, RICH_AVAILABLE, console, StreamRenderer
 from ..terminal.esc_listener import prompt_input
@@ -303,7 +307,7 @@ class MultiGpuHybridSession:
         self.enable_hooks: bool = True
         self.render_markdown: bool = True
         try:
-            self.cloud_idle_timeout: int = int(os.environ.get("MYAGY_CLOUD_IDLE_TIMEOUT", DEFAULT_CLOUD_IDLE_TIMEOUT))
+            self.cloud_idle_timeout: int = int(os.environ.get("KXTC_CLOUD_IDLE_TIMEOUT", DEFAULT_CLOUD_IDLE_TIMEOUT))
         except (ValueError, TypeError):
             self.cloud_idle_timeout = DEFAULT_CLOUD_IDLE_TIMEOUT
         self.last_answer: str = ""
@@ -381,14 +385,14 @@ class MultiGpuHybridSession:
         self.subagent_mgr = SubagentManager(
             cuda_coord=self.cuda_coord,
             laya=self.laya,
-            hooks_runner=getattr(self, "external_hooks", None),
+            hooks_provider=lambda: ExternalHooksManager.build_lifecycle_hooks(self, ".") if self.enable_hooks else [],
             mcp_tools=getattr(self, "_mcp_servers", []),
             system_prompt_provider=lambda: self.build_system_context("9002"),
-            model_id=self.endpoints.get("9002", {}).get("model") or self.endpoints.get("9001", {}).get("model") or "granite42_8b",
+            model_id=self.endpoints.get("9002", {}).get("model") or self.endpoints.get("9001", {}).get("model") or COMPACTOR_MODEL_ID,
         )
         self.active_models: Dict[str, str] = {
-            "rocm": self.endpoints.get("9000", {}).get("model", "qwen2.5-35b"),
-            "cuda": self.endpoints.get("9002", {}).get("model") or self.endpoints.get("9001", {}).get("model", "granite42_8b"),
+            "rocm": self.endpoints.get("9000", {}).get("model", DENSE_CODE_MODEL),
+            "cuda": self.endpoints.get("9002", {}).get("model") or self.endpoints.get("9001", {}).get("model", COMPACTOR_MODEL_ID),
             "cloud": self.cloud_model,
         }
         self.auto_route: bool = (self.active_target == "auto")
@@ -687,6 +691,39 @@ class MultiGpuHybridSession:
 
     def trigger_background_synthesis(self):
         return ContextCurator.trigger_background_synthesis(self)
+
+    def _schedule_epoch_compaction(self) -> None:
+        """Fires Tier 1/2 epoch compaction in the background once enough turns have accumulated."""
+        compactor = getattr(self, "compactor", None)
+        if compactor is None or not self.continuous_curation:
+            return
+        if not CudaCoordinator.can_compact():
+            return
+        task = getattr(self, "_epoch_task", None)
+        if task is not None and not task.done():
+            return
+        if len(self.history) < (compactor.epoch_chunk_turns + compactor.keep_verbatim_turns) * 2:
+            return
+
+        if self.endpoints.get("9002", {}).get("status") != "online":
+            return
+
+        async def _run() -> None:
+            snapshot = list(self.history)
+            try:
+                async with httpx.AsyncClient(base_url=CUDA_BASE_URL.removesuffix("/v1"), timeout=60.0) as client:
+                    compactor.http = client
+                    try:
+                        trimmed = await compactor.maybe_compact_epoch(snapshot)
+                    finally:
+                        compactor.http = None
+            except Exception:
+                return
+            # Apply only if an epoch was frozen and history was not edited meanwhile
+            if len(trimmed) < len(snapshot) and self.history[:len(snapshot)] == snapshot:
+                self.history[:] = trimmed + self.history[len(snapshot):]
+
+        self._epoch_task = asyncio.create_task(_run())
 
     def summarize_history_sync(self, turns: List[Dict[str, str]]) -> str:
         return ContextCurator.summarize_history_sync(self, turns)
@@ -1878,7 +1915,7 @@ class MultiGpuHybridSession:
 
         idle_timeout_secs = getattr(self, "cloud_idle_timeout", DEFAULT_CLOUD_IDLE_TIMEOUT)
         try:
-            env_val = os.environ.get("MYAGY_CLOUD_IDLE_TIMEOUT")
+            env_val = os.environ.get("KXTC_CLOUD_IDLE_TIMEOUT")
             if env_val is not None:
                 idle_timeout_secs = int(env_val)
         except (ValueError, TypeError):
@@ -2089,6 +2126,7 @@ class MultiGpuHybridSession:
             conf = round(1.0 - route_res.complexity_score, 3)
         else:
             routed_id, conf = route_res
+        routed_id = self.resolve_target_alias(routed_id)
         if routed_id == "cloud":
             short, routed_name = "Cloud", f"Google Cloud ({self.cloud_model})"
         elif routed_id in self.endpoints:
@@ -2107,13 +2145,13 @@ class MultiGpuHybridSession:
         current = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
         is_git, git_conf = self.laya.is_git_action(prompt)
         if is_git:
-            if "gemma" in current:
+            if FAST_GIT_FAMILY in current:
                 return
             say.step("git action: swapping :9000 to Gemma 4 A4B")
             say.detail(f"Laya Auto-Shift: git action detected (P={git_conf*100:.1f}%), hot-swapping for rapid execution")
             wanted = self.fast_git_model
         else:
-            if "qwen" in current:
+            if DENSE_CODE_FAMILY in current:
                 return
             catalog = await asyncio.to_thread(self.get_catalog)
             if not any(self.dense_code_model.lower() in m.get("id", "").lower() for m in catalog):
@@ -2160,6 +2198,7 @@ class MultiGpuHybridSession:
         return text, tokens, tps, ttft_ms, total, escalate_to
 
     async def _chat_impl(self, prompt: str, force_target: Optional[str] = None) -> str:
+        self._last_usage_metadata = None  # never reuse a previous turn's token usage
         requested = self.resolve_target_alias(force_target or self.active_target)
         target = requested if requested == "auto" else self._validate_target(requested)
 
@@ -2400,6 +2439,7 @@ class MultiGpuHybridSession:
                 say.step(f"auto-compacted {removed} old turns into a summary (threshold {self.autocompact_threshold})")
         else:
             self.trigger_background_synthesis()
+            self._schedule_epoch_compaction()
 
         approx_tokens = token_count if token_count else len(response_text.split())
         if response_text:
@@ -2877,7 +2917,7 @@ class MultiGpuHybridSession:
     @staticmethod
     def _port_healthy(port: int) -> bool:
         try:
-            req = urllib.request.Request(f"http://localhost:{port}/health", headers={"User-Agent": "Antigravity/1.0"})
+            req = urllib.request.Request(service_url(port, "/health"), headers={"User-Agent": "Antigravity/1.0"})
             with urllib.request.urlopen(req, timeout=0.8) as resp:
                 return resp.status == 200
         except Exception:
@@ -3156,7 +3196,7 @@ class MultiGpuHybridSession:
             memory = f"{UI.GRAY}on, inactive here{UI.RST}"
 
         g, r = UI.GRAY, UI.RST
-        say.plain(say.rule_line("myagy", UI.DARK_GRAY))
+        say.plain(say.rule_line("kontexta-cli", UI.DARK_GRAY))
         say.plain("  " + "   ".join(dots))
         say.plain(f"  {g}target{r} {UI.target_color(self.active_target)}{label}{r} {g}{model}{r}  {g}·{r}  {g}permissions{r} {perm_color}{perm}{r}  {g}·{r}  {g}theme{r} {UI.theme_name}")
         say.plain(f"  {g}repo{r} {repo}  {g}·{r}  {g}memory{r} {memory}")

@@ -13,7 +13,16 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 
-from ..config import OAUTH_TOKEN_PATH
+from ..config import (
+    OAUTH_TOKEN_PATH,
+    CUDA_BASE_URL,
+    ROCM_BASE_URL,
+    PORT_CUDA,
+    COMPACTOR_MODEL_ID,
+    COMPACTOR_MODEL_FILE,
+    DEFAULT_CLOUD_MODEL,
+    service_url,
+)
 from ..terminal.ui import UI
 from ..terminal import say
 from ..core.llamashift import wake_compactor, ctx_size_for_port
@@ -171,7 +180,7 @@ class ContextCurator:
         if tgt in ("9000", "9002"):
             port = session.endpoints[tgt]["port"]
             try:
-                req = urllib.request.Request(f"http://localhost:{port}/slots", headers={"User-Agent": "Antigravity/1.0"})
+                req = urllib.request.Request(service_url(port, "/slots"), headers={"User-Agent": "Antigravity/1.0"})
                 with urllib.request.urlopen(req, timeout=0.3) as resp:
                     slots_data = json.loads(resp.read().decode("utf-8"))
                     if isinstance(slots_data, list) and len(slots_data) > 0:
@@ -290,7 +299,7 @@ class ContextCurator:
             return None
         ep9002 = session.endpoints.get("9002", {})
         if ep9002.get("status") != "online" and not _SKIP_CUDA_WAKE.get():
-            woke = wake_compactor(9002)
+            woke = wake_compactor(PORT_CUDA)
             _note_wake_warnings(woke["warnings"])
             if woke["ok"]:
                 session.refresh_endpoints()
@@ -312,9 +321,9 @@ class ContextCurator:
             "Be factual, concise, and preserve filenames, functions, and error messages."
         )
 
-        model_name = ep9002.get("filename") or "granite-4.2-8b"
+        model_name = ep9002.get("filename") or COMPACTOR_MODEL_FILE
         return _query_local_endpoint(
-            "http://127.0.0.1:9002/v1/chat/completions",
+            f"{CUDA_BASE_URL}/chat/completions",
             model_name=model_name,
             system_instruction=system_instruction,
             conversation_log=conversation_log,
@@ -347,7 +356,7 @@ class ContextCurator:
 
         model_name = ep9000.get("filename") or "rocm-model"
         return _query_local_endpoint(
-            "http://127.0.0.1:9000/v1/chat/completions",
+            f"{ROCM_BASE_URL}/chat/completions",
             model_name=model_name,
             system_instruction=system_instruction,
             conversation_log=conversation_log,
@@ -381,7 +390,7 @@ class ContextCurator:
 
         cmd = [
             "agy",
-            "--model", getattr(session, "cloud_model", "gemini-3.8-flash-high"),
+            "--model", getattr(session, "cloud_model", DEFAULT_CLOUD_MODEL),
             "--print-timeout", "20",
             "--print", prompt,
         ]
@@ -558,7 +567,7 @@ class ContextCurator:
             try:
                 syn = cls.synthesize_context_cloud_sync(session, turns)
                 if syn and syn.strip():
-                    c_model = getattr(session, "cloud_model", "gemini-3.8-flash-high")
+                    c_model = getattr(session, "cloud_model", DEFAULT_CLOUD_MODEL)
                     return syn.strip(), f"Google Cloud ({c_model}) via OAuth"
             except Exception:
                 pass
@@ -572,7 +581,7 @@ class ContextCurator:
         """Starts :9002 and refreshes endpoints on the event loop, so the synthesis thread never mutates session state."""
         if session.endpoints.get("9002", {}).get("status") == "online":
             return
-        woke = await asyncio.to_thread(wake_compactor, 9002)
+        woke = await asyncio.to_thread(wake_compactor, PORT_CUDA)
         _note_wake_warnings(woke["warnings"])
         if woke["ok"]:
             await asyncio.to_thread(session.refresh_endpoints)
@@ -912,7 +921,7 @@ class HippocampusCompactor:
                         "POST",
                         "/v1/chat/completions",
                         json={
-                            "model": "granite42_8b",
+                            "model": COMPACTOR_MODEL_ID,
                             "messages": [
                                 {
                                     "role": "system",
@@ -1020,7 +1029,7 @@ class HippocampusCompactor:
                             "POST",
                             "/v1/chat/completions",
                             json={
-                                "model": "granite42_8b",
+                                "model": COMPACTOR_MODEL_ID,
                                 "messages": [{"role": "user", "content": prompt}],
                                 "stream": True,
                             },

@@ -1,7 +1,7 @@
 import asyncio
 import pytest
 
-from myagy.terminal import cli
+from kontexta_cli.terminal import cli
 
 
 def test_slash_command_returns_immediately(monkeypatch):
@@ -38,7 +38,7 @@ def test_eof_returns_empty(monkeypatch):
 def test_completer_suggests_commands_and_targets(monkeypatch):
     pytest.importorskip("prompt_toolkit")
     monkeypatch.setattr(cli, "_pt_session", None)
-    monkeypatch.setattr(cli, "HISTORY_PATH", "/tmp/myagy-test-history")
+    monkeypatch.setattr(cli, "HISTORY_PATH", "/tmp/kontexta-cli-test-history")
     cli.set_completion_targets(["gemma4"])
     pt = cli._get_pt_session()
     assert pt is not None

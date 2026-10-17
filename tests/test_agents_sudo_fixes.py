@@ -8,15 +8,15 @@ from unittest.mock import patch
 
 import pytest
 
-from myagy.agents import compactor, subagent as sa
-from myagy.agents.brainstorm import BrainstormWorkflow
-from myagy.agents.compactor import ContextCurator
-from myagy.agents.subagent import SubagentManager, SubagentTask
-from myagy.core import shellparse
-from myagy.core.checkpoints import Checkpoints
-from myagy.core.coordinator import CudaCoordinator
-from myagy.core.laya import LayaDecisionEngine
-from myagy.core.sudo_manager import SudoManager
+from kontexta_cli.agents import compactor, subagent as sa
+from kontexta_cli.agents.brainstorm import BrainstormWorkflow
+from kontexta_cli.agents.compactor import ContextCurator
+from kontexta_cli.agents.subagent import SubagentManager, SubagentTask
+from kontexta_cli.core import shellparse
+from kontexta_cli.core.checkpoints import Checkpoints
+from kontexta_cli.core.coordinator import CudaCoordinator
+from kontexta_cli.core.laya import LayaDecisionEngine
+from kontexta_cli.core.sudo_manager import SudoManager
 
 BYPASSES = [
     "echo hi\nsudo rm -rf /",
@@ -86,7 +86,7 @@ def test_prompt_password_falls_back_to_terminal_prompt_input(monkeypatch):
         raise OSError("no tty")
 
     monkeypatch.setattr("getpass.getpass", broken_getpass)
-    monkeypatch.setattr("myagy.terminal.esc_listener.prompt_input", lambda p="": "typed-pw")
+    monkeypatch.setattr("kontexta_cli.terminal.esc_listener.prompt_input", lambda p="": "typed-pw")
     seen = {}
     monkeypatch.setattr(SudoManager, "verify_and_authenticate", classmethod(lambda cls, pw: seen.setdefault("pw", pw) and (True, "ok")))
     assert SudoManager.prompt_password_entry() is True

@@ -15,7 +15,7 @@ if os.environ.get("AGY_MODE") == "hang":
     time.sleep(60)
 if os.environ.get("AGY_MODE") == "tool_long":
     print(json.dumps({"event": "step_update", "step_update": {"step_type": "tool", "state": "ACTIVE", "tool_name": "run_command", "tool_info": {"parameters": {"CommandLine": "vitest"}}}}), flush=True)
-    time.sleep(0.3)
+    time.sleep(float(os.environ.get("AGY_TOOL_SECS", "0.3")))
     print(json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "Tests passed"}}), flush=True)
     print(json.dumps({"event": "result"}), flush=True)
     sys.exit(0)
@@ -108,8 +108,8 @@ async def _tokens(*parts):
 @pytest.mark.parametrize("markdown", [True, False])
 def test_consume_token_stream(session, monkeypatch, markdown, capsys):
     rich_console = pytest.importorskip("rich.console")
-    from myagy.terminal import ui
-    from myagy.core import session as session_mod
+    from kontexta_cli.terminal import ui
+    from kontexta_cli.core import session as session_mod
     buf = io.StringIO()
     cap = rich_console.Console(file=buf, force_terminal=False, width=60)
     monkeypatch.setattr(ui, "console", cap)
@@ -131,8 +131,8 @@ def test_consume_token_stream_json_mode_prints_nothing(session, capsys):
 
 def test_consume_token_stream_finalizes_on_cancel(session, monkeypatch):
     rich_console = pytest.importorskip("rich.console")
-    from myagy.terminal import ui
-    from myagy.core import session as session_mod
+    from kontexta_cli.terminal import ui
+    from kontexta_cli.core import session as session_mod
     cap = rich_console.Console(file=io.StringIO(), force_terminal=False, width=60)
     monkeypatch.setattr(ui, "console", cap)
     monkeypatch.setattr(session_mod, "console", cap)
@@ -154,9 +154,10 @@ def test_consume_token_stream_finalizes_on_cancel(session, monkeypatch):
 
 def test_cloud_tool_execution_does_not_trigger_idle_timeout(session, fake_agy, monkeypatch):
     monkeypatch.setenv("AGY_MODE", "tool_long")
-    session.cloud_idle_timeout = 0.1
-    # Tool sleeps 0.3s, which is longer than idle_timeout (0.1s).
-    # Since tool is ACTIVE, it should not trigger idle timeout.
+    monkeypatch.setenv("AGY_TOOL_SECS", "1.6")
+    # Idle timeout leaves headroom for interpreter startup of the fake agent; the tool
+    # then runs longer than it, and being ACTIVE must not trigger the idle timeout.
+    session.cloud_idle_timeout = 1.0
     text = asyncio.run(session.chat_cloud_oauth("run vitest", with_project_context=False))
     assert text == "Tests passed"
 

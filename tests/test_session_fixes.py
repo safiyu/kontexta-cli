@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from myagy.core import session as session_mod
-from myagy.core.prefs import load_prefs
+from kontexta_cli.core import session as session_mod
+from kontexta_cli.core.prefs import load_prefs
 
 
 class FakeStream:

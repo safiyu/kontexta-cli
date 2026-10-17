@@ -5,7 +5,7 @@ import stat
 
 import pytest
 
-from myagy.context.hooks_loader import ExternalHooksManager
+from kontexta_cli.context.hooks_loader import ExternalHooksManager
 
 
 def _write_hook(repo, event, script_body):
@@ -146,7 +146,7 @@ def test_cloud_project_context_respects_toggles(session, git_repo):
 
 
 def test_list_sessions_newest_first(session, tmp_path, monkeypatch):
-    import myagy.core.session as ss
+    import kontexta_cli.core.session as ss
     monkeypatch.setattr(ss, "SESSIONS_DIR", str(tmp_path))
     for name, ts in (("session_zzz.json", "2020-01-01T00:00:00"), ("latest_session.json", "2026-10-05T10:00:00")):
         (tmp_path / name).write_text(json.dumps({"saved_at": ts, "history": []}))

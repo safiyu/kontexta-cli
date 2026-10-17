@@ -6,8 +6,8 @@ import pytest
 
 rich_console = pytest.importorskip("rich.console")
 
-from myagy.terminal import cli, ui, say
-from myagy.terminal.esc_listener import EscListener
+from kontexta_cli.terminal import cli, ui, say
+from kontexta_cli.terminal.esc_listener import EscListener
 
 
 @pytest.fixture(autouse=True)

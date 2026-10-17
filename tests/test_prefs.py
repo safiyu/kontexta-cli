@@ -1,6 +1,6 @@
 import json
 
-from myagy.core.prefs import PREF_DEFAULTS, load_prefs, save_prefs, reset_prefs
+from kontexta_cli.core.prefs import PREF_DEFAULTS, load_prefs, save_prefs, reset_prefs
 
 
 def test_round_trip(tmp_path):

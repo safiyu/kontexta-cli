@@ -8,7 +8,7 @@ import pytest
 
 pty = pytest.importorskip("pty")
 
-from myagy.terminal.esc_listener import EscListener  # noqa: E402
+from kontexta_cli.terminal.esc_listener import EscListener  # noqa: E402
 
 CHILD = r'''
 import sys, time, importlib.util
@@ -91,7 +91,7 @@ def test_arrow_key_sequences_do_not_interrupt(tmp_path):
 
 
 def test_prompt_input_strips_ansi_on_non_tty(monkeypatch, capsys):
-    from myagy.terminal.esc_listener import prompt_input
+    from kontexta_cli.terminal.esc_listener import prompt_input
     monkeypatch.setattr("sys.stdout.isatty", lambda: False)
     monkeypatch.setattr("builtins.input", lambda: "ok")
     res = prompt_input("\033[1;38;5;214mAuthorize?\033[0m ")
@@ -103,7 +103,7 @@ def test_prompt_input_strips_ansi_on_non_tty(monkeypatch, capsys):
 
 
 def test_prompt_input_preserves_ansi_on_tty(monkeypatch, capsys):
-    from myagy.terminal.esc_listener import prompt_input
+    from kontexta_cli.terminal.esc_listener import prompt_input
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda: "yes")
     res = prompt_input("\033[1;38;5;214mAuthorize?\033[0m ")
@@ -115,7 +115,7 @@ def test_prompt_input_preserves_ansi_on_tty(monkeypatch, capsys):
 # --- queue-ahead typing (buffer bytes typed during a turn) ---
 
 def test_apply_buffer_byte_appends_printable():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray()
     submit = _apply_buffer_byte(buf, False, ord('a'))
     assert buf == bytearray(b'a')
@@ -123,7 +123,7 @@ def test_apply_buffer_byte_appends_printable():
 
 
 def test_apply_buffer_byte_backspace_del_pops():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray(b'abc')
     submit = _apply_buffer_byte(buf, False, 0x7F)
     assert buf == bytearray(b'ab')
@@ -131,14 +131,14 @@ def test_apply_buffer_byte_backspace_del_pops():
 
 
 def test_apply_buffer_byte_backspace_bs_pops():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray(b'abc')
     _apply_buffer_byte(buf, False, 0x08)
     assert buf == bytearray(b'ab')
 
 
 def test_apply_buffer_byte_backspace_on_empty_is_noop():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray()
     submit = _apply_buffer_byte(buf, False, 0x7F)
     assert buf == bytearray()
@@ -146,14 +146,14 @@ def test_apply_buffer_byte_backspace_on_empty_is_noop():
 
 
 def test_apply_buffer_byte_ctrl_u_clears():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray(b'hello')
     _apply_buffer_byte(buf, False, 0x15)
     assert buf == bytearray()
 
 
 def test_apply_buffer_byte_enter_lf_sets_submit():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray(b'hi')
     submit = _apply_buffer_byte(buf, False, 0x0A)
     assert buf == bytearray(b'hi')  # buffer content preserved
@@ -161,14 +161,14 @@ def test_apply_buffer_byte_enter_lf_sets_submit():
 
 
 def test_apply_buffer_byte_enter_cr_sets_submit():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray()
     submit = _apply_buffer_byte(buf, False, 0x0D)
     assert submit is True
 
 
 def test_apply_buffer_byte_ignores_input_after_submit():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray(b'queued')
     submit = _apply_buffer_byte(buf, True, ord('x'))
     assert buf == bytearray(b'queued')  # unchanged
@@ -176,7 +176,7 @@ def test_apply_buffer_byte_ignores_input_after_submit():
 
 
 def test_apply_buffer_byte_appends_utf8_multibyte():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray()
     # é = 0xC3 0xA9
     _apply_buffer_byte(buf, False, 0xC3)
@@ -185,7 +185,7 @@ def test_apply_buffer_byte_appends_utf8_multibyte():
 
 
 def test_apply_buffer_byte_ignores_other_control_chars():
-    from myagy.terminal.esc_listener import _apply_buffer_byte
+    from kontexta_cli.terminal.esc_listener import _apply_buffer_byte
     buf = bytearray()
     _apply_buffer_byte(buf, False, 0x09)  # Tab
     _apply_buffer_byte(buf, False, 0x01)  # Ctrl-A

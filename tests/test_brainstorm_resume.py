@@ -5,9 +5,9 @@ import sys
 
 import pytest
 
-from myagy.agents import brainstorm as bs
-from myagy.agents.brainstorm import BrainstormWorkflow as B
-from myagy.terminal import say
+from kontexta_cli.agents import brainstorm as bs
+from kontexta_cli.agents.brainstorm import BrainstormWorkflow as B
+from kontexta_cli.terminal import say
 
 PLAN = "# Plan\n\n## Milestones\n\n1. add a\n2. add b\n   - detail line\n\n## Risks\n\n- none\n"
 
@@ -199,7 +199,7 @@ def test_outer_cancel_still_propagates(monkeypatch):
 
 
 def test_control_switches_model_before_next_milestone(monkeypatch):
-    from myagy.terminal import cli
+    from kontexta_cli.terminal import cli
 
     calls = []
 

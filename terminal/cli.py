@@ -16,7 +16,7 @@ import traceback
 from typing import Any, Optional, Dict, List
 
 # Suppress raw WARNING:root: noise from the google.antigravity library (e.g. "System step error");
-# myagy surfaces those errors via its own say.warn() / say.err() paths.
+# kontexta-cli surfaces those errors via its own say.warn() / say.err() paths.
 logging.getLogger().setLevel(logging.ERROR)
 
 from ..config import (
@@ -24,6 +24,8 @@ from ..config import (
     DEFAULT_CLOUD_MODEL,
     HISTORY_PATH,
     PORT_ROCM,
+    COMPACTOR_MODEL_FILE,
+    service_url,
     setup_antigravity_sdk,
 )
 from . import say
@@ -992,7 +994,7 @@ async def _cmd_prefs(session, arg, ctx):
         await session.reset_local_agent()
         say.ok("Preferences reset to defaults.")
     else:
-        say.card("Saved preferences (~/.myagy/config.json)", [(k, f"{UI.CYAN}{v}{UI.RST}") for k, v in session.preferences().items()])
+        say.card("Saved preferences (~/.kontexta-cli/config.json)", [(k, f"{UI.CYAN}{v}{UI.RST}") for k, v in session.preferences().items()])
         say.dim("Settings save automatically after each command. /prefs reset restores defaults.")
 
 
@@ -1259,7 +1261,7 @@ async def _cmd_compactor(session, arg, ctx):
         await asyncio.to_thread(session.refresh_endpoints)
         ep = session.endpoints.get("9002", {})
         st = f"{UI.GREEN}ONLINE{UI.RST}" if ep.get("status") == "online" else f"{UI.RED}OFFLINE{UI.RST}"
-        fn = ep.get("filename") or "granite-4.2-8b-Q4_K_M.gguf"
+        fn = ep.get("filename") or COMPACTOR_MODEL_FILE
         say.plain(f"{UI.WHITE}NVIDIA Compactor (RTX 4060 :9002){UI.RST}: {st} ({fn})")
         say.dim("Controls: /compactor start | /compactor status")
 
@@ -1283,7 +1285,12 @@ def handle_slash_command(cmd: str, session: Any) -> bool:
         return True
 
     if cmd.startswith("/build"):
-        custom_cmd = cmd.removeprefix("/build").strip() or "python3 -m pytest -q"
+        from ..agents.brainstorm import BrainstormWorkflow
+        custom_cmd = (
+            cmd.removeprefix("/build").strip()
+            or BrainstormWorkflow._detect_test_command(".")
+            or "python3 -m pytest -q"
+        )
         task = mgr.spawn_build(custom_cmd)
         console.print(
             f"[bold green]🔨 Enqueued Build & Test Subagent #{task.task_id} on CUDA:9002[/bold green] "
@@ -1443,6 +1450,22 @@ async def _cmd_fetch(session, arg, ctx):
         say.plain(content)
 
 
+class _ProcHandle:
+    """Gives a subprocess the done()/cancel() surface the Ctrl-C handler expects of ctx.task."""
+
+    def __init__(self, proc):
+        self.proc = proc
+
+    def done(self) -> bool:
+        return self.proc.returncode is not None
+
+    def cancel(self) -> None:
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+
+
 @command("/hermes", group="Agents", help="Run Hermes Agent strictly targeting AMD ROCm (:9000)")
 async def _cmd_hermes(session, arg, ctx):
     hermes_bin = os.environ.get("HERMES_BIN") or shutil.which("hermes") or os.path.expanduser("~/.local/bin/hermes")
@@ -1453,7 +1476,7 @@ async def _cmd_hermes(session, arg, ctx):
     await asyncio.to_thread(session.refresh_endpoints)
     ep = session.endpoints.get("9000", {})
     port = ep.get("port", PORT_ROCM)
-    rocm_url = f"http://localhost:{port}/v1"
+    rocm_url = service_url(port, "/v1")
     is_online = (ep.get("status") == "online")
     model_name = ep.get("name_friendly") or ep.get("filename") or "ROCm Model"
 
@@ -1493,6 +1516,7 @@ async def _cmd_hermes(session, arg, ctx):
     say.step(f"Hermes active on AMD ROCm (: {port})...")
 
     t0 = time.perf_counter()
+    stderr_task = None
     try:
         proc = await asyncio.create_subprocess_exec(
             hermes_bin,
@@ -1506,7 +1530,9 @@ async def _cmd_hermes(session, arg, ctx):
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        ctx.task = proc
+        ctx.task = _ProcHandle(proc)
+        # Drain stderr concurrently so a full pipe cannot stall stdout reads
+        stderr_task = asyncio.create_task(proc.stderr.read())
 
         response_lines = []
         accumulated_lines = []
@@ -1556,7 +1582,7 @@ async def _cmd_hermes(session, arg, ctx):
             if line.strip():
                 say.detail(f"  {line.strip()}")
 
-        stderr_bytes = await proc.stderr.read()
+        stderr_bytes = await stderr_task
         err_text = stderr_bytes.decode("utf-8", errors="replace").strip()
         await proc.wait()
         dur = time.perf_counter() - t0
@@ -1581,6 +1607,8 @@ async def _cmd_hermes(session, arg, ctx):
             proc.terminate()
         except Exception:
             pass
+        if stderr_task is not None:
+            stderr_task.cancel()
         say.warn("[^C] Hermes execution cancelled.")
     except Exception as e:
         say.err(f"Hermes execution error: {e}")
@@ -1597,7 +1625,8 @@ async def _cmd_diff(session, arg, ctx):
     if hasattr(session, "checkpointer") and session.checkpointer.checkpoints:
         diff_output = session.checkpointer.get_diff(nth_latest=n)
         if RICH_AVAILABLE and console:
-            console.print(diff_output)
+            from rich.text import Text
+            console.print(Text.from_ansi(diff_output))
         else:
             print(diff_output)
         return
@@ -1622,7 +1651,12 @@ async def _cmd_diff(session, arg, ctx):
 @command("/undo", group="Git", help="Revert the files changed by the last turn (asks first)")
 async def _cmd_undo(session, arg, ctx):
     if hasattr(session, "checkpointer") and session.checkpointer.checkpoints:
-        success, message, files = session.checkpointer.undo_latest()
+        chk = session.checkpointer.latest_checkpoint()
+        rows = [("M", f"{f}  ->  restore to pre-turn state") for f in chk.files_changed]
+        if not await _confirm(f"Revert turn {chk.turn_id}", rows, prompt="Revert these files?"):
+            say.warn("Undo cancelled.")
+            return
+        success, message, files = await asyncio.to_thread(session.checkpointer.undo_latest)
         if success:
             if RICH_AVAILABLE and console:
                 console.print(f"[green]✓ {message}[/green]")

@@ -2,8 +2,8 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-from myagy.core.coordinator import CudaCoordinator, PreemptedByHigherPriority
-from myagy.agents.compactor import (
+from kontexta_cli.core.coordinator import CudaCoordinator, PreemptedByHigherPriority
+from kontexta_cli.agents.compactor import (
     HippocampusCompactor,
     FrozenEpoch,
     EPOCH_LEDGER_SCHEMA,

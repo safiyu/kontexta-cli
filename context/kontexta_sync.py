@@ -79,7 +79,7 @@ def build_entry(kind: str, title: str, repo_root: str, *, commit: Optional[Dict[
                 outcome: str = "", spec_path: str = "", notes: Optional[List[str]] = None) -> Tuple[str, List[str]]:
     """Builds the journal text and tags for a brainstorm or commit event."""
     project = os.path.basename(os.path.abspath(repo_root))
-    lines = [f"[myagy {kind}] {title}", f"Project: {project}"]
+    lines = [f"[kontexta-cli {kind}] {title}", f"Project: {project}"]
     if outcome:
         lines.append(f"Outcome: {outcome}")
     if spec_path:
@@ -96,7 +96,7 @@ def build_entry(kind: str, title: str, repo_root: str, *, commit: Optional[Dict[
     text = redact("\n".join(lines))
     if len(text) > MAX_ENTRY_CHARS:
         text = text[:MAX_ENTRY_CHARS] + "\n[truncated]"
-    return text, ["myagy", kind, project]
+    return text, ["kontexta-cli", kind, project]
 
 
 async def push(text: str, tags: List[str], repo_root: str = ".", timeout: float = PUSH_TIMEOUT) -> bool:

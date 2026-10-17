@@ -9,7 +9,7 @@ import urllib.request
 import urllib.error
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
-from ..config import DEFAULT_MODEL_DIR, DEFAULT_LLAMASHIFT_URL
+from ..config import DEFAULT_MODEL_DIR, DEFAULT_LLAMASHIFT_URL, service_url
 
 _BASE_HEADERS = {"User-Agent": "Antigravity/1.0"}
 STATUS_TTL = 2.0
@@ -224,7 +224,7 @@ def detect_port_model(port: int | str, fallback_url: Optional[str] = None) -> Di
                 "gpu": m.get("gpu", ""),
             }
 
-    url = fallback_url or f"http://localhost:{port_int}/v1"
+    url = fallback_url or service_url(port_int, "/v1")
     model_id = query_endpoint_model(url, timeout=0.6)
     if model_id:
         fname = os.path.basename(model_id)
@@ -352,7 +352,7 @@ def model_is_running(model_id: str) -> Optional[bool]:
 
 def _port_ready(port: int | str) -> bool:
     try:
-        with urllib.request.urlopen(f"http://localhost:{int(port)}/health", timeout=1.0) as resp:
+        with urllib.request.urlopen(service_url(port, "/health"), timeout=1.0) as resp:
             return resp.status == 200
     except Exception:
         return False
@@ -406,7 +406,7 @@ def wake_compactor(port: int | str = 9002, timeout: float = 45.0,
     from ..config import COMPACTOR_MODEL_ID
     model_id = resolve_model_id(COMPACTOR_MODEL_ID)
     if model_id is None:
-        return {"ok": False, "reason": f"no LlamaShift profile matches '{COMPACTOR_MODEL_ID}' (set MYAGY_COMPACTOR_MODEL)", "log_tail": "", "elapsed": 0.0, "warnings": []}
+        return {"ok": False, "reason": f"no LlamaShift profile matches '{COMPACTOR_MODEL_ID}' (set KXTC_COMPACTOR_MODEL)", "log_tail": "", "elapsed": 0.0, "warnings": []}
     allowed, why = can_wake_secondary(model_id, port)
     if not allowed:
         return {"ok": False, "reason": why, "log_tail": "", "elapsed": 0.0, "warnings": []}
