@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kontexta-cli"
+version = "0.1.0"
+description = "Antigravity multi-GPU hybrid agent terminal (kontexta-cli, short: kxtc)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "google-antigravity>=0.1.21,<0.2",
+    "httpx>=0.27",
+    "rich>=13",
+    "prompt_toolkit>=3.0.40",
+    "tree-sitter-language-pack>=1.20.0",
+    "diskcache>=5.6.0",
+]
+
+[project.scripts]
+kontexta-cli = "kontexta_cli.antigravity_agent:main"
+kxtc = "kontexta_cli.antigravity_agent:main"
+
+[tool.setuptools]
+# The repository root is the package, so map it to the importable name
+package-dir = { "kontexta_cli" = "." }
+packages = [
+    "kontexta_cli",
+    "kontexta_cli.agents",
+    "kontexta_cli.context",
+    "kontexta_cli.core",
+    "kontexta_cli.terminal",
+    "kontexta_cli.tools",
+]

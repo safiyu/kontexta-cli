@@ -2,9 +2,9 @@ import asyncio
 import pytest
 from unittest.mock import MagicMock, AsyncMock
 
-from myagy.agents.subagent import SubagentManager, SubagentTask
-from myagy.core.session import MultiGpuHybridSession
-from myagy.terminal.cli import _cmd_9002
+from kontexta_cli.agents.subagent import SubagentManager, SubagentTask
+from kontexta_cli.core.session import MultiGpuHybridSession
+from kontexta_cli.terminal.cli import _cmd_9002
 
 
 def test_session_target_resolution_and_get_endpoint(session):

@@ -1,12 +1,12 @@
 import asyncio
 import pytest
-from myagy.core.coordinator import (
+from kontexta_cli.core.coordinator import (
     CudaCoordinator,
     CudaPriority,
     PreemptedByHigherPriority,
     CudaTelemetry,
 )
-from myagy.agents.compactor import HippocampusCompactor
+from kontexta_cli.agents.compactor import HippocampusCompactor
 
 
 def test_cuda_preemption_lifecycle():

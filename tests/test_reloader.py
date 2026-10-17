@@ -4,17 +4,17 @@ import time
 import pytest
 from pathlib import Path
 
-from myagy.core.reloader import (
+from kontexta_cli.core.reloader import (
     ReloadSnapshot,
     ReloadRequested,
     write_reload_snapshot,
     consume_reload_snapshot,
 )
-from myagy.core.session import MultiGpuHybridSession
+from kontexta_cli.core.session import MultiGpuHybridSession
 
 
 def test_write_and_consume_reload_snapshot(tmp_path, monkeypatch):
-    monkeypatch.setattr("myagy.core.reloader._get_shm_dir", lambda: tmp_path)
+    monkeypatch.setattr("kontexta_cli.core.reloader._get_shm_dir", lambda: tmp_path)
 
     snap = ReloadSnapshot(
         active_target="9000",

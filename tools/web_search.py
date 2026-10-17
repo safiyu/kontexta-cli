@@ -96,7 +96,7 @@ class WebSearchEngine:
     def search_github(cls, query: str, max_results: int = 5) -> List[Dict[str, str]]:
         """Searches GitHub public repositories for libraries, issues, and code."""
         url = f"https://api.github.com/search/repositories?q={urllib.parse.quote_plus(query)}&sort=stars&order=desc&per_page={max_results}"
-        req = urllib.request.Request(url, headers={"User-Agent": "myagy/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "kontexta-cli/1.0"})
         results = []
         try:
             with urllib.request.urlopen(req, timeout=6) as resp:

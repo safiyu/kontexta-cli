@@ -5,10 +5,10 @@ import pytest
 
 from google.antigravity import types as sdk_types
 
-from myagy.core import session as session_mod
-from myagy.core.session import _pt_style
-from myagy.terminal import say
-from myagy.terminal.ui import UI
+from kontexta_cli.core import session as session_mod
+from kontexta_cli.core.session import _pt_style
+from kontexta_cli.terminal import say
+from kontexta_cli.terminal.ui import UI
 
 
 @pytest.fixture(autouse=True)
@@ -180,7 +180,7 @@ def test_set_theme_persists_and_validates(session, monkeypatch):
 
 
 def test_theme_pref_is_applied_and_reset(session):
-    from myagy.core.prefs import PREF_DEFAULTS
+    from kontexta_cli.core.prefs import PREF_DEFAULTS
     assert PREF_DEFAULTS["theme"] == "dark"
     session.apply_preferences({"theme": "mono"})
     assert UI.theme_name == "mono" and session.preferences()["theme"] == "mono"
@@ -321,3 +321,11 @@ def test_status_and_stats_render_through_say(loud, capsys, monkeypatch):
     loud.print_stats()
     out = capsys.readouterr().out
     assert "Session usage" in out and "ROCm:9000" in out
+
+
+@pytest.mark.parametrize("routed,expected", [("rocm", "9000"), ("cuda", "9002"), ("cloud", "cloud")])
+def test_auto_route_resolves_backend_aliases(loud, routed, expected):
+    _route_with(loud, routed=routed)
+    result = asyncio.run(loud._route_auto("explain this"))
+    assert loud._validate_target(result) == result
+    assert result == loud.resolve_target_alias(expected)

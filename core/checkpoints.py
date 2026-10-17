@@ -25,7 +25,7 @@ class GitCheckpointer:
 
     def __init__(self, repo_root: Path | str | None = None) -> None:
         self.repo_root = Path(repo_root or os.getcwd()).resolve()
-        self._shadow_dir = Path(tempfile.mkdtemp(prefix="myagy_shadow_idx_"))
+        self._shadow_dir = Path(tempfile.mkdtemp(prefix="kontexta_cli_shadow_idx_"))
         self._shadow_index = self._shadow_dir / "index"
 
         self.checkpoints: list[CheckpointRecord] = []
@@ -105,8 +105,8 @@ class GitCheckpointer:
         )
         self.checkpoints.append(record)
 
-        # Anchor tree sha under refs/myagy/checkpoints/ to prevent git gc pruning
-        self._run_git(["update-ref", f"refs/myagy/checkpoints/turn_{self._turn_counter}", post_tree])
+        # Anchor tree sha under refs/kontexta-cli/checkpoints/ to prevent git gc pruning
+        self._run_git(["update-ref", f"refs/kontexta-cli/checkpoints/turn_{self._turn_counter}", post_tree])
 
         return len(files_changed)
 
@@ -114,59 +114,76 @@ class GitCheckpointer:
     # /diff [n] and /undo Implementation
     # -------------------------------------------------------------------------
 
-    def get_diff(self, nth_latest: int = 1) -> str:
-        """Implements `/diff [n]` — shows file changes from the nth latest turn."""
+    def get_diff(self, nth_latest: int = 1, plain: bool = False) -> str:
+        """
+        Implements `/diff [n]` for the nth latest turn.
+        plain=True returns the raw uncoloured diff ("" when none) for programmatic use.
+        """
         if not self.checkpoints:
-            return "No file modifications recorded in current session."
+            return "" if plain else "No file modifications recorded in current session."
 
         idx = max(0, len(self.checkpoints) - nth_latest)
         chk = self.checkpoints[idx]
 
-        stdout, _, code = self._run_git([
-            "diff", "--color=always", chk.parent_tree_sha, chk.tree_sha
-        ])
+        args = ["diff", chk.parent_tree_sha, chk.tree_sha]
+        if not plain:
+            args.insert(1, "--color=always")
+        stdout, _, code = self._run_git(args)
         if code != 0 or not stdout:
-            return f"No diff available for turn {chk.turn_id}."
+            return "" if plain else f"No diff available for turn {chk.turn_id}."
+        if plain:
+            return stdout
 
-        header = f"[dim]── Turn {chk.turn_id} Diff ({len(chk.files_changed)} files changed) ──[/dim]\n"
+        header = f"── Turn {chk.turn_id} Diff ({len(chk.files_changed)} files changed) ──\n"
         return header + stdout
+
+    def latest_checkpoint(self) -> CheckpointRecord | None:
+        return self.checkpoints[-1] if self.checkpoints else None
 
     def undo_latest(self) -> tuple[bool, str, list[str]]:
         """
-        Implements `/undo` — reverts working directory and index to the
-        parent tree of the latest turn checkpoint.
+        Implements `/undo` - reverts only the files changed by the latest turn
+        checkpoint to their parent-tree state.
         Returns: (success_bool, message, files_reverted)
         """
         if not self.checkpoints:
             return False, "Nothing to undo (no checkpoints in session stack).", []
 
-        chk = self.checkpoints.pop()
+        chk = self.checkpoints[-1]
 
-        # Revert working tree files to parent_tree_sha state
         # 1. Read parent tree into shadow index
         _, err, code = self._run_git(["read-tree", chk.parent_tree_sha])
         if code != 0:
             return False, f"Failed to read parent git tree: {err}", []
 
-        # 2. Checkout shadow index into working directory (-f overwrites modifications)
-        _, err, code = self._run_git(["checkout-index", "-a", "-f"])
-        if code != 0:
-            return False, f"Failed to checkout working tree: {err}", []
-
-        # 3. Clean up newly created files that did not exist in parent tree
+        # 2. Split the turn's changes into files to delete and files to restore
         stdout, _, _ = self._run_git(["diff-tree", "--no-commit-id", "--name-status", "-r", chk.parent_tree_sha, chk.tree_sha])
+        added: list[str] = []
+        restore: list[str] = []
         for line in stdout.splitlines():
             parts = line.strip().split("\t", 1)
-            if len(parts) == 2 and parts[0] == "A":
-                added_file = self.repo_root / parts[1]
-                if added_file.is_file():
-                    try:
-                        added_file.unlink()
-                    except OSError:
-                        pass
+            if len(parts) != 2:
+                continue
+            (added if parts[0] == "A" else restore).append(parts[1])
 
-        # 4. Clean up the git ref anchor
-        self._run_git(["update-ref", "-d", f"refs/myagy/checkpoints/turn_{chk.turn_id}"])
+        # 3. Restore only the turn's modified/deleted files from the shadow index
+        if restore:
+            _, err, code = self._run_git(["checkout-index", "-f", "--", *restore])
+            if code != 0:
+                return False, f"Failed to checkout working tree: {err}", []
+
+        # 4. Remove files that the turn created
+        for rel in added:
+            added_file = self.repo_root / rel
+            if added_file.is_file():
+                try:
+                    added_file.unlink()
+                except OSError:
+                    pass
+
+        # 5. Pop the record and clean up the git ref anchor only after success
+        self.checkpoints.pop()
+        self._run_git(["update-ref", "-d", f"refs/kontexta-cli/checkpoints/turn_{chk.turn_id}"])
 
         msg = f"Successfully reverted Turn {chk.turn_id} ({len(chk.files_changed)} files restored)."
         return True, msg, chk.files_changed
@@ -245,7 +262,7 @@ class Checkpoints:
     @classmethod
     def snapshot(cls, root: str) -> Optional[str]:
         """Returns a tree hash of the current working tree (tracked + untracked, not ignored)."""
-        tmpdir = tempfile.mkdtemp(prefix="myagy-idx-")
+        tmpdir = tempfile.mkdtemp(prefix="kontexta-cli-idx-")
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmpdir, "index"))
         try:
             excludes = [f":(exclude,literal){p}" for p in cls._oversized_untracked(root)]

@@ -49,7 +49,7 @@ class SudoManager:
         if cls._initialized and cls._runtime_dir and os.path.exists(cls._runtime_dir):
             return
 
-        runtime_dir = tempfile.mkdtemp(prefix="myagy_sudo_")
+        runtime_dir = tempfile.mkdtemp(prefix="kontexta_cli_sudo_")
         os.chmod(runtime_dir, 0o700)
         cls._runtime_dir = runtime_dir
 
@@ -60,7 +60,7 @@ class SudoManager:
         os.chmod(cls._pass_file, 0o600)
 
         # 1. Askpass script: reads from the secure token file
-        cls._askpass_file = os.path.join(runtime_dir, "myagy_askpass.sh")
+        cls._askpass_file = os.path.join(runtime_dir, "kontexta_cli_askpass.sh")
         with open(cls._askpass_file, "w", encoding="utf-8") as f:
             f.write(
                 "#!/bin/sh\n"

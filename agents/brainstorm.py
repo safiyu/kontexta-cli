@@ -41,7 +41,7 @@ except ImportError:
 from ..core.coordinator import CudaPriority
 from ..terminal.esc_listener import EscListener, prompt_input, listen_for_esc
 from ..terminal.ui import UI, RICH_AVAILABLE, console
-from ..config import PLANS_SUBDIR
+from ..config import PLANS_SUBDIR, DENSE_CODE_MODEL, DENSE_CODE_FAMILY, FAST_GIT_FAMILY
 from ..context.repomap import RepoMap
 from ..context import kontexta_sync
 from ..terminal import say
@@ -99,6 +99,17 @@ class AutonomousBrainstormWorkflow:
         self.session = session
         self.max_build_retries = max_build_retries
         self.default_test_cmd = default_test_cmd
+        self._dirty_before: set = set()
+
+    def _repo_dir(self) -> str:
+        repomap = getattr(self.session, "repomap", None)
+        root = getattr(repomap, "repo_root", None)
+        if isinstance(root, (str, os.PathLike)):
+            return str(root)
+        root = getattr(self.session, "_repo_root", None)
+        if isinstance(root, (str, os.PathLike)):
+            return str(root)
+        return "."
 
     # -------------------------------------------------------------------------
     # Main Entrypoint (/brainstorm <idea>)
@@ -127,6 +138,9 @@ class AutonomousBrainstormWorkflow:
                 else:
                     say.warn("Brainstorm cancelled at Phase 1 (Spec Gate).")
                 return False
+
+            # Files already dirty before implementation are excluded from the final commit
+            self._dirty_before = BrainstormWorkflow._git_paths(self._repo_dir())
 
             # Snapshot pre-implementation working tree so User can revert cleanly
             if hasattr(self.session, "checkpointer") and hasattr(self.session.checkpointer, "snapshot_pre_turn"):
@@ -227,7 +241,7 @@ class AutonomousBrainstormWorkflow:
             if hasattr(self.session, "active_models") and "rocm" in self.session.active_models:
                 rocm_model = self.session.active_models["rocm"]
             elif hasattr(self.session, "endpoints") and "9000" in self.session.endpoints:
-                rocm_model = self.session.endpoints["9000"].get("model", "qwen27")
+                rocm_model = self.session.endpoints["9000"].get("model", DENSE_CODE_MODEL)
 
             if console:
                 console.print(
@@ -366,32 +380,27 @@ class AutonomousBrainstormWorkflow:
             else:
                 say.step("Phase 4/5: Running Concurrent Local (:9000) & Cloud Dual Review")
 
+            git_diff = ""
             if hasattr(self.session, "checkpointer") and hasattr(self.session.checkpointer, "get_diff"):
-                git_diff = self.session.checkpointer.get_diff(nth_latest=1)
-            else:
-                git_diff = BrainstormWorkflow._get_git_diff(getattr(self.session, "_repo_root", "."))
+                git_diff = self.session.checkpointer.get_diff(nth_latest=1, plain=True)
+            if not git_diff:
+                git_diff = BrainstormWorkflow._get_git_diff(self._repo_dir())
 
             # Structured concurrency: execute Local ROCm and Cloud Gemini reviews in parallel
-            async with asyncio.TaskGroup() as tg:
-                local_task = tg.create_task(
-                    self._run_single_reviewer(
-                        target="rocm",
-                        label="ROCm :9000 (Implementation & Edge-Case Review)",
-                        spec=spec,
-                        git_diff=git_diff,
-                    )
-                )
-                cloud_task = tg.create_task(
-                    self._run_single_reviewer(
-                        target="cloud",
-                        label="Cloud Gemini (Architecture & Security Review)",
-                        spec=spec,
-                        git_diff=git_diff,
-                    )
-                )
-
-            local_verdict = local_task.result()
-            cloud_verdict = cloud_task.result()
+            local_verdict, cloud_verdict = await asyncio.gather(
+                self._run_single_reviewer(
+                    target="rocm",
+                    label="ROCm :9000 (Implementation & Edge-Case Review)",
+                    spec=spec,
+                    git_diff=git_diff,
+                ),
+                self._run_single_reviewer(
+                    target="cloud",
+                    label="Cloud Gemini (Architecture & Security Review)",
+                    spec=spec,
+                    git_diff=git_diff,
+                ),
+            )
 
             # Render both reviews side-by-side on desktop terminal
             if console and Columns and Panel and Markdown:
@@ -495,22 +504,25 @@ class AutonomousBrainstormWorkflow:
     async def _phase5_commit_and_journal(
         self, spec: BrainstormSpec, idea: str, memory_sync_enabled: bool
     ) -> str:
-        repo_dir = "."
-        if hasattr(self.session, "repomap") and getattr(self.session.repomap, "repo_root", None) and isinstance(self.session.repomap.repo_root, (str, os.PathLike)):
-            repo_dir = str(self.session.repomap.repo_root)
-        elif hasattr(self.session, "_repo_root") and isinstance(self.session._repo_root, (str, os.PathLike)):
-            repo_dir = str(self.session._repo_root)
-        subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True)
-        subprocess.run(
-            ["git", "commit", "-m", spec.commit_message],
-            cwd=repo_dir,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
-        ).strip()
+        repo_dir = self._repo_dir()
+        to_add = sorted(BrainstormWorkflow._git_paths(repo_dir) - self._dirty_before)
+        if not to_add:
+            raise RuntimeError("No new changes to commit.")
+
+        def _git_commit() -> str:
+            subprocess.run(["git", "add", "-A", "--", *to_add], cwd=repo_dir, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", spec.commit_message],
+                cwd=repo_dir,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            return subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
+            ).strip()
+
+        sha = await asyncio.to_thread(_git_commit)
 
         # Non-blocking background sync to Kontexta journal (unless /memory off)
         if memory_sync_enabled and getattr(self.session, "kontexta", None) is not None:
@@ -768,7 +780,7 @@ class BrainstormWorkflow:
 
     _MS_HEADING = re.compile(r"^(#{1,6})\s*(?:\d+[.)]\s*)?(?:step-by-step\s+)?milestones\b", re.I)
     _MS_ITEM = re.compile(r"^ {0,1}(?:\d+[.)]|[-*])\s+(?:\[([ xX])\]\s+)?(.+?)\s*$")
-    _META = re.compile(r"^<!-- myagy:(\w+)=(.*) -->$")
+    _META = re.compile(r"^<!-- (?:kontexta-cli|myagy):(\w+)=(.*) -->$")  # legacy marker still read
     _MODEL_CMDS = {"/switch", "/model", "/shift", "/use", "/mode", "/models", "/cloud", "/gemini", "/oauth"}
     SWITCH_WINDOW_SECS = 5.0
 
@@ -850,7 +862,7 @@ class BrainstormWorkflow:
     def _meta_set(cls, plan_path: str, key: str, value: str):
         with open(plan_path, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
-        new = f"<!-- myagy:{key}={value} -->"
+        new = f"<!-- kontexta-cli:{key}={value} -->"
         for k, ln in enumerate(lines[:6]):
             m = cls._META.match(ln)
             if m and m.group(1) == key:
@@ -1083,8 +1095,8 @@ class BrainstormWorkflow:
             plan_path = os.path.join(plans_dir, f"{slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md")
             cls._atomic_write(
                 plan_path,
-                f"<!-- myagy:idea={cls._norm_idea(idea)} -->\n"
-                f"<!-- myagy:dirty_before={json.dumps(sorted(dirty_before))} -->\n\n{plan_content}",
+                f"<!-- kontexta-cli:idea={cls._norm_idea(idea)} -->\n"
+                f"<!-- kontexta-cli:dirty_before={json.dumps(sorted(dirty_before))} -->\n\n{plan_content}",
             )
             say.ok(f"Plan generated and saved to {plan_path}")
 
@@ -1114,7 +1126,7 @@ class BrainstormWorkflow:
         if getattr(session, "auto_shift", getattr(session, "auto_git_shift", False)) and session.active_target == "9000":
             ep_9000 = session.endpoints.get("9000", {})
             curr = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
-            if "qwen" not in curr:
+            if DENSE_CODE_FAMILY not in curr:
                 say.step("dev activity: switching :9000 to Qwen 27B Dense for implementation")
                 if await session.switch_model(session.dense_code_model):
                     await asyncio.to_thread(session.refresh_endpoints)
@@ -1258,7 +1270,7 @@ class BrainstormWorkflow:
                     if getattr(session, "auto_shift", getattr(session, "auto_git_shift", False)):
                         ep_9000 = session.endpoints.get("9000", {})
                         curr = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
-                        if "gemma" not in curr:
+                        if FAST_GIT_FAMILY not in curr:
                             say.step("git action: swapping :9000 to Gemma 4 A4B for commit")
                             if await session.switch_model(session.fast_git_model):
                                 await asyncio.to_thread(session.refresh_endpoints)
@@ -1282,7 +1294,7 @@ class BrainstormWorkflow:
             if getattr(session, "auto_shift", getattr(session, "auto_git_shift", False)) and session.active_target == "9000":
                 ep_9000 = session.endpoints.get("9000", {})
                 curr = " ".join((ep_9000.get(k) or "").lower() for k in ("id", "filename", "name_friendly"))
-                if "qwen" not in curr:
+                if DENSE_CODE_FAMILY not in curr:
                     say.step("dev activity: switching :9000 back to Qwen 27B Dense")
                     if await session.switch_model(session.dense_code_model):
                         await asyncio.to_thread(session.refresh_endpoints)

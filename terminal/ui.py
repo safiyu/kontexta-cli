@@ -64,8 +64,8 @@ class UI:
 
     @classmethod
     def detect_theme(cls) -> str:
-        """Theme from env MYAGY_THEME (dark|light|mono), default dark."""
-        name = os.environ.get("MYAGY_THEME", "").strip().lower()
+        """Theme from env KXTC_THEME (dark|light|mono), default dark."""
+        name = os.environ.get("KXTC_THEME", "").strip().lower()
         return name if name in cls.THEMES else "dark"
 
     @classmethod
@@ -462,7 +462,7 @@ try:
     from ..core.session import ContextZoneTelemetry
 except Exception:
     try:
-        from myagy.core.session import ContextZoneTelemetry
+        from ..core.session import ContextZoneTelemetry
     except Exception:
         ContextZoneTelemetry = Any
 

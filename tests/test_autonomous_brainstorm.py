@@ -1,13 +1,13 @@
 import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from myagy.agents.brainstorm import (
+from kontexta_cli.agents.brainstorm import (
     AutonomousBrainstormWorkflow,
     BrainstormSpec,
     BuildVerificationResult,
     ReviewVerdict,
 )
-from myagy.terminal import cli
+from kontexta_cli.terminal import cli
 
 
 def test_brainstorm_spec_dataclass():
@@ -324,7 +324,7 @@ def test_stream_from_target_cloud_failure_falls_back_to_rocm():
 
 def test_oauth_cloud_agent_instantiated_when_no_api_key_and_has_oauth():
     async def _test():
-        from myagy.core.session import MultiGpuHybridSession, OAuthCloudAgent
+        from kontexta_cli.core.session import MultiGpuHybridSession, OAuthCloudAgent
         session = MultiGpuHybridSession(api_key=None)
         session.has_oauth = True
         session.cloud_model = "gemini-2.5-pro"
@@ -340,7 +340,7 @@ def test_oauth_cloud_agent_instantiated_when_no_api_key_and_has_oauth():
 
 def test_cloud_review_fallback_when_no_api_key():
     async def _test():
-        from myagy.core.session import MultiGpuHybridSession, LocalAgentConfig
+        from kontexta_cli.core.session import MultiGpuHybridSession, LocalAgentConfig
         session = MultiGpuHybridSession(api_key=None)
         session.has_oauth = False  # no OAuth and no api_key
 

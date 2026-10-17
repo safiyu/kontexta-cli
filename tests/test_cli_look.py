@@ -2,8 +2,8 @@ import asyncio
 
 import pytest
 
-from myagy.terminal import cli, say
-from myagy.terminal.ui import UI
+from kontexta_cli.terminal import cli, say
+from kontexta_cli.terminal.ui import UI
 
 
 @pytest.fixture(autouse=True)
@@ -147,7 +147,7 @@ def test_last_reshows_full_answer(capsys):
 def test_last_renders_markdown_through_stream_renderer(monkeypatch):
     rich_console = pytest.importorskip("rich.console")
     import io
-    from myagy.terminal import ui
+    from kontexta_cli.terminal import ui
     buf = io.StringIO()
     monkeypatch.setattr(ui, "console", rich_console.Console(file=buf, force_terminal=False, width=60))
     s = FakeSession()

@@ -6,11 +6,11 @@ import time
 
 import pytest
 
-from myagy.context import hooks_loader
-from myagy.context.hooks_loader import ExternalHooksManager, normalize_spec
-from myagy.context.instructions import ProjectInstructions
-from myagy.context.repomap import RepoMap
-from myagy.tools.web_search import WebSearchEngine
+from kontexta_cli.context import hooks_loader
+from kontexta_cli.context.hooks_loader import ExternalHooksManager, normalize_spec
+from kontexta_cli.context.instructions import ProjectInstructions
+from kontexta_cli.context.repomap import RepoMap
+from kontexta_cli.tools.web_search import WebSearchEngine
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -40,7 +40,7 @@ def test_instructions_dedup_case_variants(tmp_path):
 
 
 def _mcp_setup(monkeypatch, tmp_path, data):
-    from myagy.context import mcp_loader
+    from kontexta_cli.context import mcp_loader
     cfg = tmp_path / "mcp.json"
     cfg.write_text(json.dumps(data))
     monkeypatch.setattr(mcp_loader, "MCP_CONFIG_PATH", str(cfg))
@@ -117,7 +117,7 @@ def test_pre_tool_non_string_decision_does_not_crash(tmp_path, monkeypatch):
     script.chmod(0o755)
     _hooks_file(tmp_path, monkeypatch, {"h": {"PreToolUse": [{"hooks": [{"command": str(script)}]}]}})
     (decide,) = ExternalHooksManager.build_lifecycle_hooks(_Sess())
-    from myagy.context.hooks_loader import types
+    from kontexta_cli.context.hooks_loader import types
     assert decide(types.ToolCall(name="grep", args={})).allow
 
 
@@ -193,11 +193,13 @@ def test_fetch_url_rejects_binary_and_caps_read(monkeypatch):
 
 def test_config_env_overrides():
     code = (
-        f"import sys; sys.path.insert(0, {os.path.dirname(ROOT)!r}); sys.modules['google'] = None\n"
-        "from myagy import config\n"
+        "import sys, importlib.util; sys.modules['google'] = None\n"
+        f"spec = importlib.util.spec_from_file_location('kontexta_cli', {os.path.join(ROOT, '__init__.py')!r}, submodule_search_locations=[{ROOT!r}])\n"
+        "mod = importlib.util.module_from_spec(spec); sys.modules['kontexta_cli'] = mod; spec.loader.exec_module(mod)\n"
+        "from kontexta_cli import config\n"
         "print(config.DEFAULT_MODEL_DIR, config.KONTEXTA_MCP_PATH, config.KONTEXTA_DATA_DIR)\n"
     )
-    env = {**os.environ, "MYAGY_MODEL_DIR": "/m", "MYAGY_KONTEXTA_MCP": "/k/index.js", "MYAGY_KONTEXTA_DATA": "/d"}
+    env = {**os.environ, "KXTC_MODEL_DIR": "/m", "KXTC_KONTEXTA_MCP": "/k/index.js", "KXTC_KONTEXTA_DATA": "/d"}
     out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, env=env, timeout=60)
     assert out.stdout.split() == ["/m", "/k/index.js", "/d"], out.stderr
 
@@ -209,7 +211,7 @@ def test_wrapper_import_is_lazy():
         "import importlib.util\n"
         f"spec = importlib.util.spec_from_file_location('antigravity_agent', {os.path.join(ROOT, 'antigravity_agent.py')!r})\n"
         "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
-        "assert 'myagy.core.session' not in sys.modules\n"
+        "assert 'kontexta_cli.core.session' not in sys.modules\n"
         "assert m.PORT_ROCM == 9000\n"
     )
     res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)

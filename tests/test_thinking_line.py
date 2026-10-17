@@ -1,6 +1,6 @@
 import asyncio
 
-from myagy.core import session as session_mod
+from kontexta_cli.core import session as session_mod
 
 
 class Thought:

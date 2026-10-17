@@ -1,7 +1,7 @@
 import pytest
 
-from myagy.terminal import say
-from myagy.terminal.ui import UI
+from kontexta_cli.terminal import say
+from kontexta_cli.terminal.ui import UI
 
 
 @pytest.fixture(autouse=True)

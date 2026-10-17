@@ -3,7 +3,7 @@ import sys
 import tempfile
 import pytest
 
-from myagy.config import (
+from kontexta_cli.config import (
     setup_antigravity_sdk,
     _find_antigravity_sdk_dir,
     _find_localharness_bin,

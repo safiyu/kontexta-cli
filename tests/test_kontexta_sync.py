@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from myagy.context import kontexta_sync as ks
+from kontexta_cli.context import kontexta_sync as ks
 
 
 class FakeSession:
@@ -40,8 +40,8 @@ def test_commit_info_and_build_entry(git_repo):
     assert info["subject"] == "add b"
     assert info["files"] == [{"path": "b.txt", "added": "2", "removed": "0"}]
     text, tags = ks.build_entry("commit", "add b", str(git_repo), commit=info)
-    assert "b.txt (+2 -0)" in text and "[myagy commit]" in text
-    assert tags[:2] == ["myagy", "commit"]
+    assert "b.txt (+2 -0)" in text and "[kontexta-cli commit]" in text
+    assert tags[:2] == ["kontexta-cli", "commit"]
 
 
 def test_build_entry_truncates_and_redacts():
@@ -84,13 +84,13 @@ def test_sync_event_pushes_once_per_commit_and_drains(monkeypatch):
 
 def test_push_never_raises_without_server(monkeypatch):
     monkeypatch.setattr(ks.KontextaManager, "find_mcp_entrypoint", classmethod(lambda cls: None))
-    assert asyncio.run(ks.push("x", ["myagy"])) is False
+    assert asyncio.run(ks.push("x", ["kontexta-cli"])) is False
     monkeypatch.setattr(ks.KontextaManager, "find_mcp_entrypoint", classmethod(lambda cls: "/nonexistent/index.js"))
-    assert asyncio.run(ks.push("x", ["myagy"], timeout=5)) is False
+    assert asyncio.run(ks.push("x", ["kontexta-cli"], timeout=5)) is False
 
 
 def test_prefs_include_kontexta_sync():
-    from myagy.core.prefs import PREF_DEFAULTS
+    from kontexta_cli.core.prefs import PREF_DEFAULTS
     assert PREF_DEFAULTS["kontexta_sync"] is True
 
 

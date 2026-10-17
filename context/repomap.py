@@ -1,4 +1,3 @@
-# Projects/myagy/context/repomap.py
 from __future__ import annotations
 
 import ast
@@ -48,10 +47,12 @@ EXT_TO_LANG: dict[str, str] = {
     ".sh": "bash",
 }
 
+from ..config import STATE_DIR
+
 IGNORE_DIRS: frozenset[str] = frozenset({
     ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
     ".ruff_cache", "node_modules", ".venv", "venv", "env", "dist", "build",
-    "target", ".next", ".nuxt", ".agents", ".gemini", "coverage", ".myagy",
+    "target", ".next", ".nuxt", ".agents", ".gemini", "coverage", ".kontexta-cli",
 })
 
 # Node types that represent named structural symbols per language family
@@ -114,8 +115,8 @@ class RepoMap:
         self._cached_outline: str = ""
         self._last_scan_ms: float = 0.0
 
-        # Tier 2: Persistent SQLite WAL cache (~/.myagy/cache/repomap.db)
-        default_db = Path.home() / ".myagy" / "cache" / "repomap.db"
+        # Tier 2: Persistent SQLite WAL cache (<state dir>/cache/repomap.db)
+        default_db = Path(STATE_DIR) / "cache" / "repomap.db"
         self._db_path = cache_db_path or default_db
         try:
             self._db_path.parent.mkdir(parents=True, exist_ok=True)

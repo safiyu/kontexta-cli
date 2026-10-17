@@ -1,4 +1,4 @@
-# myagy: Antigravity Multi-GPU Hybrid Agent
+# kontexta-cli: Antigravity Multi-GPU Hybrid Agent
 
 An asynchronous, dual-accelerator pairing framework and terminal copilot built on top of the `google-antigravity` Python SDK.
 
@@ -31,7 +31,7 @@ An asynchronous, dual-accelerator pairing framework and terminal copilot built o
 * **Per-Turn Checkpoints (`/diff`, `/undo`)**:
   * Every turn that changes files is snapshotted as git tree objects (real index untouched), so you can review or revert exactly what the agent did, including changes made by shell commands.
 * **Usage Ledger (`/stats`)**: per-target tokens, tok/s, TTFT, time, escalations and errors for the session.
-* **Persistent Preferences (`~/.myagy/config.json`)**: target, permission mode, toggles and thresholds survive restarts and `/reload`. Explicit CLI flags win over saved values.
+* **Persistent Preferences (`~/.kontexta-cli/config.json`)**: target, permission mode, toggles and thresholds survive restarts and `/reload`. Explicit CLI flags win over saved values.
 * **Markdown Rendering**: responses stream through a live Markdown renderer (toggle with `/markdown`).
 * **Tool-Using Subagents**: `/spawn` runs a real agent on :9002 with the same hooks; unsafe actions are denied (no prompts from the background). Falls back to a plain no-tools completion if the agent can't start.
 * **Universal MCP Server Support**:
@@ -45,8 +45,10 @@ An asynchronous, dual-accelerator pairing framework and terminal copilot built o
 ## 📂 Project Structure
 
 ```text
-Projects/myagy/
-├── antigravity_agent.py      # Top-level executable runner & backward-compat wrapper
+Projects/kontexta-cli/
+├── antigravity_agent.py      # Top-level executable runner (also `kxtc setup` / `kxtc doctor`)
+├── deps.py                   # Dependency checks and installers (Antigravity, Kontexta, LlamaShift, Laya)
+├── install.sh                # One-shot venv + package + dependency install
 ├── config.py                 # Ports, endpoints, directory constants
 ├── launch_cuda_compactor.sh  # Script helper for dedicated compactor
 ├── __init__.py               # Package root exports
@@ -55,7 +57,7 @@ Projects/myagy/
 │   ├── session.py            # MultiGpuHybridSession cross-GPU orchestrator
 │   ├── coordinator.py        # NVIDIA CUDA:9002 resource arbitrator
 │   ├── checkpoints.py        # Git tree snapshots behind /diff and /undo
-│   ├── prefs.py              # Persisted preferences (~/.myagy/config.json)
+│   ├── prefs.py              # Persisted preferences (~/.kontexta-cli/config.json)
 │   ├── laya.py               # Laya System 1 ModernBERT decision protocol
 │   └── llamashift.py         # Port telemetry, model catalog & hot-swapping
 │
@@ -86,41 +88,66 @@ tests/                        # pytest suite (runs against a stubbed SDK)
 
 ## 🛠️ Installation & Setup
 
-### 1. Prerequisites
-Ensure Python 3.10+ and the required packages are installed:
+### 1. Install
+One line, from anywhere (clones the repo to `~/.kontexta-cli/src`, installs everything, links `kxtc` into `~/.local/bin`):
 ```bash
-pip install -r requirements.txt   # google-antigravity, rich, prompt_toolkit (history + tab completion)
-pip install -r requirements-dev.txt  # adds pytest
+curl -fsSL https://raw.githubusercontent.com/safiyu/kontexta-cli/main/install.sh | bash
+# non-interactive: ... | bash -s -- --yes
 ```
+
+kontexta-cli depends on four things. The installer sets up all that can be automated.
+
+| Dependency | What it is | How it is installed |
+|---|---|---|
+| Antigravity SDK | Agent runtime (`google-antigravity`) | pip, pulled in automatically by the package |
+| Kontexta | Knowledge base and journal (MCP server) | `npm install -g kontexta-mcp` (needs Node 22+) |
+| LlamaShift | Local model manager (default `:8002`) | pip, from `github.com/safiyu/llamashift` (the `llamashift` command; data in `~/.llamashift`). Running it as a system service stays opt-in via its own installer. `kxtc doctor` checks its API version. |
+| Laya | System 1 decision server (default `:8003`) | not installable from here; without it routing falls back to built-in heuristics |
+
+```bash
+./install.sh            # from a checkout: venv + pip install -e . + `kxtc setup`; add --yes to skip the questions
+```
+
+Or step by step:
+```bash
+pip install .           # Python deps and the kontexta-cli / kxtc commands
+kxtc setup              # installs Kontexta and LlamaShift if missing (--yes, --only <name>)
+kxtc doctor             # shows what is installed and running; exits 1 if a required one is missing
+```
+
+`kxtc setup` and `kxtc doctor` run even when the SDK is not installed yet.
 
 Run the tests (the SDK is stubbed, no GPUs or network needed):
 ```bash
+pip install -r requirements-dev.txt
 python3 -m pytest
 ```
 
 ### 2. Environment Overrides (optional)
+Everything below is optional. Ports and host feed every derived URL, so changing one place is enough.
+The `9000` and `9002` endpoint ids stay as stable target names (`/9000`, `@9002`) even if the ports change.
+
 | Variable | Default | Purpose |
 |---|---|---|
-| `MYAGY_CUDA_BASE_URL` | `http://127.0.0.1:9002/v1` | NVIDIA CUDA compactor & subagent llama-server (Port 9002; leaves 9001 free for Portainer) |
-| `MYAGY_ROCM_BASE_URL` | `http://127.0.0.1:9000/v1` | AMD ROCm executive llama-server (Port 9000) |
-| `MYAGY_LAYA_BASE_URL` | `http://127.0.0.1:8003` | Laya System 1 ModernBERT decision engine |
-| `MYAGY_MODEL_DIR` | `/home/safiyu/models` | GGUF model directory (also used by `launch_cuda_compactor.sh`) |
-| `MYAGY_KONTEXTA_MCP` | `~/Projects/kontexta/apps/mcp/dist/index.js` | Kontexta MCP entrypoint |
-| `MYAGY_KONTEXTA_DATA` | `~/.local/share/kontexta` | Kontexta data directory |
-| `MYAGY_COMPACTOR_MODEL` | `granite42_8b` | LlamaShift profile id for the compactor and subagents (matched by name if the id is absent) |
+| `KXTC_HOST` | `127.0.0.1` | Host for all local services |
+| `KXTC_ROCM_PORT` / `KXTC_CUDA_PORT` | `9000` / `9002` | ROCm executive and CUDA compactor llama-server ports |
+| `KXTC_LLAMASHIFT_PORT` / `KXTC_LAYA_PORT` | `8002` / `8003` | LlamaShift and Laya ports |
+| `KXTC_ROCM_BASE_URL`, `KXTC_CUDA_BASE_URL`, `KXTC_LAYA_BASE_URL`, `KXTC_LAYA_ENDPOINT`, `KXTC_LLAMASHIFT_URL` | derived from host and ports | Full URL overrides |
+| `KXTC_HOME` | `~/.kontexta-cli` | Preferences, prompt history, repomap cache |
+| `KXTC_PROJECTS_DIR` | parent of the checkout, or `$KXTC_HOME/deps` when pip-installed | Where sibling checkouts (LlamaShift, Kontexta, SDK) live |
+| `KXTC_MODEL_DIR` | `~/models` | GGUF model directory (also used by `launch_cuda_compactor.sh`) |
+| `KXTC_KONTEXTA_MCP` | auto-detected | Kontexta MCP entrypoint (sibling checkout, `~/Projects`, or the npm `kxta` bin) |
+| `KXTC_KONTEXTA_DATA` | `~/.local/share/kontexta` | Kontexta data directory |
+| `KXTC_COMPACTOR_MODEL` / `KXTC_COMPACTOR_FILE` | `granite42_8b` / `granite-4.2-8b-instruct-Q4_K_M.gguf` | LlamaShift profile id and GGUF filename for the compactor and subagents |
+| `KXTC_COMPACTOR_CTX` / `KXTC_COMPACTOR_GPU_LAYERS` / `KXTC_KV_CACHE_DIR` | `16384` / `99` / `/dev/shm/kontexta_cli_kv_cache` | Compactor script tuning |
+| `KXTC_FAST_MODEL` / `KXTC_DENSE_MODEL` | `gemma4` / `qwen27` | Models auto-shift swaps between for git and heavy code work |
+| `KXTC_CLOUD_MODEL` | `gemini-3.8-flash-high` | Default cloud model |
+| `KXTC_LLAMASHIFT_REPO` / `KXTC_LLAMASHIFT_PIP` | `https://github.com/safiyu/llamashift.git` / `git+<repo>` | Where `kxtc setup` pip-installs LlamaShift from; set the pip spec to `llamashift` once it is on PyPI |
 | `LLAMASHIFT_API_KEY` | unset | LlamaShift `managementApiKey`, sent as a Bearer token on `/api/*` calls |
-| `LLAMA_SERVER_BIN` | `/home/safiyu/llama.cpp-cuda/build/bin/llama-server` | llama-server binary for the compactor script |
+| `LLAMA_SERVER_BIN` | `~/llama.cpp-cuda/build/bin/llama-server` | llama-server binary for the compactor script |
 
-### 3. Configure Bash Alias
-To launch `myagy` from anywhere in your terminal, add the alias to your `~/.bashrc`:
-
-```bash
-# Append alias to ~/.bashrc
-echo "alias myagy='python3 /home/safiyu/Projects/myagy/antigravity_agent.py --dangerously-skip-permissions'" >> ~/.bashrc
-
-# Reload your shell environment
-source ~/.bashrc
-```
+### 3. Commands
+`pip install` and `install.sh` create `kontexta-cli` and its short form `kxtc`. From a source checkout without installing, use `bin/kontexta-cli` and `bin/kxtc`.
 
 ---
 
@@ -128,11 +155,8 @@ source ~/.bashrc
 
 ### Running the Agent
 ```bash
-# Using the bash alias
-myagy
-
-# Or directly from the project directory
-python3 /home/safiyu/Projects/myagy/antigravity_agent.py --dangerously-skip-permissions
+kontexta-cli            # or the short form: kxtc
+kxtc --dangerously-skip-permissions
 ```
 
 ### Slash Command Palette

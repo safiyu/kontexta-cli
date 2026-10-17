@@ -1,9 +1,9 @@
 import asyncio
 import pytest
 
-from myagy.core.laya import LayaDecisionEngine
-from myagy.core.session import MultiGpuHybridSession
-from myagy.agents.brainstorm import BrainstormWorkflow
+from kontexta_cli.core.laya import LayaDecisionEngine
+from kontexta_cli.core.session import MultiGpuHybridSession
+from kontexta_cli.agents.brainstorm import BrainstormWorkflow
 
 
 def test_is_git_action_ignores_implementation_prompts():

@@ -7,7 +7,7 @@ from contextlib import closing
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
-from ..config import KONTEXTA_MCP_PATH, KONTEXTA_DATA_DIR
+from ..config import KONTEXTA_MCP_PATH, KONTEXTA_DATA_DIR, PROJECTS_DIR
 from ..terminal.ui import UI
 
 from google.antigravity.types import McpStdioServer
@@ -22,9 +22,10 @@ class KontextaManager:
         candidates = [
             os.environ.get("KONTEXTA_MCP_PATH"),
             KONTEXTA_MCP_PATH,
+            os.path.join(PROJECTS_DIR, "kontexta", "apps", "mcp", "dist", "index.js"),
             os.path.expanduser("~/kontexta/apps/mcp/dist/index.js"),
             os.path.expanduser("~/.local/share/kontexta/mcp/dist/index.js"),
-        ]
+        ] + [os.path.realpath(found) for found in map(shutil.which, ("kxta", "kontexta-mcp")) if found]
         for path in candidates:
             if path and os.path.isfile(path):
                 return os.path.abspath(path)

@@ -4,12 +4,12 @@ import types
 
 import pytest
 
-from myagy.agents import brainstorm as bs
-from myagy.agents.brainstorm import BrainstormWorkflow as B
-from myagy.agents.subagent import SubagentManager, SubagentTask
-from myagy.core.coordinator import CudaCoordinator
-from myagy.core.sudo_manager import SudoManager
-from myagy.terminal import say
+from kontexta_cli.agents import brainstorm as bs
+from kontexta_cli.agents.brainstorm import BrainstormWorkflow as B
+from kontexta_cli.agents.subagent import SubagentManager, SubagentTask
+from kontexta_cli.core.coordinator import CudaCoordinator
+from kontexta_cli.core.sudo_manager import SudoManager
+from kontexta_cli.terminal import say
 
 
 @pytest.fixture(autouse=True)
@@ -111,7 +111,7 @@ def test_step_lines_quiet_and_verbose(capsys):
 
 
 def test_compact_history_reports_one_line(session, monkeypatch, capsys):
-    from myagy.agents.compactor import ContextCurator
+    from kontexta_cli.agents.compactor import ContextCurator
     session.json_output = False
     session.history = [{"role": "user", "target": "9000", "content": f"m{i}"} for i in range(8)]
     monkeypatch.setattr(ContextCurator, "synthesize_working_memory", classmethod(lambda cls, s, older, silent=False: ("summary", "test-tier")))
@@ -123,7 +123,7 @@ def test_compact_history_reports_one_line(session, monkeypatch, capsys):
 
 
 def test_context_summary_card(session, capsys):
-    from myagy.agents.compactor import ContextCurator
+    from kontexta_cli.agents.compactor import ContextCurator
     session.json_output = False
     ContextCurator.print_context_summary(session)
     out = capsys.readouterr().out
@@ -199,7 +199,7 @@ def test_subagent_task_table_and_detail(monkeypatch, capsys):
 
 
 def test_background_denial_warns(online_session, monkeypatch, capsys):
-    import myagy.agents.subagent as sa
+    import kontexta_cli.agents.subagent as sa
     from test_subagent import _fake_agent
     captured = {}
 

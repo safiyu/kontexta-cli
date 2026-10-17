@@ -1,0 +1,14 @@
+#!/bin/sh
+# Launcher for kontexta-cli; kxtc is a symlink to this script
+src=$0
+if [ -L "$src" ]; then
+  target=$(readlink "$src")
+  case $target in
+    /*) src=$target ;;
+    *) src=$(dirname "$src")/$target ;;
+  esac
+fi
+dir=$(cd "$(dirname "$src")" && pwd)
+py="$dir/../.venv/bin/python"
+[ -x "$py" ] || py=python3
+exec "$py" "$dir/../antigravity_agent.py" "$@"

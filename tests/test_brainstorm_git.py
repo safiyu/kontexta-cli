@@ -1,6 +1,6 @@
 import subprocess
 
-from myagy.agents.brainstorm import BrainstormWorkflow as B
+from kontexta_cli.agents.brainstorm import BrainstormWorkflow as B
 
 
 def test_untracked_files_appear_in_diff(git_repo):

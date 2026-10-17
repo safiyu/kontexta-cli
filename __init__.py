@@ -1,5 +1,5 @@
 """
-myagy - Antigravity Multi-GPU Hybrid Agent Package
+kontexta-cli - Antigravity Multi-GPU Hybrid Agent Package
 Dual-GPU executive pipeline (AMD ROCm + NVIDIA CUDA) with continuous background hippocampus curation,
 Laya System 1 decision engine (~33ms ModernBERT), and Cloud Gemini fallback.
 """

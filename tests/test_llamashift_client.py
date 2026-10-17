@@ -6,9 +6,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from myagy.core import llamashift as ls
-from myagy.agents import compactor
-from myagy.agents.compactor import ContextCurator
+from kontexta_cli.core import llamashift as ls
+from kontexta_cli.agents import compactor
+from kontexta_cli.agents.compactor import ContextCurator
 
 
 def _status(mode="multi_port", granite_port=9002, running=("qwen27",), granite_dedicated=False, effective=False):
@@ -205,7 +205,7 @@ def test_resolve_model_id(shift):
 
 def test_wake_refused_in_single_port_and_never_calls_start(shift, monkeypatch):
     fake = shift(_status(mode="single_port"))
-    monkeypatch.setattr("myagy.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
+    monkeypatch.setattr("kontexta_cli.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
     res = ls.wake_compactor(9002, timeout=2)
     assert not res["ok"] and "single_port" in res["reason"] and "dedicated" in res["reason"]
     assert "/api/start" not in fake.paths
@@ -218,16 +218,16 @@ def test_wake_allowed_for_dedicated_model_in_single_port(shift):
 
 def test_wake_refused_when_profile_is_on_another_port(shift, monkeypatch):
     shift(_status(granite_port=9005))
-    monkeypatch.setattr("myagy.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
+    monkeypatch.setattr("kontexta_cli.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
     res = ls.wake_compactor(9002, timeout=2)
     assert not res["ok"] and "9005" in res["reason"]
 
 
 def test_wake_refused_when_no_profile_matches(shift, monkeypatch):
     shift()
-    monkeypatch.setattr("myagy.config.COMPACTOR_MODEL_ID", "nosuchmodel")
+    monkeypatch.setattr("kontexta_cli.config.COMPACTOR_MODEL_ID", "nosuchmodel")
     res = ls.wake_compactor(9002, timeout=2)
-    assert not res["ok"] and "MYAGY_COMPACTOR_MODEL" in res["reason"]
+    assert not res["ok"] and "KXTC_COMPACTOR_MODEL" in res["reason"]
 
 
 def test_ensure_ready_waits_for_health(shift):
@@ -273,7 +273,7 @@ def test_wake_skip_note_is_shown_once(capsys):
 
 
 def test_refresh_endpoints_announces_transitions_once(monkeypatch, capsys):
-    from myagy.core import session as sess_mod
+    from kontexta_cli.core import session as sess_mod
     state = {"v": "down"}
     monkeypatch.setattr(sess_mod, "shift_state", lambda: state["v"])
     monkeypatch.setattr(sess_mod, "get_llamashift_active", lambda: [])
@@ -350,12 +350,12 @@ def test_effective_port_from_status_needs_no_config_call(shift):
 
 def test_wake_result_always_carries_warnings(shift, monkeypatch):
     shift(_status(mode="single_port"))
-    monkeypatch.setattr("myagy.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
+    monkeypatch.setattr("kontexta_cli.config.COMPACTOR_MODEL_ID", "granite_8b_q4")
     assert ls.wake_compactor(9002, timeout=1)["warnings"] == []
 
 
 def test_refresh_endpoints_explains_unauthorized(monkeypatch, capsys):
-    from myagy.core import session as sess_mod
+    from kontexta_cli.core import session as sess_mod
     monkeypatch.setattr(sess_mod, "shift_state", lambda: "unauthorized")
     monkeypatch.setattr(sess_mod, "get_llamashift_active", lambda: [])
     offline = {"model_path": "", "filename": "x", "name": "x", "status": "offline", "source": "none", "port": 0, "gpu": ""}
@@ -367,7 +367,7 @@ def test_refresh_endpoints_explains_unauthorized(monkeypatch, capsys):
 
 
 def test_compactor_start_command_shows_vram_warnings(monkeypatch, capsys):
-    from myagy.terminal import cli
+    from kontexta_cli.terminal import cli
 
     monkeypatch.setattr(cli, "wake_compactor", lambda port=9002, **k: {
         "ok": True, "reason": "", "log_tail": "", "elapsed": 2.0, "warnings": ["Model may not fit: 9 GB needed"]})
@@ -467,7 +467,7 @@ GPUS = [
 
 
 def _toolbar_text(session, monkeypatch, target, gpus=GPUS):
-    from myagy.core import session as sess_mod
+    from kontexta_cli.core import session as sess_mod
     monkeypatch.setattr(sess_mod, "vram_snapshot", lambda: gpus)
     session.active_target = target
     return "".join(t for _, t in session.toolbar_fragments())

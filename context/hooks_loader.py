@@ -234,7 +234,7 @@ class ExternalHooksManager:
                         body = dict(payload)
                         body.update({
                             "event": event,
-                            "conversationId": getattr(session_obj, "conversation_id", "myagy-session"),
+                            "conversationId": getattr(session_obj, "conversation_id", "kontexta-cli-session"),
                             "modelName": session_obj.active_target,
                         })
                         result = cls.execute_command_hook(cmd, entry["base_dir"], body, timeout=h["timeout"])
@@ -312,7 +312,7 @@ class ExternalHooksManager:
 
                     payload = {
                         "toolCall": {"name": c_name, "args": c_args},
-                        "conversationId": getattr(session_obj, "conversation_id", "myagy-session"),
+                        "conversationId": getattr(session_obj, "conversation_id", "kontexta-cli-session"),
                         "modelName": session_obj.active_target,
                     }
 
@@ -379,7 +379,7 @@ class ExternalHooksManager:
                         "toolCall": {"name": c_name, "args": c_args},
                         "output": output_text[:4000],
                         "error": str(res.error) if res.error else "",
-                        "conversationId": getattr(session_obj, "conversation_id", "myagy-session"),
+                        "conversationId": getattr(session_obj, "conversation_id", "kontexta-cli-session"),
                         "modelName": session_obj.active_target,
                     }
 

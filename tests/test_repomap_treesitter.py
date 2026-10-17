@@ -1,6 +1,6 @@
 import os
 import pytest
-from myagy.context.repomap import RepoMap
+from kontexta_cli.context.repomap import RepoMap
 
 def test_repomap_treesitter_and_diskcache(tmp_path):
     RepoMap.invalidate_cache()

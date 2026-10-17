@@ -4,14 +4,14 @@ import pytest
 import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from myagy.agents.subagent import (
+from kontexta_cli.agents.subagent import (
     SubagentManager,
     SubagentTask,
     SubagentToolTrace,
     ModeStr,
 )
-from myagy.core.coordinator import CudaCoordinator
-from myagy.terminal.cli import handle_slash_command
+from kontexta_cli.core.coordinator import CudaCoordinator
+from kontexta_cli.terminal.cli import handle_slash_command
 
 
 class MockLaya:
@@ -19,20 +19,8 @@ class MockLaya:
         self.p_safe = p_safe
         self.reason = reason
 
-    async def score_tool_safety(self, tool_name: str, args: dict):
-        return types.SimpleNamespace(p_safe=self.p_safe, reason=self.reason)
-
-
-class MockHooksRunner:
-    def __init__(self, decision: str = "allow", reason: str = ""):
-        self.decision = decision
-        self.reason = reason
-
-    async def run_pre_tool(self, tool_name: str, args: dict):
-        return types.SimpleNamespace(decision=self.decision, reason=self.reason, overwritten_args=None)
-
-    async def run_post_tool(self, tool_name: str, args: dict, output: str, error: str):
-        pass
+    def evaluate_action_safety(self, action_desc: str):
+        return self.p_safe >= 0.90, self.p_safe
 
 
 @pytest.fixture
@@ -43,11 +31,9 @@ def cuda_coordinator():
 @pytest.fixture
 async def subagent_mgr(cuda_coordinator, monkeypatch):
     laya = MockLaya(p_safe=0.95)
-    hooks_runner = MockHooksRunner(decision="allow")
     mgr = SubagentManager(
         cuda_coord=cuda_coordinator,
         laya=laya,
-        hooks_runner=hooks_runner,
         mcp_tools=[],
         system_prompt_provider=lambda: "System instructions",
         model_id="granite42_8b",
@@ -90,39 +76,28 @@ async def test_non_interactive_safety_denies_low_score(subagent_mgr):
     """Tool calls with P(Safe) < 0.90 are denied in-place without terminal prompts."""
     subagent_mgr.laya = MockLaya(p_safe=0.75, reason="potential destructive write")
     task = SubagentTask(task_id=1, prompt="delete files")
-    
-    agent = subagent_mgr._build_headless_subagent(task)
-    # Trigger the pre_tool_call hook
-    handler = None
-    if hasattr(agent, "_handlers") and "pre_tool_call" in agent._handlers:
-        handler = agent._handlers["pre_tool_call"][0]
 
-    if handler is not None:
-        from myagy.agents.subagent import ToolCallContext
-        ctx = ToolCallContext(name="write_to_file", args={"path": "/important"})
-        decision = await handler(ctx)
-        assert decision.allow is False
-        assert "denied unsafe action" in decision.reason
-        assert len(task.tool_traces) == 1
-        assert task.tool_traces[0].status == "denied"
-        assert "P(Safe)=0.75" in task.tool_traces[0].detail
+    allowed, reason = subagent_mgr._gate_tool_call(task, "write_to_file", {"path": "/important"})
+    assert allowed is False
+    assert "denied unsafe action" in reason
+    assert len(task.tool_traces) == 1
+    assert task.tool_traces[0].status == "denied"
+    assert "P(Safe)=0.75" in task.tool_traces[0].detail
 
 
 @pytest.mark.anyio
-async def test_hooks_runner_pre_tool_denial(subagent_mgr):
-    """External hooks runner denial halts execution in-place."""
-    subagent_mgr.hooks_runner = MockHooksRunner(decision="deny", reason="Blocked by policy")
-    task = SubagentTask(task_id=2, prompt="modify config")
-    
-    agent = subagent_mgr._build_headless_subagent(task)
-    if hasattr(agent, "_handlers") and "pre_tool_call" in agent._handlers:
-        handler = agent._handlers["pre_tool_call"][0]
-        from myagy.agents.subagent import ToolCallContext
-        ctx = ToolCallContext(name="run_command", args={"cmd": "git push"})
-        decision = await handler(ctx)
-        assert decision.allow is False
-        assert "Blocked by policy" in decision.reason
-        assert task.tool_traces[0].status == "denied"
+async def test_safe_tool_call_allowed(subagent_mgr):
+    task = SubagentTask(task_id=2, prompt="read files")
+    allowed, _ = subagent_mgr._gate_tool_call(task, "view_file", {"path": "a.py"})
+    assert allowed is True
+    assert task.tool_traces[0].status == "executed"
+
+
+@pytest.mark.anyio
+async def test_destructive_command_denied(subagent_mgr):
+    task = SubagentTask(task_id=3, prompt="clean")
+    allowed, _ = subagent_mgr._gate_tool_call(task, "run_command", {"CommandLine": "rm -rf /"})
+    assert allowed is False
 
 
 @pytest.mark.anyio
@@ -176,7 +151,8 @@ async def test_selective_context_injection(subagent_mgr):
     assert count == 1
     assert ids == [1]
     assert task.injected is True
-    assert len(session.agent.history) == 1
+    assert len(session.agent.history) == 2
+    assert session.agent.history[1]["role"] == "assistant"
     assert "[Background Subagent #1" in session.agent.history[0]["content"]
     assert "Found zero vulnerabilities." in session.agent.history[0]["content"]
 
@@ -223,3 +199,46 @@ async def test_cli_slash_commands(subagent_mgr):
     subagent_mgr.tasks[2].output_chunks = ["Build passed!"]
     assert handle_slash_command("/subagent inject 2", session) is True
     assert subagent_mgr.tasks[2].injected is True
+
+
+@pytest.mark.anyio
+async def test_stop_terminates_worker_while_task_is_running(subagent_mgr, monkeypatch):
+    """Cancelling the worker (e.g. /reload) must not be swallowed by the per-task cancel handler."""
+    started = asyncio.Event()
+
+    async def long_exec(task, abort_ev):
+        started.set()
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(subagent_mgr, "_execute_subagent_task", long_exec)
+    subagent_mgr.spawn("slow")
+    await asyncio.wait_for(started.wait(), 2)
+    await asyncio.wait_for(subagent_mgr.stop(), 3)
+    assert subagent_mgr._worker_task.done()
+
+
+@pytest.mark.anyio
+async def test_cancel_task_keeps_worker_alive_for_next_task(subagent_mgr, monkeypatch):
+    started = asyncio.Event()
+    calls = []
+
+    async def exec_fn(task, abort_ev):
+        calls.append(task.task_id)
+        if task.task_id == 1:
+            started.set()
+            await asyncio.sleep(60)
+        task.output_chunks.append("ok")
+
+    monkeypatch.setattr(subagent_mgr, "_execute_subagent_task", exec_fn)
+    t1 = subagent_mgr.spawn("first")
+    t2 = subagent_mgr.spawn("second")
+    await asyncio.wait_for(started.wait(), 2)
+    ok, _ = subagent_mgr.cancel_task(t1.task_id)
+    assert ok
+    for _ in range(50):
+        if t2.state == "completed":
+            break
+        await asyncio.sleep(0.05)
+    assert t1.state == "cancelled"
+    assert t2.state == "completed"
+    assert calls == [1, 2]

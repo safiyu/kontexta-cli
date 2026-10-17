@@ -1,6 +1,6 @@
 import os
 
-from myagy.core.checkpoints import Checkpoints
+from kontexta_cli.core.checkpoints import Checkpoints
 
 
 def test_snapshot_diff_and_restore(git_repo):
@@ -44,7 +44,7 @@ def test_not_a_repo(tmp_path):
 
 def test_git_checkpointer_shadow_index_diff_and_undo(git_repo):
     import subprocess
-    from myagy.core.checkpoints import GitCheckpointer, CheckpointRecord
+    from kontexta_cli.core.checkpoints import GitCheckpointer, CheckpointRecord
 
     checkpointer = GitCheckpointer(repo_root=git_repo)
     assert checkpointer._shadow_dir.exists()
@@ -72,7 +72,7 @@ def test_git_checkpointer_shadow_index_diff_and_undo(git_repo):
     assert sorted(chk.files_changed) == ["a.txt", "created.py"]
 
     # Verify git ref anchor was written
-    ref_check = subprocess.run(["git", "rev-parse", "refs/myagy/checkpoints/turn_1"], cwd=git_repo, capture_output=True, text=True)
+    ref_check = subprocess.run(["git", "rev-parse", "refs/kontexta-cli/checkpoints/turn_1"], cwd=git_repo, capture_output=True, text=True)
     assert ref_check.returncode == 0
     assert ref_check.stdout.strip() == chk.tree_sha
 
@@ -103,9 +103,59 @@ def test_git_checkpointer_shadow_index_diff_and_undo(git_repo):
     assert not (git_repo / "created.py").exists()
 
     # Verify ref anchor removed
-    ref_gone = subprocess.run(["git", "rev-parse", "refs/myagy/checkpoints/turn_1"], cwd=git_repo, capture_output=True, text=True)
+    ref_gone = subprocess.run(["git", "rev-parse", "refs/kontexta-cli/checkpoints/turn_1"], cwd=git_repo, capture_output=True, text=True)
     assert ref_gone.returncode != 0
 
     checkpointer.close()
     assert not checkpointer._shadow_dir.exists()
 
+
+
+def test_undo_only_touches_files_changed_by_the_turn(git_repo):
+    from kontexta_cli.core.checkpoints import GitCheckpointer
+
+    (git_repo / "other.txt").write_text("other\n")
+    import subprocess
+    subprocess.run(["git", "add", "other.txt"], cwd=git_repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "other"], cwd=git_repo, check=True)
+
+    cp = GitCheckpointer(repo_root=git_repo)
+    cp.snapshot_pre_turn()
+    (git_repo / "a.txt").write_text("turn edit\n")
+    assert cp.commit_post_turn_snapshot() == 1
+
+    # A manual edit made after the turn to a file the turn never touched must survive /undo
+    (git_repo / "other.txt").write_text("manual edit\n")
+    ok, _, files = cp.undo_latest()
+    assert ok and files == ["a.txt"]
+    assert (git_repo / "a.txt").read_text() == "a\n"
+    assert (git_repo / "other.txt").read_text() == "manual edit\n"
+    cp.close()
+
+
+def test_failed_undo_keeps_the_checkpoint(git_repo):
+    from kontexta_cli.core.checkpoints import GitCheckpointer
+
+    cp = GitCheckpointer(repo_root=git_repo)
+    cp.snapshot_pre_turn()
+    (git_repo / "a.txt").write_text("turn edit\n")
+    cp.commit_post_turn_snapshot()
+    cp.checkpoints[-1].parent_tree_sha = "0" * 40
+    ok, _, _ = cp.undo_latest()
+    assert ok is False
+    assert len(cp.checkpoints) == 1
+    cp.close()
+
+
+def test_get_diff_plain_is_uncoloured_data(git_repo):
+    from kontexta_cli.core.checkpoints import GitCheckpointer
+
+    cp = GitCheckpointer(repo_root=git_repo)
+    assert cp.get_diff(plain=True) == ""
+    cp.snapshot_pre_turn()
+    (git_repo / "a.txt").write_text("[bold]x[/bold]\n")
+    cp.commit_post_turn_snapshot()
+    plain = cp.get_diff(plain=True)
+    assert "\x1b[" not in plain and "Turn 1 Diff" not in plain
+    assert "[bold]x[/bold]" in plain
+    cp.close()

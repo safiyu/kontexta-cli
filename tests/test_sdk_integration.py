@@ -1,8 +1,8 @@
 import asyncio
 import pytest
 from types import SimpleNamespace
-from myagy.core.session import MultiGpuHybridSession
-from myagy.context.hooks_loader import ExternalHooksManager
+from kontexta_cli.core.session import MultiGpuHybridSession
+from kontexta_cli.context.hooks_loader import ExternalHooksManager
 from google.antigravity import hooks, types
 
 class FakeToolCall:

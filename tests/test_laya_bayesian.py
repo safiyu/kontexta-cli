@@ -2,7 +2,7 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from myagy.core.laya import (
+from kontexta_cli.core.laya import (
     LayaDecisionEngine,
     RouteDecision,
     NoulSafetyScore,
@@ -163,7 +163,7 @@ async def test_laya_route_prompt():
 
 @pytest.mark.anyio
 async def test_cli_slash_commands_auto_and_permissions():
-    from myagy.terminal.cli import _cmd_auto, _cmd_permissions
+    from kontexta_cli.terminal.cli import _cmd_auto, _cmd_permissions
 
     class FakeSession:
         def __init__(self):

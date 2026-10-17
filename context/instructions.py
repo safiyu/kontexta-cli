@@ -1,6 +1,6 @@
 """
 Discovery and loading of project instruction and guidelines files (GEMINI.md, antigravity.md, etc.)
-Automatically scans the repository root and standard customization directories to feed context into myagy sessions.
+Automatically scans the repository root and standard customization directories to feed context into kontexta-cli sessions.
 """
 
 import os

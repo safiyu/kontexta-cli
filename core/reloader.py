@@ -1,4 +1,3 @@
-# Projects/myagy/core/reloader.py
 from __future__ import annotations
 
 import json
@@ -60,7 +59,7 @@ def _get_shm_dir() -> Path:
 def write_reload_snapshot(snapshot: ReloadSnapshot) -> Path:
     """Writes session state to /dev/shm with strict 0600 permissions."""
     shm_dir = _get_shm_dir()
-    shm_path = shm_dir / f"myagy_reload_{os.getpid()}.json"
+    shm_path = shm_dir / f"kontexta_cli_reload_{os.getpid()}.json"
 
     payload = json.dumps(asdict(snapshot), ensure_ascii=False).encode("utf-8")
 

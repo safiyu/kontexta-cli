@@ -1,15 +1,15 @@
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from myagy.core.session import ContextZoneTelemetry, MultiGpuHybridSession
-from myagy.terminal.ui import (
+from kontexta_cli.core.session import ContextZoneTelemetry, MultiGpuHybridSession
+from kontexta_cli.terminal.ui import (
     _build_stacked_context_bar,
     render_context_telemetry,
     format_toolbar_context_segment,
     console,
     RICH_AVAILABLE,
 )
-from myagy.terminal import cli
+from kontexta_cli.terminal import cli
 
 
 def test_context_zone_telemetry_properties():
@@ -213,7 +213,7 @@ def test_cli_context_command():
         )
         session.get_context_telemetry = AsyncMock(return_value=mock_telemetry)
 
-        with patch("myagy.terminal.ui.render_context_telemetry") as mock_render:
+        with patch("kontexta_cli.terminal.ui.render_context_telemetry") as mock_render:
             ctx = MagicMock()
             await cli.COMMANDS["/context"](session, "", ctx)
             mock_render.assert_called_once_with(mock_telemetry)
