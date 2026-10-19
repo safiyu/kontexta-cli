@@ -2,6 +2,8 @@
 
 An asynchronous, dual-accelerator pairing framework and terminal copilot built on top of the `google-antigravity` Python SDK.
 
+kontexta-cli (kxtc) treats local heterogeneous hardware and cloud frontier models as a unified cognitive system rather than a single monolithic endpoint. Instead of forcing one model to handle routing, deep multi-file code synthesis, background context compaction, and build verification sequentially on a single queue, kxtc splits the workload across specialized compute tiers—pairing System 1 sub-35ms neural routing (:8003), AMD ROCm deep reasoning (:9000), NVIDIA CUDA background compaction and subagents (:9002), and Google Cloud Gemini OAuth into a deterministic, local-first terminal copilot.
+
 ---
 
 ## ⚡ Key Architectural Highlights
