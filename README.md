@@ -7,8 +7,8 @@ An asynchronous, dual-accelerator pairing framework and terminal copilot built o
 ## ⚡ Key Architectural Highlights
 
 * **Dual-GPU Asymmetric Compute Pipeline**:
-  * **Primary Executive (`ROCm:9000`)**: AMD ROCm GPU running deep reasoning models (e.g. Qwen 2.5 35B / Muse Glimmer) with full tool execution privileges.
-  * **Dedicated Compactor & Subagent Engine (`CUDA:9002`)**: NVIDIA RTX 4060 running IBM Granite 4.2 8B for rolling background Working Memory synthesis and asynchronous task delegation.
+  * **Primary Executive (`ROCm:9000`)**: AMD ROCm GPU running deep reasoning models (e.g. Nemotron Flash / Qwen) with full tool execution privileges.
+  * **Dedicated Compactor & Subagent Engine (`CUDA:9002`)**: NVIDIA RTX 5090 running IBM Granite 4.2 8B for rolling background Working Memory synthesis and asynchronous task delegation.
   * **LlamaShift Hot-Swapping (`Port 8002`)**: Zero-downtime model lifecycle management and VRAM hot-swapping.
 * **Laya System 1 Decision Engine (`Port 8003`)**:
   * ~33ms Non-Autoregressive ModernBERT (~421M params) for dynamic prompt auto-routing, escalation scoring, and Bayesian safe-action permission gating (`/noul`).
